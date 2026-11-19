@@ -1,0 +1,42 @@
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { mkdirSync, existsSync } from 'node:fs';
+
+function envInt(name: string, fallback: number): number {
+  const v = process.env[name];
+  if (!v) return fallback;
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const dataDir = resolve(process.env.SERVIFY_DATA_DIR ?? join(homedir(), '.servify'));
+
+export const config = {
+  /** Where the SQLite database, build caches and logs live. */
+  dataDir,
+  dbPath: join(dataDir, 'servify.db'),
+  buildsDir: join(dataDir, 'builds'),
+  logsDir: join(dataDir, 'logs'),
+  /** Dashboard + REST + MCP. */
+  host: process.env.SERVIFY_HOST ?? '127.0.0.1',
+  port: envInt('SERVIFY_PORT', 7700),
+  /** Public HTTP load balancer / router. */
+  proxyHost: process.env.SERVIFY_PROXY_HOST ?? '127.0.0.1',
+  proxyPort: envInt('SERVIFY_PROXY_PORT', 8080),
+  /** Base domain for generated service URLs: <service>.<project>.<baseDomain> */
+  baseDomain: process.env.SERVIFY_BASE_DOMAIN ?? 'localhost',
+  /** Range used when auto-assigning public TCP ports for databases etc. */
+  tcpPortStart: envInt('SERVIFY_TCP_PORT_START', 15400),
+  /** Extra hostnames allowed to reach the dashboard (DNS-rebinding protection). */
+  allowedHosts: (process.env.SERVIFY_ALLOWED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  /** Set to "none" to disable dashboard auth entirely (only sensible on a single-user machine). */
+  authMode: (process.env.SERVIFY_AUTH ?? 'password') as 'password' | 'none',
+  /** When Servify itself runs inside Docker it talks to replicas over the bridge network. */
+  inContainer: existsSync('/.dockerenv') || process.env.SERVIFY_IN_CONTAINER === '1',
+  webDist: resolve(import.meta.dirname, '../../web/dist'),
+  version: '0.1.0',
+};
+
+for (const dir of [config.dataDir, config.buildsDir, config.logsDir]) {
+  mkdirSync(dir, { recursive: true });
+}
