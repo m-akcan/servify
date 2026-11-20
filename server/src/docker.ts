@@ -333,6 +333,9 @@ export const docker = {
     call('POST', '/volumes/create', { body: { Name: name, Labels: labels } }),
   removeVolume: (name: string) => call('DELETE', `/volumes/${name}`).catch(() => {}),
 
+  /** Tar stream of a path inside a container (GET /containers/{id}/archive). */
+  archive: (id: string, path: string) => stream('GET', `/containers/${id}/archive`, { query: { path } }),
+
   stats: (id: string) => call<any>('GET', `/containers/${id}/stats`, { query: { stream: false, 'one-shot': true }, timeout: 8000 }),
 
   logs(id: string, opts: { follow?: boolean; tail?: number | 'all'; since?: number; timestamps?: boolean }) {

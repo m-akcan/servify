@@ -23,6 +23,8 @@ import { config } from './config.ts';
 import { docker, dockerTarget } from './docker.ts';
 import { readDeploymentLog } from './deployer.ts';
 import type { ServerEvent } from './types.ts';
+import { Readable } from 'node:stream';
+import { replicasOf } from './engine.ts';
 
 type Env = { Variables: { principal: Principal } };
 
@@ -192,6 +194,22 @@ api.get('/services/:id/metrics', (c) => c.json(ops.serviceMetrics(c.req.param('i
 api.get('/services/:id/logs', async (c) =>
   c.json(await ops.serviceLogs(c.req.param('id'), { tail: Number(c.req.query('tail') ?? 300), search: c.req.query('search') })),
 );
+api.get('/services/:id/volumes/:name/download', async (c) => {
+  if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot download volume data');
+  const svc = ops.getServiceOrThrow(c.req.param('id'));
+  const vol = svc.volumes.find((v) => v.name === c.req.param('name'));
+  if (!vol) throw new HttpError(404, 'volume not found');
+  const rep = replicasOf(svc.id).find((r) => r.dockerState === 'running');
+  if (!rep) throw new HttpError(409, 'start the service to download its data');
+  const res = await docker.archive(rep.containerId, vol.mountPath);
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  return new Response(Readable.toWeb(res) as ReadableStream, {
+    headers: {
+      'content-type': 'application/x-tar',
+      'content-disposition': `attachment; filename="${svc.slug}-${vol.name}-${stamp}.tar"`,
+    },
+  });
+});
 api.post('/services/:id/exec', async (c) => {
   const { command, replica } = await c.req.json<{ command: string; replica?: number }>();
   return c.json(await ops.execInService(actor(c), c.req.param('id'), command, replica));

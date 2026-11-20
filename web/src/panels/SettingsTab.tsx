@@ -287,6 +287,12 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             <span className="mono">{v.name}</span>
             <Icon name="arrowRight" size={12} className="faint" />
             <span className="mono grow">{v.mountPath}</span>
+            {s.activeDeploymentId && !s.stopped && (
+              <a className="btn btn-ghost btn-sm" href={`/api/services/${s.id}/volumes/${encodeURIComponent(v.name)}/download`} download>
+                <Icon name="download" size={14} />
+                Download
+              </a>
+            )}
             <Button size="sm" variant="ghost" icon="trash" onClick={() => void patch(id, { volumes: s.volumes.filter((x) => x.name !== v.name) })}>
               Detach
             </Button>
