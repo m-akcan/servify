@@ -758,7 +758,8 @@ export async function execInService(actor: Actor, serviceId: string, command: st
   const target = replica !== undefined ? reps.find((r) => r.index === replica) : reps[0];
   assert(target, 400, `${svc.name} has no running replica${replica !== undefined ? ` #${replica}` : ''}`);
   recordActivity(actor, 'service.exec', `Ran \`${command.slice(0, 80)}\` in ${svc.name}#${target.index}`, svc.projectId, svc.id);
-  return docker.exec(target.containerId, ['/bin/sh', '-c', command]);
+  // Long enough for migrations and one-off scripts; the deadline only stops a command that never exits.
+  return docker.exec(target.containerId, ['/bin/sh', '-c', command], 10 * 60_000);
 }
 
 export function serviceMetrics(serviceId: string, seconds = 300) {

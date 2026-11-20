@@ -212,7 +212,7 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
       const vols = volumesOf(svc);
       if (svc.templateId === 'redis') {
         const r = runningReplica(svc);
-        if (r) await docker.exec(r.containerId, ['/bin/sh', '-c', 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning SAVE >/dev/null 2>&1 || true'], 30_000).catch(() => {});
+        if (r) await docker.exec(r.containerId, ['/bin/sh', '-c', 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning SAVE >/dev/null 2>&1 || true'], 10 * 60_000).catch(() => {});
       }
       const mounts = vols.flatMap((v) => {
         const src = dockerVolumeFor(svc.id, v);
