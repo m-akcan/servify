@@ -3,7 +3,7 @@
   'use strict';
 
   /** Change this once the repository is public. */
-  const REPO_URL = 'https://github.com/OWNER/servify';
+  const REPO_URL = 'https://github.com/m-akcan/servify';
 
   const $ = (s, el = document) => el.querySelector(s);
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];

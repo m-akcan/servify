@@ -10,6 +10,6 @@ python3 -m http.server 4321 --bind 127.0.0.1 --directory site
 
 Then open http://localhost:4321.
 
-**Before publishing:** set `REPO_URL` at the top of `main.js` to the real repository. The GitHub links in `index.html` also carry the placeholder as a no-JavaScript fallback.
+**Repository link:** `REPO_URL` at the top of `main.js` (and the fallback links in `index.html`) point at https://github.com/m-akcan/servify.
 
-**Hosting:** any static host works (GitHub Pages, Cloudflare Pages, Netlify). Upload the `site/` folder as-is.
+**Hosting:** published to GitHub Pages at https://m-akcan.github.io/servify/ by `.github/workflows/pages.yml` whenever `site/` changes on `master`. Any static host works too: upload the `site/` folder as-is.
