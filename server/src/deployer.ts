@@ -4,7 +4,8 @@
  */
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
-import { docker, normalizeImageRef } from './docker.ts';
+import { docker, normalizeImageRef, dockerHostEnv } from './docker.ts';
+import { spawn } from 'node:child_process';
 import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable } from './db.ts';
 import type { Deployment, DeployTrigger, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
@@ -28,6 +29,21 @@ import { buildSource } from './builder.ts';
 import { nextRun } from './cron.ts';
 
 const lock = new KeyedLock();
+
+/** `docker pull` through the CLI, which uses the user's credential store. */
+function cliPull(ref: string, log: (l: string) => void): Promise<boolean> {
+  return new Promise((resolve) => {
+    log(`▸ Retrying pull with the docker CLI (uses your docker login credentials)`);
+    const child = spawn('docker', ['pull', ref], { env: { ...process.env, DOCKER_HOST: dockerHostEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const onData = (b: Buffer) => {
+      for (const l of b.toString('utf8').split(/\r?\n/)) if (l.trim() && !/Downloading|Extracting|Waiting/.test(l)) log(l);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('error', () => resolve(false));
+    child.on('close', (code) => resolve(code === 0));
+  });
+}
 const logStreams = new Map<string, WriteStream>();
 
 export function deploymentLogPath(depId: string) {
@@ -166,8 +182,12 @@ async function runDeployment(depId: string, actor: Actor) {
           try {
             await docker.pullImage(ref, (l) => log(l));
           } catch (e) {
-            if (!local) throw e;
-            log(`! pull failed (${(e as Error).message}); using cached image`);
+            // The Engine API doesn't see `docker login` credentials; the CLI does (private registries).
+            const viaCli = await cliPull(ref, log);
+            if (!viaCli) {
+              if (!local) throw e;
+              log(`! pull failed (${(e as Error).message}); using cached image`);
+            }
           }
         } else {
           log(`▸ Using cached image ${ref}`);

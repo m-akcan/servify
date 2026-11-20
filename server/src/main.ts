@@ -42,6 +42,8 @@ async function main() {
   }
 
   const app = new Hono();
+  // Unauthenticated liveness probe (no data exposed).
+  app.get('/api/health', async (c) => c.json({ ok: true, docker: await docker.ping(), version: config.version }));
   app.route('/api', api);
 
   app.all('/mcp', async (c) => {
