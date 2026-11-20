@@ -171,6 +171,30 @@ export function AgentsView({ settings }: { settings?: boolean }) {
             </div>
           </section>
 
+          <section className="card agents-card rise-in" style={{ animationDelay: '210ms' }}>
+            <div className="h3" style={{ marginBottom: 4 }}>
+              Try asking your agent
+            </div>
+            <div className="faint" style={{ fontSize: 12, marginBottom: 12 }}>
+              Once connected, plain requests like these just work.
+            </div>
+            <div className="col" style={{ gap: 6 }}>
+              {[
+                'Deploy github.com/me/api with 3 replicas, add Postgres, and wire DATABASE_URL.',
+                'Why is my web service failing? Check the last deploy log and the runtime logs.',
+                'Load test the web service at 100 req/s and tell me if autoscaling kicks in.',
+                'Add a nightly 03:00 job that runs `npm run cleanup` in the api image.',
+                'Export the shop project as servify.json and recreate it as shop-staging.',
+              ].map((p) => (
+                <div key={p} className="prompt-row">
+                  <Icon name="sparkle" size={13} />
+                  <span className="grow">{p}</span>
+                  <CopyButton text={p} />
+                </div>
+              ))}
+            </div>
+          </section>
+
           <section className="card agents-card rise-in" style={{ animationDelay: '240ms' }}>
             <div className="h3" style={{ marginBottom: 12 }}>
               Recent agent activity

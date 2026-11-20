@@ -2011,3 +2011,22 @@ button.chip {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.prompt-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 6px 7px 10px;
+  border-radius: var(--r-md);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.prompt-row svg {
+  color: var(--signal);
+  flex-shrink: 0;
+}
+:root[data-theme='light'] .prompt-row svg {
+  color: #5a7200;
+}
