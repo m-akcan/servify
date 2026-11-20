@@ -6,6 +6,28 @@ import { api } from '../lib/api.ts';
 import { useAutoHeight } from '../motion/hooks.ts';
 import type { Pt } from '../canvas/geometry.ts';
 import type { Template } from '../lib/types.ts';
+import { registry } from '../canvas/geometry.ts';
+
+/** Spiral out from the viewport centre to the first grid slot that doesn't overlap a node. */
+function freeSlotNear(c: Pt): Pt {
+  const W = 256;
+  const H = 150;
+  const rects = [...registry.rects.values()];
+  const free = (x: number, y: number) => rects.every((r) => x + W + 40 < r.x || x > r.x + r.w + 40 || y + H + 40 < r.y || y > r.y + r.h + 40);
+  const ox = c.x - W / 2;
+  const oy = c.y - H / 2;
+  for (let ring = 0; ring < 14; ring++) {
+    for (let gx = -ring; gx <= ring; gx++) {
+      for (let gy = -ring; gy <= ring; gy++) {
+        if (Math.max(Math.abs(gx), Math.abs(gy)) !== ring) continue;
+        const x = ox + gx * 320;
+        const y = oy + gy * 200;
+        if (free(x, y)) return { x, y };
+      }
+    }
+  }
+  return { x: ox, y: oy };
+}
 
 type Kind = 'git' | 'image' | 'local' | 'template';
 
@@ -53,10 +75,7 @@ export function NewServiceModal({
   const create = async (body: Record<string, unknown>) => {
     setBusy(true);
     try {
-      const pos = at ?? (() => {
-        const c = getCenter();
-        return { x: c.x - 128, y: c.y - 60 };
-      })();
+      const pos = at ?? freeSlotNear(getCenter());
       const r = await api.post<{ service: { id: string; name: string } }>(`/projects/${projectId}/services`, { ...body, x: Math.round(pos.x / 20) * 20, y: Math.round(pos.y / 20) * 20 });
       toast({ title: `${r.service.name} created`, body: 'First deploy started', tone: 'build' });
       onCreated(r.service.id);
