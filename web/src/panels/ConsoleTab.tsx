@@ -15,6 +15,12 @@ export function ConsoleTab({ service: s }: { service: ServiceView }) {
   const [hist, setHist] = useState<string[]>([]);
   const [hi, setHi] = useState(-1);
   const scroller = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    // Focus after the panel finishes sliding in.
+    const t = setTimeout(() => inputRef.current?.focus(), 350);
+    return () => clearTimeout(t);
+  }, []);
   const nextId = useRef(1);
 
   useEffect(() => {
@@ -87,8 +93,8 @@ export function ConsoleTab({ service: s }: { service: ServiceView }) {
       <form className="console-input" onSubmit={run}>
         <Icon name="chevronRight" size={14} />
         <input
+          ref={inputRef}
           className="mono"
-          autoFocus
           value={cmd}
           spellCheck={false}
           placeholder="Type a command and press Enter"
