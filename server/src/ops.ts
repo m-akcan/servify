@@ -340,7 +340,7 @@ export const updateServiceInput = z.object({
     .optional(),
   publicHttp: z.boolean().optional(),
   domains: z.array(z.string()).optional(),
-  publicTcpPort: z.number().int().min(1024).max(65535).nullable().optional(),
+  publicTcpPort: z.number().int().min(0).max(65535).nullable().optional().describe('Host port for the TCP proxy; 0 = pick a free one; null = off'),
   volumes: z.array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/') })).optional(),
   startCommand: z.string().nullable().optional(),
   buildCommand: z.string().nullable().optional(),
@@ -414,6 +414,8 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     }
     set('domains', clean, 'domains');
   }
+  if (patch.publicTcpPort === 0) patch.publicTcpPort = svc.publicTcpPort ?? (await allocateTcpPort());
+  if (patch.publicTcpPort !== undefined && patch.publicTcpPort !== null && patch.publicTcpPort < 1024) throw new HttpError(400, 'TCP proxy ports must be 1024 or higher');
   if (patch.publicTcpPort !== undefined) {
     if (patch.publicTcpPort !== null) {
       if (tcpPortInUse(patch.publicTcpPort, svc.id)) throw new HttpError(409, `port ${patch.publicTcpPort} is already in use`);

@@ -76,7 +76,7 @@ export function AgentsView({ settings }: { settings?: boolean }) {
   const snippets = {
     'claude-code': `claude mcp add --transport http servify ${origin}/mcp \\\n  --header "Authorization: Bearer ${tok}"`,
     json: JSON.stringify({ mcpServers: { servify: { type: 'http', url: `${origin}/mcp`, headers: { Authorization: `Bearer ${tok}` } } } }, null, 2),
-    stdio: JSON.stringify({ mcpServers: { servify: { command: 'node', args: ['/path/to/servify/server/bin/servify.mjs', 'mcp'], env: { SERVIFY_URL: origin, SERVIFY_TOKEN: tok } } } }, null, 2),
+    stdio: JSON.stringify({ mcpServers: { servify: { command: 'node', args: [system?.binPath ?? '/path/to/servify/server/bin/servify.mjs', 'mcp'], env: { SERVIFY_URL: origin, SERVIFY_TOKEN: tok } } } }, null, 2),
     rest: `curl ${origin}/api/projects \\\n  -H "Authorization: Bearer ${tok}"\n\ncurl -X POST ${origin}/api/services/<id>/scale \\\n  -H "Authorization: Bearer ${tok}" \\\n  -H "content-type: application/json" -d '{"replicas": 3}'`,
   };
 

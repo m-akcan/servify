@@ -24,6 +24,7 @@ import { docker, dockerTarget } from './docker.ts';
 import { readDeploymentLog } from './deployer.ts';
 import type { ServerEvent } from './types.ts';
 import { Readable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { replicasOf } from './engine.ts';
 
 type Env = { Variables: { principal: Principal } };
@@ -139,6 +140,7 @@ api.get('/system', async (c) => {
     proxy: { host: config.proxyHost, port: config.proxyPort, baseDomain: config.baseDomain },
     api: { host: config.host, port: config.port },
     dataDir: config.dataDir,
+    binPath: fileURLToPath(new URL('../bin/servify.mjs', import.meta.url)),
     authMode: config.authMode,
     actor: actor(c),
     scope: c.get('principal').scope,

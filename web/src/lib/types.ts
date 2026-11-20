@@ -40,6 +40,7 @@ export type SystemInfo = {
   proxy: { host: string; port: number; baseDomain: string };
   api: { host: string; port: number };
   dataDir: string;
+  binPath?: string;
   authMode: 'password' | 'none';
   actor: { type: string; name: string };
   scope: 'read' | 'write';

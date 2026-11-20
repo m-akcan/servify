@@ -244,7 +244,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
                 <CommitInput mono value={String(s.publicTcpPort)} onCommit={(v) => void patch(id, { publicTcpPort: Number(v) || null })} />
               </div>
             )}
-            <Switch checked={!!s.publicTcpPort} onChange={(v) => void patch(id, { publicTcpPort: v ? 15400 + Math.floor(Math.random() * 500) : null })} />
+            <Switch checked={!!s.publicTcpPort} onChange={(v) => void patch(id, { publicTcpPort: v ? 0 : null })} />
           </div>
         )}
       </Section>
