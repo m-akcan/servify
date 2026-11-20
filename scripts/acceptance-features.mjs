@@ -214,6 +214,37 @@ async function main() {
   check('metrics answer for a 1-hour window', Array.isArray(m.points));
 
   // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ rollback when the image tag moves');
+  {
+    // A local `:latest` tag that gets re-pointed between deploys (like a fresh `docker pull` or `compose build`).
+    const tag = `servify-acceptance-moving:latest`;
+    const imageId = (ref) => execSync(`docker image inspect -f '{{.Id}}' ${ref}`).toString().trim();
+    execSync(`docker tag alpine:3.20 ${tag}`);
+    cleanups.push(async () => execSync(`docker rmi ${tag}`, { stdio: 'ignore' }));
+    const mover = (await api('POST', `/projects/${P.id}/services`, { image: tag, name: 'mover', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'mover');
+    const runningImage = async () => {
+      const r = (await api('GET', `/services/${mover.id}/metrics?seconds=1`)).replicas.find((x) => x.state === 'healthy' || x.dockerState === 'running');
+      return r ? execSync(`docker inspect -f '{{.Image}}' ${r.containerId}`).toString().trim() : null;
+    };
+    const v1 = (await api('GET', `/services/${mover.id}`)).activeDeploymentId;
+    const v1Image = await runningImage();
+    check('first deploy runs the tagged image', v1Image === imageId('alpine:3.20'));
+    const d1 = await api('GET', `/deployments/${v1}`);
+    check('the deployment is pinned to its own image name', d1.image?.startsWith('servify/') && d1.sourceLabel.includes(tag), `${d1.image} · ${d1.sourceLabel}`);
+    execSync(`docker pull -q busybox:1.36 && docker tag busybox:1.36 ${tag}`, { stdio: 'ignore' });
+    await api('POST', `/services/${mover.id}/deploy`);
+    await waitFor(async () => (await api('GET', `/services/${mover.id}`)).activeDeploymentId !== v1, 120_000, 'second deploy');
+    check('a redeploy picks up the moved tag', !!(await waitFor(async () => (await runningImage()) === imageId('busybox:1.36'), 60_000, 'new image')));
+    await api('POST', `/services/${mover.id}/rollback`, { deploymentId: v1 });
+    check('rolling back brings the old image back, not the moved tag', !!(await waitFor(async () => (await runningImage()) === v1Image, 120_000, 'rollback image')));
+    const v3 = (await api('GET', `/services/${mover.id}`)).activeDeploymentId;
+    await api('POST', `/services/${mover.id}/restart`);
+    await waitFor(async () => (await api('GET', `/services/${mover.id}`)).activeDeploymentId !== v3, 120_000, 'restart');
+    check('a restart keeps the rolled-back image', (await runningImage()) === v1Image);
+  }
+
+  // ─────────────────────────────────────────────────────────────
   console.log('\n▸ volumes (attach / detach)');
   const writer = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'writer', protocol: 'none', startCommand: 'sleep infinity' })).service;
   const reader = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'reader', protocol: 'none', startCommand: 'sleep infinity' })).service;

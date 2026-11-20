@@ -301,6 +301,11 @@ export function createDockerClient(target: DockerTarget) {
       for await (const msg of jsonLines(res)) if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
     },
     removeImage: (ref: string) => call('DELETE', `/images/${encodeURIComponent(ref)}`, { query: { force: false } }).catch(() => {}),
+    /** Add a `repo:tag` name to an image (`docker tag`). */
+    tagImage: (ref: string, repoTag: string) => {
+      const i = repoTag.lastIndexOf(':');
+      return call('POST', `/images/${encodeURIComponent(ref)}/tag`, { query: { repo: repoTag.slice(0, i), tag: repoTag.slice(i + 1) } });
+    },
     listImages: (labels: string[] = []) => call<any[]>('GET', '/images/json', { query: { filters: filtersParam({ label: labels }) } }),
 
     async buildFromTar(tar: Readable, tag: string, dockerfile: string, onLine: (l: string) => void, labels: Record<string, string> = {}) {

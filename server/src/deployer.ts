@@ -26,7 +26,7 @@ import {
   LABEL,
   converging,
 } from './engine.ts';
-import { buildSource } from './builder.ts';
+import { buildSource, imageTag } from './builder.ts';
 import { nextRun } from './cron.ts';
 import { notify } from './notify.ts';
 import { hasSharedVolume } from './volumes.ts';
@@ -212,7 +212,7 @@ async function runDeployment(depId: string, actor: Actor) {
             break;
           }
         }
-        if (!from) throw new Error(`image ${dep.image} is no longer on any server — deploy again to build it fresh`);
+        if (!from) throw new Error(`image ${dep.image} is no longer on any server — deploy again to ${src.type === 'image' ? 'pull' : 'build'} it fresh`);
         log(`▸ Copying ${dep.image} from ${nodeName(from)} to ${nodeName(node)}`);
         await d.loadImage(await dockerFor(from).exportImage(dep.image));
       }
@@ -238,6 +238,17 @@ async function runDeployment(depId: string, actor: Actor) {
         }
         dep.image = ref;
         dep.builder = 'image';
+        // A tag like `:latest` moves on. Pin this deployment to the exact image under its own name, so
+        // rollbacks, restarts and moves bring back this image, not whatever the tag points at by then.
+        // Kept and cleaned up like built images (the last 5 per service stay for rollbacks).
+        const pinned = await d.inspectImage(ref);
+        if (pinned?.Id) {
+          const tag = imageTag(projectsTable.get(svc.projectId)!, svc, dep);
+          await d.tagImage(pinned.Id, tag);
+          dep.image = tag;
+          dep.sourceLabel = `${sourceLabel(svc)} · ${String(pinned.Id).replace(/^sha256:/, '').slice(0, 7)}`;
+          log(`▸ Using ${ref} (${String(pinned.Id).replace(/^sha256:/, '').slice(0, 12)}) as ${tag}`);
+        }
       } else {
         const project = projectsTable.get(svc.projectId)!;
         const result = await buildSource(svc, project, dep, log);

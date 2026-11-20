@@ -71,7 +71,8 @@ export async function latestCommit(repo: string, branch: string | undefined, tok
   return r.out.trim().split(/\s+/)[0] || null;
 }
 
-function imageTag(project: Project, svc: Service, dep: Deployment) {
+/** The deployment's own image name: built images get it, pulled images are tagged with it (exact rollbacks). */
+export function imageTag(project: Project, svc: Service, dep: Deployment) {
   return `servify/${project.slug}-${svc.slug}:${dep.id.slice(-8)}`.toLowerCase();
 }
 
