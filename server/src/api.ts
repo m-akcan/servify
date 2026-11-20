@@ -14,6 +14,7 @@ import {
   principalFor,
   createToken,
   hostAllowed,
+  originOk,
   type Principal,
 } from './auth.ts';
 import { tokensTable, deployments as deploymentsTable } from './db.ts';
@@ -40,15 +41,7 @@ api.onError((err, c) => {
 // Host / origin validation for everything under /api.
 api.use('*', async (c, next) => {
   if (!hostAllowed(c.req.header('host'))) return c.json({ error: 'host not allowed' }, 403);
-  const origin = c.req.header('origin');
-  if (origin && c.req.method !== 'GET') {
-    try {
-      const o = new URL(origin);
-      if (!hostAllowed(o.host)) return c.json({ error: 'origin not allowed' }, 403);
-    } catch {
-      return c.json({ error: 'bad origin' }, 403);
-    }
-  }
+  if (!originOk(c.req.header('origin'), c.req.header('host'), c.req.method)) return c.json({ error: 'origin not allowed' }, 403);
   await next();
 });
 

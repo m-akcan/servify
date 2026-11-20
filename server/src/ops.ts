@@ -512,7 +512,7 @@ export async function deleteService(actor: Actor, serviceId: string, opts: { qui
   const cids = replicasOf(svc.id).map((r) => r.containerId);
   await drainAndRemove(cids, 1000);
   // Remove any stragglers by label, then volumes and built images.
-  const left = await docker.listContainers([`servify.service=${svc.id}`]);
+  const left = await docker.listContainers([`servify.service=${svc.id}`]); // service ids are globally unique
   await Promise.all(left.map((c) => docker.removeContainer(c.Id, true)));
   if (!opts.keepVolumes) for (const v of svc.volumes) await docker.removeVolume(volumeName(svc.id, v.name));
   for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) {

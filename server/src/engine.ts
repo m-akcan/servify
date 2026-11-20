@@ -10,7 +10,18 @@ import { services as servicesTable, projects as projectsTable, deployments as de
 import type { Service, Project, Deployment, Replica, ReplicaState } from './types.ts';
 import { bus, SYSTEM, recordActivity } from './events.ts';
 import { config } from './config.ts';
-import { sleep } from './util.ts';
+import { sleep, id as newId } from './util.ts';
+import { kv } from './db.ts';
+
+/** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
+export const INSTANCE_ID = (() => {
+  let v = kv.get('instance_id');
+  if (!v) {
+    v = newId('ins');
+    kv.set('instance_id', v);
+  }
+  return v;
+})();
 
 export const LABEL = {
   managed: 'servify.managed',
@@ -18,7 +29,16 @@ export const LABEL = {
   service: 'servify.service',
   deployment: 'servify.deployment',
   index: 'servify.replica',
+  instance: 'servify.instance',
 };
+
+/** Ours if labelled with our instance id, or a legacy (pre-instance) container whose service we own. */
+function isOurs(labels: Record<string, string>): boolean {
+  const inst = labels[LABEL.instance];
+  if (inst) return inst === INSTANCE_ID;
+  const sid = labels[LABEL.service];
+  return !!sid && !!servicesTable.get(sid);
+}
 
 type Runtime = Replica & {
   network: string;
@@ -145,7 +165,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   if (!project) throw new Error('project missing');
   if (!dep.image) throw new Error('deployment has no image');
   const network = networkName(project.id);
-  await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.project]: project.id });
+  await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
   const port = dep.port;
   const env = { ...(dep as any).resolvedEnv ?? dep.config.env };
   if (port && !env.PORT) env.PORT = String(port);
@@ -153,7 +173,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   env.SERVIFY_DEPLOYMENT_ID = dep.id;
 
   for (const v of dep.config.volumes) {
-    await docker.createVolume(volumeName(svc.id, v.name), { [LABEL.managed]: 'true', [LABEL.service]: svc.id });
+    await docker.createVolume(volumeName(svc.id, v.name), { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.service]: svc.id });
   }
 
   const exposed = port && dep.config.protocol !== 'none' ? { [`${port}/tcp`]: {} } : undefined;
@@ -163,6 +183,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
     Hostname: `${svc.slug}-${index}`.slice(0, 63),
     Labels: {
       [LABEL.managed]: 'true',
+      [LABEL.instance]: INSTANCE_ID,
       [LABEL.project]: project.id,
       [LABEL.service]: svc.id,
       [LABEL.deployment]: dep.id,
@@ -452,7 +473,7 @@ export async function reconcile(): Promise<void> {
 }
 
 async function reconcileOnce() {
-  const containers = await docker.listContainers([`${LABEL.managed}=true`]);
+  const containers = (await docker.listContainers([`${LABEL.managed}=true`])).filter((c) => isOurs(c.Labels));
   const live = new Set(containers.map((c) => c.Id));
   for (const cid of [...runtime.keys()]) if (!live.has(cid)) runtime.delete(cid);
 
@@ -553,6 +574,8 @@ async function watchEvents() {
         const cid: string = ev.id ?? ev.Actor?.ID;
         const action: string = ev.Action ?? ev.status ?? '';
         if (!cid) continue;
+        const attrs = ev.Actor?.Attributes ?? {};
+        if (attrs[LABEL.instance] && attrs[LABEL.instance] !== INSTANCE_ID) continue;
         if (['die', 'start', 'restart', 'destroy', 'oom', 'stop', 'kill'].includes(action.split(':')[0])) {
           if (action === 'destroy') runtime.delete(cid);
           else await adopt(cid);

@@ -7,7 +7,7 @@ import { config } from './config.ts';
 import { docker, dockerTarget } from './docker.ts';
 import { api } from './api.ts';
 import { handleMcp } from './mcp.ts';
-import { principalFor, hostAllowed, SESSION_COOKIE } from './auth.ts';
+import { principalFor, hostAllowed, originOk, SESSION_COOKIE } from './auth.ts';
 import { startEngine } from './engine.ts';
 import { startProxy } from './proxy.ts';
 import { startMetrics } from './metrics.ts';
@@ -44,6 +44,7 @@ async function main() {
 
   app.all('/mcp', async (c) => {
     if (!hostAllowed(c.req.header('host'))) return c.json({ error: 'host not allowed' }, 403);
+    if (!originOk(c.req.header('origin'), c.req.header('host'), c.req.method)) return c.json({ error: 'origin not allowed' }, 403);
     const auth = c.req.header('authorization');
     const p = principalFor({ bearer: auth?.startsWith('Bearer ') ? auth.slice(7).trim() : undefined, cookie: getCookie(c, SESSION_COOKIE) });
     if (!p) {

@@ -40,7 +40,6 @@ export function Particles({ edges, getCamera, subscribeCamera }: { edges: EdgeSp
     themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
     const st = state.current;
-    (window as any).__particles = { st, edges: edgesRef, rateFor: (e: EdgeSpec) => rateFor(e) };
 
     const rateFor = (e: EdgeSpec): { rate: number; errFrac: number } => {
       if (e.kind === 'ingress') {

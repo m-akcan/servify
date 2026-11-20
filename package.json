@@ -5,12 +5,16 @@
   "description": "Local-first, private, self-hosted PaaS with a live canvas, load-balanced replicas and agent (MCP) access.",
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=22.18" },
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "pnpm --filter web build",
-    "start": "node server/src/main.ts",
+    "start": "node server/bin/servify.mjs start",
     "typecheck": "pnpm -r typecheck",
-    "test:e2e": "node scripts/acceptance.mjs"
+    "test:e2e": "node scripts/acceptance.mjs",
+    "mcp": "node server/bin/servify.mjs mcp",
+    "token": "node server/bin/servify.mjs token"
   }
 }

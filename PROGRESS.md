@@ -13,3 +13,15 @@
 ## Verified
 - [x] scripts/acceptance.mjs: deploy, LB across 3 replicas, scale 3→5→1, zero-downtime redeploy under load (0 failures / 18.7k req), self-heal, redis via TCP proxy, cross-service variable refs.
 - [x] Servify restart re-adopts running containers (no duplicates).
+- [x] Instance scoping: `servify.instance` label; legacy containers adopted; 2 instances verified isolated.
+- [x] CSRF: Origin must equal Host on writes (api + /mcp).
+- [x] UI verified in browser: canvas, particles (need visible pane), panel tabs, scaling, template create, ref edges, pending-changes deploy.
+- [x] Builds: local folder (node, zero-config) + GitHub repo without Dockerfile, both via BuildKit.
+
+## Punch list (from advisor review)
+- [ ] Fresh clone: pnpm install && pnpm build && pnpm start; password setup/logout/login; SSE under cookie; acceptance with token.
+- [ ] Acceptance additions: failing deploy keeps old version (stateless + volume), rollback, stop/start, docker kill, redis data persists, autoscale up/down, git auto-deploy via local bare repo, project delete leaves nothing.
+- [ ] Templates each once (skip ollama); uptime-kuma websocket via browser.
+- [ ] UI: drag/snap, wheel/pinch, minimap, context menus, ⌘K, light theme, agents token flow, activity, perf with ~25 nodes.
+- [ ] In-container mode: join project networks or don't document.
+- [ ] README, LICENSE. Kill dev servers/curl loops before final run.

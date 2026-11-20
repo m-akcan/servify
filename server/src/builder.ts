@@ -5,6 +5,7 @@ import { docker, dockerHostEnv } from './docker.ts';
 import { config } from './config.ts';
 import { detect, DEFAULT_IGNORE } from './detect.ts';
 import type { Deployment, Project, Service } from './types.ts';
+import { INSTANCE_ID } from './engine.ts';
 
 type Log = (line: string) => void;
 
@@ -169,7 +170,7 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
       log(`▸ Using ${relative(ctx, dockerfile) || 'Dockerfile'}`);
     }
     const tag = imageTag(project, svc, dep);
-    const labels = { 'servify.managed': 'true', 'servify.service': svc.id, 'servify.deployment': dep.id };
+    const labels = { 'servify.managed': 'true', 'servify.instance': INSTANCE_ID, 'servify.service': svc.id, 'servify.deployment': dep.id };
     log(`▸ Building image ${tag}`);
     const t0 = Date.now();
     const usedCli = await cliBuild(ctx, dockerfile, tag, labels, log);

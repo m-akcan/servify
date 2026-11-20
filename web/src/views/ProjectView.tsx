@@ -139,10 +139,6 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         case 'Delete':
           if (sel) void remove(sel);
           break;
-        case 'd':
-        case 'D':
-          if (sel) void deploy(sel);
-          break;
         case 'Tab': {
           e.preventDefault();
           const ids = st.order;

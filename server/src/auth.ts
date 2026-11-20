@@ -101,3 +101,17 @@ export function hostAllowed(hostHeader: string | undefined): boolean {
   if (host.endsWith('.localhost')) return true;
   return false;
 }
+
+/**
+ * CSRF guard: browsers always send Origin on cross-site writes. It must be exactly our own
+ * origin — hosted apps live on *.localhost too, so a mere "is local" check is not enough.
+ */
+export function originOk(origin: string | undefined, host: string | undefined, method: string): boolean {
+  if (!origin) return true; // non-browser clients (curl, agents, MCP SDKs)
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return true;
+  try {
+    return new URL(origin).host.toLowerCase() === (host ?? '').toLowerCase();
+  } catch {
+    return false;
+  }
+}
