@@ -4,7 +4,8 @@ import { SpringGroup, springs, Spring } from '../motion/spring.ts';
 import { registry, snap, NODE_W, type Camera } from './geometry.ts';
 import { ServiceGlyph, Icon } from '../components/Icon.tsx';
 import { serviceTone, serviceLabel, num, isBusy } from '../lib/format.ts';
-import { useTraffic, traffic } from '../lib/store.ts';
+import { useTraffic, traffic, useDeployTail } from '../lib/store.ts';
+import { duration } from '../lib/format.ts';
 
 type Props = {
   service: ServiceView;
@@ -59,6 +60,37 @@ function Pips({ service, replicas }: { service: ServiceView; replicas: Replica[]
       {Array.from({ length: ghosts }, (_, i) => (
         <span key={`g${i}`} className="pip" data-state="pending" />
       ))}
+    </div>
+  );
+}
+
+const STAGES = ['queued', 'building', 'deploying'] as const;
+
+/** Live deploy progress on the card: three-stage rail + the latest log line. */
+function DeployTicker({ service, latest }: { service: ServiceView; latest: Deployment }) {
+  const tail = useDeployTail(service.id, true);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const i = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(i);
+  }, []);
+  const stage = STAGES.indexOf(latest.status as (typeof STAGES)[number]);
+  const fresh = tail && tail.ts >= latest.createdAt;
+  const label = latest.status === 'queued' ? 'Queued' : latest.status === 'building' ? (latest.config.source.type === 'image' ? 'Pulling' : 'Building') : 'Starting replicas';
+  return (
+    <div className="ticker">
+      <div className="ticker-rail">
+        {['Build', 'Deploy', 'Live'].map((name, i) => (
+          <span key={name} className="ticker-seg" data-state={i < stage ? 'done' : i === stage ? 'active' : 'todo'} />
+        ))}
+      </div>
+      <div className="ticker-meta">
+        <span>{label}</span>
+        <span className="tnum faint">{duration(Date.now() - (latest.startedAt ?? latest.createdAt))}</span>
+      </div>
+      <div className="ticker-line mono truncate" key={fresh ? tail!.ts : 'none'}>
+        {fresh ? tail!.line : latest.status === 'queued' ? 'Waiting for the previous deploy…' : '…'}
+      </div>
     </div>
   );
 }
@@ -223,6 +255,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
             </span>
           ) : null}
         </div>
+        {busy && latest && STAGES.includes(latest.status as any) && <DeployTicker service={s} latest={latest} />}
         <div className="node-foot">
           <Pips service={s} replicas={replicas} />
           <span className="node-replicas tnum">

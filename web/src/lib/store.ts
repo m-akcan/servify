@@ -83,6 +83,25 @@ export const traffic = {
   tick: 0,
 };
 
+/** Latest build/deploy log line per service, for the live ticker on canvas nodes. */
+export const deployTail = {
+  data: {} as Record<string, { line: string; ts: number }>,
+  subs: new Set<() => void>(),
+};
+
+export function useDeployTail(serviceId: string, enabled: boolean) {
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (!enabled) return;
+    const fn = () => force((n) => n + 1);
+    deployTail.subs.add(fn);
+    return () => {
+      deployTail.subs.delete(fn);
+    };
+  }, [enabled]);
+  return enabled ? deployTail.data[serviceId] ?? null : null;
+}
+
 export function useTraffic(serviceId: string | null | undefined): Traffic | null {
   const [, force] = useState(0);
   useEffect(() => {
@@ -169,9 +188,11 @@ function computeEdges(services: Record<string, ServiceView>) {
 export const deployLogBus = new EventTarget();
 let stopEvents: (() => void) | null = null;
 const toastListeners = new Set<(ev: ServerEvent) => void>();
-export function onServerEvent(fn: (ev: ServerEvent) => void) {
+export function onServerEvent(fn: (ev: ServerEvent) => void): () => void {
   toastListeners.add(fn);
-  return () => toastListeners.delete(fn);
+  return () => {
+    toastListeners.delete(fn);
+  };
 }
 
 export function connectEvents() {
@@ -209,6 +230,13 @@ function applyEvent(ev: ServerEvent) {
         if (h.length > 60) h.shift();
       }
       for (const fn of traffic.subs) fn();
+      return;
+    }
+    case 'deployment.log': {
+      const clean = ev.line.trim();
+      if (!clean || /^\s*│/.test(clean)) return;
+      deployTail.data[ev.serviceId] = { line: clean, ts: ev.ts };
+      for (const fn of deployTail.subs) fn();
       return;
     }
     case 'project.updated': {

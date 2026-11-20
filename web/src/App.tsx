@@ -8,6 +8,7 @@ import { ProjectView } from './views/ProjectView.tsx';
 import { AgentsView } from './views/Agents.tsx';
 import { CommandPalette } from './components/CommandPalette.tsx';
 import { Shell } from './views/Shell.tsx';
+import { EventToasts } from './components/EventToasts.tsx';
 
 export function App() {
   const auth = useStore((s) => s.auth);
@@ -42,6 +43,7 @@ export function App() {
       <MenuHost />
       <ConfirmHost />
       <ToastHost />
+      <EventToasts />
     </>
   );
 }

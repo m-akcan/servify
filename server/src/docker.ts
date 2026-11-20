@@ -46,6 +46,11 @@ export const dockerHostEnv =
 
 let apiPrefix = '';
 
+// Node's global agent kills sockets after 5s idle — fatal for pulls, builds, log follows and the
+// event stream, which can be silent for much longer. Calls reuse sockets; streams get their own.
+const callAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+const streamAgent = new http.Agent({ keepAlive: false, maxSockets: Infinity });
+
 export class DockerError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -60,6 +65,7 @@ type ReqOpts = {
   rawBody?: Readable;
   headers?: Record<string, string>;
   timeout?: number;
+  stream?: boolean;
 };
 
 function buildPath(path: string, query?: ReqOpts['query']): string {
@@ -83,8 +89,14 @@ function rawRequest(method: string, path: string, opts: ReqOpts = {}): Promise<h
       headers['Content-Length'] = String(Buffer.byteLength(payload));
     }
     const req = http.request(
-      { ...dockerTarget, method, path: buildPath(path, opts.query), headers, timeout: opts.timeout },
-      (res) => resolve(res),
+      { ...dockerTarget, method, path: buildPath(path, opts.query), headers, timeout: opts.timeout, agent: opts.stream ? streamAgent : callAgent },
+      (res) => {
+        if (opts.stream) {
+          res.socket?.setTimeout(0);
+          res.socket?.setKeepAlive(true, 30_000);
+        }
+        resolve(res);
+      },
     );
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error(`docker ${method} ${path} timed out`)));
@@ -124,7 +136,7 @@ async function call<T = any>(method: string, path: string, opts: ReqOpts = {}): 
 }
 
 async function stream(method: string, path: string, opts: ReqOpts = {}): Promise<http.IncomingMessage> {
-  const res = await rawRequest(method, path, opts);
+  const res = await rawRequest(method, path, { ...opts, stream: true });
   const status = res.statusCode ?? 500;
   if (status >= 400) {
     const text = await readBody(res);
