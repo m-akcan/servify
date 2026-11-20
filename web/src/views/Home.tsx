@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useStore, loadProjects } from '../lib/store.ts';
 import { api } from '../lib/api.ts';
 import { navigate, projectPath } from '../lib/router.ts';
-import { Button, Modal, toastError, Empty } from '../components/ui.tsx';
+import { Button, Modal, toastError, Empty, Switch } from '../components/ui.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { serviceTone } from '../lib/format.ts';
 import type { Project } from '../lib/types.ts';
@@ -65,11 +65,89 @@ function MiniCanvas({ services }: { services: { id: string; status: any }[] }) {
   );
 }
 
+function ImportModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [text, setText] = useState('');
+  const [deploy, setDeploy] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [drag, setDrag] = useState(false);
+  let parsed: any = null;
+  let error: string | null = null;
+  if (text.trim()) {
+    try {
+      parsed = JSON.parse(text);
+      if (parsed.servify !== 1 || !Array.isArray(parsed.services)) error = 'Not a servify.json spec';
+    } catch {
+      error = 'Invalid JSON';
+    }
+  }
+  const submit = async () => {
+    setBusy(true);
+    try {
+      const r = await api.post<{ project: Project }>('/projects/import', { spec: parsed, deploy });
+      await loadProjects();
+      onClose();
+      setText('');
+      navigate(projectPath(r.project.slug));
+    } catch (e) {
+      toastError(e, 'Import failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal open={open} onClose={onClose} width={560}>
+      <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div>
+          <h2 className="h2">Import project</h2>
+          <p className="muted" style={{ margin: '4px 0 0' }}>
+            Paste or drop a <code className="inline-code">servify.json</code> exported from Servify (or written by an agent).
+          </p>
+        </div>
+        <textarea
+          className={`textarea mono import-area ${drag ? 'drag' : ''}`}
+          placeholder={'{\n  "servify": 1,\n  "name": "my-stack",\n  "services": [ … ]\n}'}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDrag(true);
+          }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={async (e) => {
+            e.preventDefault();
+            setDrag(false);
+            const f = e.dataTransfer.files[0];
+            if (f) setText(await f.text());
+          }}
+        />
+        {parsed && !error && (
+          <div className="faint" style={{ fontSize: 12 }}>
+            <b style={{ color: 'var(--text)' }}>{parsed.name}</b> · {parsed.services.length} services: {parsed.services.map((s: any) => s.name).join(', ')}
+          </div>
+        )}
+        {error && <div style={{ color: 'var(--err)', fontSize: 12 }}>{error}</div>}
+        <label className="row" style={{ gap: 10, fontSize: 13 }}>
+          <Switch checked={deploy} onChange={setDeploy} /> Deploy everything after import
+        </label>
+        <div className="row" style={{ justifyContent: 'flex-end' }}>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" icon="download" loading={busy} disabled={!parsed || !!error} onClick={() => void submit()}>
+            Import
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export function Home() {
   const projects = useStore((s) => s.projects);
   const loaded = useStore((s) => s.projectsLoaded);
   const system = useStore((s) => s.system);
   const [open, setOpen] = useState(false);
+  const [importing, setImporting] = useState(false);
 
   return (
     <div className="home">
@@ -82,9 +160,14 @@ export function Home() {
             </h1>
           </div>
           <div className="spacer" />
-          <Button variant="primary" icon="plus" onClick={() => setOpen(true)}>
-            New project
-          </Button>
+          <div className="row">
+            <Button icon="download" onClick={() => setImporting(true)}>
+              Import
+            </Button>
+            <Button variant="primary" icon="plus" onClick={() => setOpen(true)}>
+              New project
+            </Button>
+          </div>
         </div>
 
         {system && (
@@ -169,6 +252,7 @@ export function Home() {
         )}
       </div>
       <NewProjectModal open={open} onClose={() => setOpen(false)} />
+      <ImportModal open={importing} onClose={() => setImporting(false)} />
     </div>
   );
 }

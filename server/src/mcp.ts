@@ -295,6 +295,24 @@ export function buildMcpServer(principal: Principal): McpServer {
   );
 
   server.registerTool(
+    'export_project',
+    { description: 'Export a project as a servify.json spec (services, sources, scaling, variables). Secrets are blanked unless includeSecrets.', inputSchema: { project: projRef, includeSecrets: z.boolean().optional() } },
+    wrap(({ project, includeSecrets }: { project: string; includeSecrets?: boolean }) => ops.exportProject(project, { secrets: !!includeSecrets && write })),
+  );
+
+  server.registerTool(
+    'import_project',
+    {
+      description: 'Create a whole project from a servify.json spec in one call: {"servify":1,"name":"…","services":[{"name":"api","source":{"type":"image","image":"nginx:alpine"},"replicas":2,"env":{…}}]}. Deploys everything unless deploy=false.',
+      inputSchema: { spec: z.any(), deploy: z.boolean().optional(), name: z.string().optional() },
+    },
+    wrap(async ({ spec, deploy, name }: { spec: any; deploy?: boolean; name?: string }) => {
+      guard();
+      return ops.importProject(actor, typeof spec === 'string' ? JSON.parse(spec) : spec, { deploy, name });
+    }),
+  );
+
+  server.registerTool(
     'load_test',
     { description: 'Send synthetic HTTP traffic to a service through the load balancer (to verify scaling, balancing or autoscaling).', inputSchema: { service: svcRef, rps: z.number().min(1).max(500).optional(), seconds: z.number().int().min(1).max(300).optional() } },
     wrap(({ service, rps, seconds }: { service: string; rps?: number; seconds?: number }) => {

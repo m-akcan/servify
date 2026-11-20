@@ -1880,3 +1880,12 @@ a.panel-link:hover {
     right: 14px;
   }
 }
+
+.import-area {
+  min-height: 220px;
+  transition: border-color var(--t-fast), background var(--t-fast);
+}
+.import-area.drag {
+  border-color: var(--signal);
+  background: var(--signal-soft);
+}

@@ -788,3 +788,81 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   const deployment = deployService(actor, svc.id);
   return { service: serializeService(servicesTable.get(svc.id)!), deployment };
 }
+
+// ───────────────────────────── export / import (servify.json) ─────────────────────────────
+
+export type ProjectSpec = {
+  servify: 1;
+  name: string;
+  color?: string;
+  services: Array<Partial<Service> & { name: string; source: Source }>;
+};
+
+const SPEC_KEYS = [
+  'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'x', 'y',
+] as const;
+
+export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
+  const p = getProjectOrThrow(projectId);
+  const svcs = servicesTable.all('WHERE project_id = ? ORDER BY created_at ASC', p.id);
+  return {
+    servify: 1,
+    name: p.name,
+    color: p.color,
+    services: svcs.map((s) => {
+      const out: any = {};
+      for (const k of SPEC_KEYS) out[k] = structuredClone((s as any)[k]);
+      if (!opts.secrets) {
+        for (const k of s.secretKeys) if (k in out.env && !/\$\{\{/.test(out.env[k])) out.env[k] = '';
+        if (out.source?.type === 'git') delete out.source.token;
+      }
+      return out;
+    }),
+  };
+}
+
+export async function importProject(actor: Actor, spec: ProjectSpec, opts: { deploy?: boolean; name?: string } = {}) {
+  assert(spec && spec.servify === 1 && Array.isArray(spec.services), 400, 'not a servify project spec (expected {"servify":1, "services":[…]})');
+  const project = createProject(actor, { name: opts.name ?? spec.name ?? 'imported', color: spec.color });
+  const tpls = new Map(templates.map((t) => [t.id, t]));
+  const created: Service[] = [];
+  for (const raw of spec.services) {
+    const src = raw.source;
+    assert(src && ['image', 'git', 'local'].includes(src.type), 400, `service ${raw.name}: invalid source`);
+    const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y, protocol: raw.protocol, port: raw.port ?? undefined, env: raw.env };
+    if (src.type === 'image') input.image = src.image;
+    else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile });
+    else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
+    const r = await createService(actor, project.id, input);
+    const svc = servicesTable.get(r.service.id)!;
+    // Regenerate empty secrets from templates so imports without secrets still boot.
+    const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
+    const env = { ...(raw.env ?? {}) };
+    if (tpl) for (const [k, v] of Object.entries(tpl.env)) if (!env[k] && v.includes('{{secret}}')) env[k] = v.replace(/\{\{secret\}\}/g, () => secret(18));
+    Object.assign(svc, {
+      icon: raw.icon ?? svc.icon,
+      templateId: raw.templateId ?? null,
+      replicas: raw.replicas ?? svc.replicas,
+      strategy: raw.strategy ?? svc.strategy,
+      healthcheck: { ...svc.healthcheck, ...(raw.healthcheck ?? {}) },
+      autoscale: { ...svc.autoscale, ...(raw.autoscale ?? {}) },
+      publicHttp: raw.publicHttp ?? svc.publicHttp,
+      domains: [],
+      volumes: raw.volumes ?? [],
+      env,
+      secretKeys: raw.secretKeys ?? svc.secretKeys,
+      startCommand: raw.startCommand ?? null,
+      buildCommand: raw.buildCommand ?? null,
+      resources: { ...svc.resources, ...(raw.resources ?? {}) },
+      autoDeploy: raw.autoDeploy ?? svc.autoDeploy,
+    } satisfies Partial<Service>);
+    if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
+    servicesTable.put(svc);
+    bus.publish({ type: 'service.updated', service: svc });
+    created.push(svc);
+  }
+  if (opts.deploy !== false) for (const s of created) deployService(actor, s.id);
+  recordActivity(actor, 'project.imported', `Imported ${created.length} services into ${project.name}`, project.id);
+  return { project, services: created.map((s) => s.id) };
+}

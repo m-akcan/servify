@@ -62,6 +62,29 @@ export function ProjectSettings({ open, onClose, project }: { open: boolean; onC
             ))}
           </div>
         </Field>
+        <Field label="Export" hint="A servify.json spec of every service — import it elsewhere, commit it, or hand it to an agent. Secrets are left blank.">
+          <div className="row">
+            <Button
+              type="button"
+              icon="download"
+              onClick={async () => {
+                try {
+                  const spec = await api.get<unknown>(`/projects/${project.id}/export`);
+                  const blob = new Blob([JSON.stringify(spec, null, 2)], { type: 'application/json' });
+                  const a = document.createElement('a');
+                  a.href = URL.createObjectURL(blob);
+                  a.download = `${project.slug}.servify.json`;
+                  a.click();
+                  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+                } catch (err) {
+                  toastError(err);
+                }
+              }}
+            >
+              Download servify.json
+            </Button>
+          </div>
+        </Field>
         <div className="row">
           <Button type="button" variant="danger" icon="trash" onClick={() => void del()}>
             Delete project

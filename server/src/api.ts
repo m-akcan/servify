@@ -138,6 +138,14 @@ api.delete('/projects/:id', async (c) => {
   await ops.deleteProject(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
+api.get('/projects/:id/export', (c) => {
+  const spec = ops.exportProject(c.req.param('id'), { secrets: c.req.query('secrets') === '1' && view(c).revealSecrets });
+  return c.json(spec, 200, { 'content-disposition': `attachment; filename="${spec.name.replace(/[^a-z0-9-_]/gi, '_')}.servify.json"` });
+});
+api.post('/projects/import', async (c) => {
+  const body = await c.req.json<{ spec: ops.ProjectSpec; deploy?: boolean; name?: string }>();
+  return c.json(await ops.importProject(actor(c), body.spec, { deploy: body.deploy, name: body.name }), 201);
+});
 api.post('/projects/:id/demo', async (c) => c.json(await ops.seedDemo(actor(c), c.req.param('id'))));
 api.get('/projects/:id/activity', (c) => {
   const p = ops.getProjectOrThrow(c.req.param('id'));
