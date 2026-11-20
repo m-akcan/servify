@@ -13,6 +13,7 @@ import { startProxy } from './proxy.ts';
 import { startMetrics } from './metrics.ts';
 import { startBackgroundJobs } from './jobs.ts';
 import { sessionsTable } from './db.ts';
+import { recoverInterrupted } from './deployer.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -80,6 +81,7 @@ async function main() {
     }
   });
 
+  recoverInterrupted();
   const proxyPort = await startProxy();
   await startEngine();
   startMetrics();

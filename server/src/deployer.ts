@@ -283,3 +283,21 @@ export function isDeploying(serviceId: string) {
 }
 
 export { LABEL };
+
+/** On boot: deployments that were mid-flight when Servify stopped can never finish — fail them cleanly. */
+export function recoverInterrupted() {
+  const stuck = deploymentsTable.all().filter((d) => d.status === 'queued' || d.status === 'building' || d.status === 'deploying');
+  for (const d of stuck) {
+    d.status = 'failed';
+    d.error = 'interrupted: Servify restarted during this deploy';
+    d.finishedAt = Date.now();
+    deploymentsTable.put(d);
+  }
+  for (const svc of servicesTable.all()) {
+    if (svc.status === 'building' || svc.status === 'deploying') {
+      svc.status = svc.activeDeploymentId ? 'running' : 'failed';
+      servicesTable.put(svc);
+    }
+  }
+  if (stuck.length) console.log(`[deployer] marked ${stuck.length} interrupted deployment(s) as failed`);
+}
