@@ -227,7 +227,26 @@ try {
   check('autoscaler adds replicas under load', scaled);
   await api('PATCH', `/services/${service.id}`, { autoscale: { enabled: false } });
 
-  // 13. git auto-deploy from a local bare repository
+  // 13. cron job: manual run + scheduled run
+  console.log('\n▸ cron jobs');
+  const job = await api('POST', `/projects/${project.id}/services`, { image: 'alpine:3.20', name: 'cronjob', protocol: 'none', startCommand: 'echo hello-from-cron-$SERVIFY_JOB_RUN_ID', deploy: false });
+  await api('PATCH', `/services/${job.service.id}`, { schedule: '* * * * *' });
+  const jd = await api('POST', `/services/${job.service.id}/deploy`);
+  const jdd = await waitDeploy(jd.id);
+  check('cron service armed', jdd.status === 'active', jdd.error ?? '');
+  await api('POST', `/services/${job.service.id}/run`);
+  let runs = [];
+  const manualOk = await waitFor(async () => {
+    runs = await api('GET', `/services/${job.service.id}/runs`);
+    return runs.some((r) => r.trigger === 'manual' && r.status === 'succeeded' && r.output.includes('hello-from-cron'));
+  }, 60_000, 'manual run');
+  check('manual run succeeds with output', manualOk, JSON.stringify(runs[0] ?? {}).slice(0, 200));
+  const schedOk = await waitFor(async () => (await api('GET', `/services/${job.service.id}/runs`)).some((r) => r.trigger === 'schedule' && r.status === 'succeeded'), 75_000, 'scheduled run');
+  check('scheduled run fires', schedOk);
+  const jobContainers = execSync(`docker ps -aq --filter label=servify.job=true --filter label=servify.service=${job.service.id}`).toString().trim();
+  check('job containers are cleaned up', jobContainers === '', jobContainers);
+
+  // 14. git auto-deploy from a local bare repository
   if (!process.env.SKIP_GIT) {
     console.log('\n▸ git auto-deploy (local bare repo, up to ~90s)');
     const { mkdtempSync, cpSync, writeFileSync } = await import('node:fs');

@@ -41,6 +41,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
   };
   runsTable.insert(run);
   bus.publish({ type: 'job.run', run });
+  bus.publish({ type: 'service.updated', service: svc });
   let cid: string | null = null;
   try {
     const network = networkName(project.id);
@@ -78,6 +79,8 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     running.delete(svc.id);
     run.finishedAt = Date.now();
     save(run);
+    const latest = servicesTable.get(svc.id);
+    if (latest) bus.publish({ type: 'service.updated', service: latest });
     if (cid) await docker.removeContainer(cid, true).catch(() => {});
   }
   if (run.status === 'failed') recordActivity(actor, 'job.failed', `${svc.name} run failed (exit ${run.exitCode ?? '?'})`, svc.projectId, svc.id);
