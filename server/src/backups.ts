@@ -16,8 +16,8 @@ import { Transform, type Readable, type Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip, createGzip } from 'node:zlib';
 import { backupsTable, deployments as deploymentsTable, projects as projectsTable, services as servicesTable, volumesTable } from './db.ts';
-import { normalizeImageRef } from './docker.ts';
-import { dockerFor, dockerForContainer, nodeOf } from './nodes.ts';
+import { databaseOf, normalizeImageRef } from './docker.ts';
+import { dockerFor, dockerForContainer, isOnline, nodeOf } from './nodes.ts';
 import { busy, drainAndRemove, replicasOf, requestReconcile, volumeName, refreshServiceStatus } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
@@ -27,7 +27,7 @@ import { s3Delete, s3Get, s3Put } from './s3.ts';
 import { config } from './config.ts';
 import { HttpError, id, KeyedLock, sleep } from './util.ts';
 import { parseCron, cronMatches } from './cron.ts';
-import type { BackupMethod, BackupRecord, Service } from './types.ts';
+import type { BackupMethod, BackupRecord, DatabaseKind, Service } from './types.ts';
 
 const HELPER_IMAGE = 'alpine:3.20';
 const lock = new KeyedLock();
@@ -47,15 +47,41 @@ function volumesOf(svc: Service) {
   return ownedMounts(svc.volumes);
 }
 
+const DUMP_FOR: Record<DatabaseKind, BackupMethod> = { postgres: 'pg_dumpall', mysql: 'mysqldump', mongo: 'mongodump' };
+
+function kindFromName(ref: string): DatabaseKind | null {
+  const name = ref.toLowerCase().split('@')[0].replace(/:[^/]*$/, '').split('/').pop() ?? '';
+  if (['postgres', 'postgis', 'timescaledb', 'timescaledb-ha', 'pgvector'].includes(name)) return 'postgres';
+  if (['mysql', 'mariadb', 'percona-server'].includes(name)) return 'mysql';
+  if (['mongo', 'mongodb-community-server'].includes(name)) return 'mongo';
+  return null;
+}
+
 export function backupMethod(svc: Service): BackupMethod | null {
-  const img = deployedImage(svc);
-  const repo = img.split('@')[0].replace(/:[^/]*$/, '');
-  const name = repo.split('/').pop() ?? '';
-  if (svc.templateId === 'postgres' || ['postgres', 'postgis', 'timescaledb', 'timescaledb-ha', 'pgvector'].includes(name)) return 'pg_dumpall';
-  if (svc.templateId === 'mysql' || name === 'mysql' || name === 'mariadb' || name === 'percona-server') return 'mysqldump';
-  if (svc.templateId === 'mongo' || name === 'mongo' || name === 'mongodb-community-server') return 'mongodump';
+  if (svc.templateId === 'postgres') return 'pg_dumpall';
+  if (svc.templateId === 'mysql') return 'mysqldump';
+  if (svc.templateId === 'mongo') return 'mongodump';
+  // The engine detected from the deployed image; then the image names (the deployed image is often
+  // Servify's own per-deployment name, so the source's name counts first).
+  const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
+  const kind = dep?.database ?? kindFromName(svc.source.type === 'image' ? svc.source.image : '') ?? kindFromName(deployedImage(svc));
+  // A sidecar built on a database image (e.g. a pg_dump loop) runs its own command and holds no data: not a server.
+  const ownCommand = !!(svc.startCommand || svc.cmd?.length || svc.entrypoint?.length);
+  if (kind && (volumesOf(svc).length || !ownCommand)) return DUMP_FOR[kind];
   if (volumesOf(svc).length) return 'volume';
   return null;
+}
+
+/** Detect the engine of deployments made before detection existed (once, at startup). */
+export async function backfillDatabaseKinds() {
+  for (const svc of servicesTable.all()) {
+    const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
+    if (!dep?.image || dep.database !== undefined || !isOnline(nodeOf(svc))) continue;
+    const img = await dockerFor(nodeOf(svc)).inspectImage(dep.image).catch(() => null);
+    if (!img) continue;
+    dep.database = databaseOf(img);
+    deploymentsTable.put(dep);
+  }
 }
 
 const EXT: Record<BackupMethod, string> = { pg_dumpall: 'sql.gz', mysqldump: 'sql.gz', mongodump: 'archive.gz', volume: 'tar.gz' };
@@ -391,8 +417,11 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
       const src = dockerVolumeFor(svc.id, v);
       return src ? ['-v', `${src}:/backup/${v.name}`] : [];
     });
-    const wipe = await cli(svc, ['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
-    if (wipe.code !== 0) throw new Error(`could not clear the volumes: ${wipe.stderr.slice(-300)}`);
+    // No volumes (a database keeping its data in the container): removing the container already reset it.
+    if (mounts.length) {
+      const wipe = await cli(svc, ['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
+      if (wipe.code !== 0) throw new Error(`could not clear the volumes: ${wipe.stderr.slice(-300)}`);
+    }
     if (b.method === 'volume') {
       const r = await cli(svc, ['run', '--rm', '-i', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'xzf', '-', '-C', '/backup'], { stdin: createReadStream(tmp) });
       if (r.code !== 0) throw new Error(`extracting the archive failed: ${r.stderr.slice(-400)}`);

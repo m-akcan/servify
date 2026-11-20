@@ -4,7 +4,7 @@
  */
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
-import { normalizeImageRef, type DockerClient } from './docker.ts';
+import { databaseOf, normalizeImageRef, type DockerClient } from './docker.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
 import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable } from './db.ts';
@@ -242,8 +242,10 @@ async function runDeployment(depId: string, actor: Actor) {
         // rollbacks, restarts and moves bring back this image, not whatever the tag points at by then.
         // Kept and cleaned up like built images (the last 5 per service stay for rollbacks).
         const pinned = await d.inspectImage(ref);
+        const project = projectsTable.get(svc.projectId);
+        if (!project) throw new Error('the project was deleted');
         if (pinned?.Id) {
-          const tag = imageTag(projectsTable.get(svc.projectId)!, svc, dep);
+          const tag = imageTag(project, svc, dep);
           await d.tagImage(pinned.Id, tag);
           dep.image = tag;
           dep.sourceLabel = `${sourceLabel(svc)} · ${String(pinned.Id).replace(/^sha256:/, '').slice(0, 7)}`;
@@ -269,6 +271,7 @@ async function runDeployment(depId: string, actor: Actor) {
     // ─── port detection ───
     const img = await d.inspectImage(dep.image!);
     if (!img) throw new Error(`image ${dep.image} not found after build`);
+    dep.database = databaseOf(img); // how backups dump it, whatever the image is called
     const exposed = Object.keys(img.Config?.ExposedPorts ?? {})
       .filter((p) => p.endsWith('/tcp'))
       .map((p) => Number.parseInt(p, 10))

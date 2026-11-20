@@ -10,6 +10,7 @@ import { db } from './db.ts';
 import { readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.ts';
+import { backfillDatabaseKinds } from './backups.ts';
 
 const AUTOSCALER: Actor = { type: 'system', name: 'autoscaler' };
 const GIT: Actor = { type: 'system', name: 'git-watcher' };
@@ -93,6 +94,7 @@ function housekeeping() {
 
 export function startBackgroundJobs() {
   setTimeout(() => housekeeping(), 30_000);
+  setTimeout(() => void backfillDatabaseKinds().catch(() => {}), 5_000);
   setInterval(() => housekeeping(), 60 * 60_000);
   setInterval(() => void autoscale().catch(() => {}), 10_000);
   setInterval(() => void gitWatch().catch(() => {}), 60_000);

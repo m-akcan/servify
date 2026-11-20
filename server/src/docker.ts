@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { Readable } from 'node:stream';
+import type { DatabaseKind } from './types.ts';
 
 export type DockerTarget = { socketPath: string } | { host: string; port: number };
 
@@ -446,6 +447,15 @@ export function splitImageRef(ref: string): [string, string] {
   const lastColon = ref.lastIndexOf(':');
   if (lastColon > lastSlash) return [ref.slice(0, lastColon), ref.slice(lastColon + 1)];
   return [ref, 'latest'];
+}
+
+/** The database engine an image runs, from the variables the official images set (works for renamed or pinned copies). */
+export function databaseOf(image: { Config?: { Env?: string[] | null } } | null): DatabaseKind | null {
+  const env = new Set((image?.Config?.Env ?? []).map((e) => e.split('=')[0]));
+  if (env.has('PG_VERSION') || env.has('PG_MAJOR')) return 'postgres';
+  if (env.has('MARIADB_VERSION') || env.has('MYSQL_VERSION') || env.has('MARIADB_MAJOR') || env.has('MYSQL_MAJOR')) return 'mysql';
+  if (env.has('MONGO_VERSION') || env.has('MONGO_MAJOR')) return 'mongo';
+  return null;
 }
 
 export function normalizeImageRef(ref: string): string {

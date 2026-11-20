@@ -186,12 +186,17 @@ export interface PublishedPort {
   hostIp?: string | null;
 }
 
+/** A database engine Servify knows how to dump (detected from the image, whatever it is called). */
+export type DatabaseKind = 'postgres' | 'mysql' | 'mongo';
+
 export interface Deployment {
   id: string;
   serviceId: string;
   projectId: string;
   status: DeploymentStatus;
   image: string | null;
+  /** The database engine in the image (null = none; missing = not detected yet, from before detection existed). */
+  database?: DatabaseKind | null;
   /** The server it was rolled out on (null = this machine). */
   nodeId?: string | null;
   /** Detected/used port for this image. */

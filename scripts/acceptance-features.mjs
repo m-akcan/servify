@@ -196,6 +196,25 @@ async function main() {
   const scheduled = await waitFor(async () => (await api('GET', `/services/${pg.id}/backups`)).find((b) => b.trigger === 'schedule' && b.status === 'succeeded'), 90_000, 'scheduled backup');
   check('scheduled backup fires on its cron schedule', !!scheduled);
   await api('PATCH', `/services/${pg.id}`, { backup: { enabled: false } });
+  {
+    // A database whose image name says nothing (a pinned or renamed copy, a compose import): still dumped, not tarred.
+    const tpl = (await api('GET', `/services/${pg.id}`)).source.image;
+    const renamed = 'servify-acceptance-renamed-db:pinned';
+    execSync(`docker tag ${tpl} ${renamed}`);
+    cleanups.push(async () => execSync(`docker rmi ${renamed}`, { stdio: 'ignore' }));
+    const rdb = (await api('POST', `/projects/${P.id}/services`, { image: renamed, name: 'renamed-db', protocol: 'tcp', port: 5432, env: { POSTGRES_PASSWORD: 'acceptance' } })).service;
+    await running(P.id, 'renamed-db');
+    await waitFor(async () => (await exec(rdb.id, 'pg_isready -q -U postgres')).exitCode === 0, 60_000, 'renamed postgres ready');
+    check('a renamed postgres image is recognised as postgres', (await api('GET', `/services/${rdb.id}`)).backupMethod === 'pg_dumpall');
+    await exec(rdb.id, `psql -U postgres -c "create table r(v text); insert into r values ('kept');"`);
+    const rb = await api('POST', `/services/${rdb.id}/backups`, {});
+    check('and backed up with a database dump', rb.status === 'succeeded' && rb.method === 'pg_dumpall', `${rb.method} ${rb.error ?? ''}`);
+    await exec(rdb.id, 'psql -U postgres -c "drop table r;"');
+    await api('POST', `/backups/${rb.id}/restore`);
+    await sleep(2000);
+    await waitFor(async () => !(await api('GET', `/services/${rdb.id}`)).restoring, 240_000, 'restore');
+    check('which restores', (await exec(rdb.id, 'psql -U postgres -tAc "select v from r"')).output.trim() === 'kept');
+  }
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ persistent logs and metrics');
