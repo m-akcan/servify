@@ -22,7 +22,7 @@ import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
 import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { clusterStatus } from './pgcluster.ts';
-import { isExternal, parseExternalUrl, externalTarget } from './external.ts';
+import { isExternal, isRoute, parseExternalUrl, parseRedirect, externalTarget } from './external.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
@@ -224,6 +224,10 @@ export const createServiceInput = z.object({
   deploy: z.boolean().optional().describe('Deploy immediately (default true)'),
   server: z.string().optional().describe('Server to run on (id or name from list_servers). Default: this machine.'),
   external: z.string().optional().describe('Route to an address on another machine instead of running anything, e.g. http://192.168.1.20:8080 (owner only)'),
+  udp: z.boolean().optional().describe('External TCP routes: forward UDP on the same proxy port too'),
+  redirect: z.string().optional().describe('Make this a redirect: its domains answer with a redirect to this URL (e.g. https://www.example.com)'),
+  redirectCode: z.number().int().optional().describe('301, 302, 307 or 308 (default 308, permanent)'),
+  keepPath: z.boolean().optional().describe('Redirects: append the requested path (default true)'),
 });
 export type CreateServiceInput = z.infer<typeof createServiceInput>;
 
@@ -233,6 +237,7 @@ function inferName(input: CreateServiceInput): string {
   if (input.image) return input.image.split('/').pop()!.split(':')[0].split('@')[0];
   if (input.repo) return normalizeRepo(input.repo).split('/').pop()!.replace(/\.git$/, '');
   if (input.path) return input.path.replace(/\/+$/, '').split('/').pop() || 'app';
+  if (input.redirect) return (input.redirect.replace(/^[a-z]+:\/\//i, '').split(/[/:]/)[0] || 'redirect').replace(/\./g, '-');
   if (input.external) return input.external.replace(/^[a-z]+:\/\//i, '').split(/[:/]/)[0].replace(/\./g, '-') || 'external';
   return 'service';
 }
@@ -365,8 +370,10 @@ export async function createService(actor: Actor, projectId: string, raw: Create
   else if (input.external) {
     // The router can reach anything this machine can: pointing it somewhere is the owner's call.
     requireOwner(actor, 'External routes');
-    source = { type: 'external', ...parseExternalUrl(input.external, input.protocol ?? 'http') };
-  } else throw new HttpError(400, 'provide one of: templateId, image, repo, path, external');
+    source = { type: 'external', ...parseExternalUrl(input.external, input.protocol ?? 'http'), ...(input.udp ? { udp: true } : {}) };
+    if (input.udp && (input.protocol ?? 'http') !== 'tcp') throw new HttpError(400, 'UDP forwarding needs a TCP route (protocol tcp)');
+  } else if (input.redirect) source = parseRedirect(input.redirect, input.redirectCode, input.keepPath);
+  else throw new HttpError(400, 'provide one of: templateId, image, repo, path, external, redirect');
 
   // A GitHub "tree" URL carries branch and subdirectory.
   if (input.repo) {
@@ -424,23 +431,28 @@ export async function createService(actor: Actor, projectId: string, raw: Create
     updatedAt: Date.now(),
   };
   if (protocol === 'tcp') svc.publicTcpPort = await allocateTcpPort();
-  if (source.type === 'external') {
+  if (source.type === 'external' || source.type === 'redirect') {
     svc.replicas = 1;
     svc.autoDeploy = false;
-    svc.status = 'deploying'; // until the first probe answers
-    if (svc.nodeId) throw new HttpError(400, 'an external route runs on this machine’s router — no server to pick');
+    svc.status = source.type === 'redirect' ? 'running' : 'deploying'; // a route is up once its first probe answers
+    if (source.type === 'redirect') {
+      svc.protocol = 'http';
+      svc.publicTcpPort = null;
+    }
+    if (svc.nodeId) throw new HttpError(400, 'routes run on this machine’s router — no server to pick');
   }
   servicesTable.insert(svc);
   syncServiceVolumes(svc);
   bus.publish({ type: 'service.updated', service: svc });
   recordActivity(actor, 'service.created', `Created ${svc.name} from ${describeSource(source)}`, project.id, svc.id);
   let deployment: Deployment | null = null;
-  if (input.deploy !== false && source.type !== 'external') deployment = queueDeployment(svc, 'create', actor);
+  if (input.deploy !== false && source.type !== 'external' && source.type !== 'redirect') deployment = queueDeployment(svc, 'create', actor);
   return { service: serializeService(servicesTable.get(svc.id)!), deployment: deployment ? serializeDeployment(deployment) : null };
 }
 
 function describeSource(s: Source) {
   if (s.type === 'external') return s.url;
+  if (s.type === 'redirect') return `a redirect to ${s.to}`;
   if (s.type === 'image') return s.image;
   if (s.type === 'git') return s.repo.replace(/^https:\/\/github\.com\//, '');
   return s.path;
@@ -513,6 +525,10 @@ export const updateServiceInput = z.object({
     .optional()
     .describe('Scheduled backups of the service data (databases are dumped, other volumes archived)'),
   external: z.string().optional().describe('New address of an external route (owner only)'),
+  udp: z.boolean().optional().describe('External TCP routes: also forward UDP on the proxy port'),
+  redirect: z.string().optional().describe('Redirects: new target URL'),
+  redirectCode: z.number().int().optional(),
+  keepPath: z.boolean().optional(),
   ports: z
     .array(z.object({ container: z.number().int().min(1).max(65535), host: z.number().int().min(1).max(65535), protocol: z.enum(['tcp', 'udp']), hostIp: z.string().nullable().optional() }))
     .optional()
@@ -537,12 +553,22 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
       changes.push(label);
     }
   };
-  if (isExternal(svc)) {
+  if (svc.source.type === 'redirect') {
+    if (patch.redirect !== undefined || patch.redirectCode !== undefined || patch.keepPath !== undefined) {
+      const cur = svc.source;
+      set('source', parseRedirect(patch.redirect ?? cur.to, patch.redirectCode ?? cur.code, patch.keepPath ?? cur.keepPath), 'redirect');
+    }
+    if (patch.protocol && patch.protocol !== 'http') throw new HttpError(400, 'a redirect answers HTTP');
+  } else if (patch.redirect !== undefined) throw new HttpError(400, 'create a new redirect service instead');
+  if (isRoute(svc)) {
     if ((patch.replicas !== undefined && patch.replicas !== 1) || patch.volumes?.length || patch.ports?.length || patch.autoscale?.enabled || patch.image || patch.repo || patch.path)
       throw new HttpError(400, `${svc.name} is a route to another machine: no replicas, volumes, ports or builds`);
-    if (patch.external !== undefined) {
+    if (svc.source.type === 'external' && (patch.external !== undefined || patch.udp !== undefined)) {
       requireOwner(actor, 'External routes');
-      set('source', { type: 'external', ...parseExternalUrl(patch.external, patch.protocol ?? svc.protocol) }, 'address');
+      const udp = patch.udp ?? svc.source.udp ?? false;
+      const proto = patch.protocol ?? svc.protocol;
+      if (udp && proto !== 'tcp') throw new HttpError(400, 'UDP forwarding needs a TCP route');
+      set('source', { type: 'external', ...parseExternalUrl(patch.external ?? svc.source.url, proto), ...(udp ? { udp: true } : {}) }, 'address');
     }
   } else if (patch.external !== undefined) throw new HttpError(400, 'only a route can change its address; create a new external service instead');
   if (patch.name !== undefined) set('name', patch.name.trim(), 'name');
@@ -667,7 +693,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
 }
 
 function notExternal(svc: Service, what: string) {
-  if (isExternal(svc)) throw new HttpError(400, `${svc.name} is a route to ${(svc.source as any).url} — there's nothing to ${what} here`);
+  if (isRoute(svc)) throw new HttpError(400, `${svc.name} is ${svc.source.type === 'redirect' ? `a redirect to ${(svc.source as any).to}` : `a route to ${(svc.source as any).url}`} — there's nothing to ${what} here`);
 }
 
 /** Host folders, published ports and external routes reach outside the container sandbox: the owner decides. */
@@ -866,8 +892,8 @@ export async function stopService(actor: Actor, serviceId: string) {
 export function startService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   svc.stopped = false;
-  if (isExternal(svc)) {
-    svc.status = 'deploying';
+  if (isRoute(svc)) {
+    svc.status = svc.source.type === 'redirect' ? 'running' : 'deploying';
     servicesTable.put(svc);
     bus.publish({ type: 'service.updated', service: svc });
     recordActivity(actor, 'service.started', `Routing to ${svc.name} again`, svc.projectId, svc.id);
@@ -1110,7 +1136,8 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   };
   if (s.type === 'image') input.image = s.image;
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
-  else if (s.type === 'external') input.external = s.url;
+  else if (s.type === 'external') Object.assign(input, { external: s.url, udp: s.udp });
+  else if (s.type === 'redirect') Object.assign(input, { redirect: s.to, redirectCode: s.code, keepPath: s.keepPath });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
   await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
@@ -1169,13 +1196,14 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   for (const raw of spec.services) {
     const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
     const src = raw.source ?? (tpl ? { type: 'image' as const, image: tpl.image } : undefined);
-    assert(src && ['image', 'git', 'local', 'external'].includes(src.type), 400, `service ${raw.name}: invalid source`);
+    assert(src && ['image', 'git', 'local', 'external', 'redirect'].includes(src.type), 400, `service ${raw.name}: invalid source`);
     // Start from the template (all its variables, volumes, port…) when there is one; the spec overrides.
     const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y };
     if (tpl) input.templateId = tpl.id;
     else if (src.type === 'image') input.image = src.image;
     else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile, token: src.token });
-    else if (src.type === 'external') input.external = src.url;
+    else if (src.type === 'external') Object.assign(input, { external: src.url, udp: src.udp });
+    else if (src.type === 'redirect') Object.assign(input, { redirect: src.to, redirectCode: src.code, keepPath: src.keepPath });
     else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
     if (raw.protocol) input.protocol = raw.protocol;
     if (raw.port) input.port = raw.port;

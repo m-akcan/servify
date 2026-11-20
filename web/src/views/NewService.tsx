@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Modal, Button, Field, Stepper, Segmented, toastError, toast } from '../components/ui.tsx';
+import { Modal, Button, Field, Stepper, Segmented, Switch, toastError, toast } from '../components/ui.tsx';
 import { Icon, ServiceGlyph, type IconName } from '../components/Icon.tsx';
 import { useStore, loadTemplates } from '../lib/store.ts';
 import { api } from '../lib/api.ts';
@@ -29,7 +29,7 @@ function freeSlotNear(c: Pt): Pt {
   return { x: ox, y: oy };
 }
 
-type Kind = 'git' | 'image' | 'local' | 'template' | 'external';
+type Kind = 'git' | 'image' | 'local' | 'template' | 'external' | 'redirect';
 
 const SOURCES: { kind: Kind; title: string; desc: string; icon: IconName }[] = [
   { kind: 'git', title: 'Git repository', desc: 'GitHub or any git URL. Dockerfile or zero-config build.', icon: 'github' },
@@ -37,6 +37,7 @@ const SOURCES: { kind: Kind; title: string; desc: string; icon: IconName }[] = [
   { kind: 'local', title: 'Local folder', desc: 'Build straight from a directory on this machine.', icon: 'folder' },
   { kind: 'template', title: 'Template', desc: 'Databases, caches and tools in one click.', icon: 'template' },
   { kind: 'external', title: 'Another machine', desc: 'Route a domain or TCP port to an address Servify doesn’t run.', icon: 'external' },
+  { kind: 'redirect', title: 'Redirect', desc: 'Send a domain somewhere else (old name → new, bare → www).', icon: 'arrowUpRight' },
 ];
 
 const IMAGE_SUGGESTIONS = ['nginx:alpine', 'traefik/whoami', 'caddy:2-alpine', 'httpd:alpine', 'ghcr.io/', 'node:22-alpine'];
@@ -58,7 +59,7 @@ export function NewServiceModal({
 }) {
   const [kind, setKind] = useState<Kind | null>(null);
   const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false, external: '', tcp: false });
+  const [form, setForm] = useState({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false, external: '', tcp: false, udp: false, redirect: '', keepPath: true });
   const templates = useStore((s) => s.templates);
   const [servers, setServers] = useState<PublicServer[]>([]);
   const [server, setServer] = useState('local');
@@ -73,7 +74,7 @@ export function NewServiceModal({
         .then(setServers)
         .catch(() => setServers([]));
       setKind(null);
-      setForm({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false, external: '', tcp: false });
+      setForm({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false, external: '', tcp: false, udp: false, redirect: '', keepPath: true });
     }
   }, [open]);
 
@@ -101,10 +102,11 @@ export function NewServiceModal({
     if (kind === 'git') void create({ ...common, repo: form.repo, branch: form.branch || undefined, rootDir: form.rootDir || undefined, token: form.token || undefined, dockerfile: form.dockerfile || undefined, replicas: form.replicas });
     if (kind === 'image') void create({ ...common, image: form.image, replicas: form.replicas });
     if (kind === 'local') void create({ ...common, path: form.path, dockerfile: form.dockerfile || undefined, replicas: form.replicas });
-    if (kind === 'external') void create({ name: form.name.trim() || undefined, external: form.external.trim(), protocol: form.tcp ? 'tcp' : 'http' });
+    if (kind === 'external') void create({ name: form.name.trim() || undefined, external: form.external.trim(), protocol: form.tcp ? 'tcp' : 'http', ...(form.tcp && form.udp ? { udp: true } : {}) });
+    if (kind === 'redirect') void create({ name: form.name.trim() || undefined, redirect: form.redirect.trim(), keepPath: form.keepPath });
   };
 
-  const canSubmit = (kind === 'git' && form.repo.trim()) || (kind === 'image' && form.image.trim()) || (kind === 'local' && form.path.trim().startsWith('/')) || (kind === 'external' && /\S+:\d+/.test(form.external));
+  const canSubmit = (kind === 'git' && form.repo.trim()) || (kind === 'image' && form.image.trim()) || (kind === 'local' && form.path.trim().startsWith('/')) || (kind === 'external' && /\S+:\d+/.test(form.external)) || (kind === 'redirect' && /\S+\.\S+/.test(form.redirect));
 
   return (
     <Modal open={open} onClose={onClose} width={640} className="new-service">
@@ -124,7 +126,7 @@ export function NewServiceModal({
           <Icon name="x" size={16} />
         </button>
       </div>
-      {servers.length > 1 && kind !== 'external' && (
+      {servers.length > 1 && kind !== 'external' && kind !== 'redirect' && (
         <div className="ns-server row">
           <Icon name="server" size={14} />
           <span className="faint">Run on</span>
@@ -185,9 +187,42 @@ export function NewServiceModal({
                   <Segmented size="sm" value={form.tcp ? 'tcp' : 'http'} onChange={(v) => set('tcp', v === 'tcp')} options={[{ value: 'http', label: 'HTTP' }, { value: 'tcp', label: 'TCP' }]} />
                 </Field>
               </div>
+              {form.tcp && (
+                <label className="setting-row" style={{ cursor: 'pointer' }}>
+                  <div className="grow">
+                    <div className="title">Forward UDP too</div>
+                    <div className="desc">Same port, for game servers and voice chat.</div>
+                  </div>
+                  <Switch checked={form.udp} onChange={(v) => set('udp', v)} />
+                </label>
+              )}
               <div className="row" style={{ justifyContent: 'flex-end' }}>
                 <Button type="submit" variant="primary" icon="external" loading={busy} disabled={!canSubmit}>
                   Add route
+                </Button>
+              </div>
+            </form>
+          )}
+
+          {kind === 'redirect' && (
+            <form className="ns-form" onSubmit={submit}>
+              <Field label="Redirect to" hint="Add the domains to redirect in its settings afterwards (Networking → custom domains).">
+                <input className="input input-lg mono" autoFocus placeholder="https://www.example.com" value={form.redirect} onChange={(e) => set('redirect', e.target.value)} />
+              </Field>
+              <div className="ns-grid">
+                <Field label="Name" hint="Optional">
+                  <input className="input" placeholder="auto" value={form.name} onChange={(e) => set('name', e.target.value)} />
+                </Field>
+                <label className="setting-row" style={{ cursor: 'pointer' }}>
+                  <div className="grow">
+                    <div className="title">Keep the path</div>
+                  </div>
+                  <Switch checked={form.keepPath} onChange={(v) => set('keepPath', v)} />
+                </label>
+              </div>
+              <div className="row" style={{ justifyContent: 'flex-end' }}>
+                <Button type="submit" variant="primary" icon="arrowUpRight" loading={busy} disabled={!canSubmit}>
+                  Add redirect
                 </Button>
               </div>
             </form>

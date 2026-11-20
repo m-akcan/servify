@@ -176,7 +176,15 @@ Some things aren't HTTP and don't fit the TCP proxy: game servers, voice chat (U
 
 ## External routes
 
-**New → Another machine** routes a domain (with automatic HTTPS) or a TCP proxy port to an address Servify doesn't run — a NAS, a VM, another box on your network (`http://192.168.1.20:8080`). Nothing is deployed: Servify health-checks the address, shows it on the canvas, alerts when it stops answering and serves "unavailable" meanwhile. The original `Host` header and WebSockets pass through. Owner only (the router can reach whatever this machine can); plain HTTP targets only, since Servify terminates HTTPS.
+**New → Another machine** routes a domain (with automatic HTTPS) or a TCP proxy port to an address Servify doesn't run — a NAS, a VM, another box on your network (`http://192.168.1.20:8080`). Nothing is deployed: Servify health-checks the address, shows it on the canvas, alerts when it stops answering and serves "unavailable" meanwhile. The original `Host` header and WebSockets pass through. A TCP route can also **forward UDP** on the same proxy port (game servers, voice chat). Owner only (the router can reach whatever this machine can); plain HTTP targets only, since Servify terminates HTTPS.
+
+## Redirects
+
+**New → Redirect** makes a service whose domains only redirect — an old name to the new one, a bare domain to `www`. It keeps the path by default (`/blog?page=2` lands on the same path), answers `308` (permanent; `301`, `307` and `302` are available), gets HTTPS like any domain, and runs nothing.
+
+## Behind another proxy
+
+When something else terminates HTTPS in front of Servify (Nginx Proxy Manager, a cloud load balancer), set `SERVIFY_TRUSTED_PROXIES` to its address or network (e.g. `172.28.0.0/16`): requests from there keep their `X-Forwarded-Proto: https`, so apps build `https://` links and sign-in callbacks. From anywhere else the header is replaced with what Servify actually saw. The router has no overall request deadline, so long uploads and downloads finish.
 
 ## PostgreSQL clusters
 
@@ -249,6 +257,7 @@ The **production ▾** menu next to the project name creates environments: a ful
 | `SERVIFY_ALLOWED_HOSTS` | | Extra hostnames allowed to reach the dashboard |
 | `SERVIFY_AGENT_HOST` / `SERVIFY_AGENT_PORT` | `0.0.0.0` / `7701` | Where servers' agents connect (TLS). Only started once a server is added |
 | `SERVIFY_AGENT_PUBLIC_HOST` | first LAN IPv4 | Address shown in the join command |
+| `SERVIFY_TRUSTED_PROXIES` | | Proxies in front of Servify (IPs / IPv4 CIDRs) whose `X-Forwarded-Proto` is kept |
 | `SERVIFY_HOST_MOUNTS` | | Folders services may mount from the host (comma-separated). Empty = host folders off |
 | `SERVIFY_AUTH` | `password` | `none` disables the dashboard password (single-user machines only) |
 | `SERVIFY_LOG_RETENTION_DAYS` / `SERVIFY_LOG_MAX_LINES` | `7` / `200000` | Runtime log history per service |

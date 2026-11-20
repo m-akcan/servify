@@ -105,6 +105,7 @@ function setServiceStatus(serviceId: string, status: Service['status'], patch: P
 function sourceLabel(svc: Service): string {
   const s = svc.source;
   if (s.type === 'external') return s.url;
+  if (s.type === 'redirect') return `→ ${s.to}`;
   if (s.type === 'image') return s.image;
   if (s.type === 'git') return `${s.repo.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '')}${s.branch ? `@${s.branch}` : ''}`;
   return (s as any).path;

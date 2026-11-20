@@ -63,7 +63,7 @@ export async function createEnvironment(
 
   const spec = exportProject(base.id, { secrets: true });
   // External routes point at production machines: environments don't get them.
-  spec.services = spec.services.filter((s) => s.source?.type !== 'external');
+  spec.services = spec.services.filter((s) => s.source?.type !== 'external' && s.source?.type !== 'redirect');
   const branch = input.branch?.trim();
   const repo = input.repo ? repoKey(input.repo) : null;
   for (const s of spec.services) {

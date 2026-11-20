@@ -111,7 +111,7 @@ export function buildMcpServer(principal: Principal): McpServer {
     'create_service',
     {
       description:
-        'Create a service in a project from ONE of: templateId, image, repo (git URL or owner/repo), or path (local folder). Deploys immediately unless deploy=false. Returns the service and its first deployment id.',
+        'Create a service in a project from ONE of: templateId, image, repo (git URL or owner/repo), path (local folder), external (route to another machine, owner only) or redirect (a URL its domains redirect to). Deploys immediately unless deploy=false. Returns the service and its first deployment id.',
       inputSchema: { project: projRef, ...ops.createServiceInput.shape },
     },
     wrap(async ({ project, ...input }: { project: string } & ops.CreateServiceInput) => {

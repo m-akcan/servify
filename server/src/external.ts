@@ -17,6 +17,30 @@ type Target = { host: string; port: number; healthy: boolean | null; lastProbe: 
 const targets = new Map<string, Target>();
 
 export const isExternal = (s: Pick<Service, 'source'> | null | undefined): boolean => s?.source.type === 'external';
+/** Services where nothing runs: routes to another machine and redirects. */
+export const isRoute = (s: Pick<Service, 'source'> | null | undefined): boolean => s?.source.type === 'external' || s?.source.type === 'redirect';
+
+/** "https://next.example.com" (+ code, keep path) → a redirect source. */
+export function parseRedirect(raw: string, code?: number, keepPath?: boolean) {
+  const s = raw?.trim();
+  let u: URL;
+  try {
+    u = new URL(/^[a-z]+:\/\//i.test(s) ? s : `https://${s}`);
+  } catch {
+    throw new HttpError(400, `not a URL: ${s}`);
+  }
+  if (!/^https?:$/.test(u.protocol)) throw new HttpError(400, 'redirect to an http(s) URL');
+  const c = code ?? 308;
+  if (![301, 302, 307, 308].includes(c)) throw new HttpError(400, 'redirect code: 301, 302, 307 or 308');
+  return { type: 'redirect' as const, to: u.toString().replace(/\/$/, u.pathname === '/' && !u.search ? '' : '/'), code: c as 301 | 302 | 307 | 308, keepPath: keepPath ?? true };
+}
+
+/** Where a request to a redirect service goes. */
+export function redirectLocation(svc: Service, url: string | undefined) {
+  const src = svc.source as Extract<Service['source'], { type: 'redirect' }>;
+  if (!src.keepPath) return src.to;
+  return `${src.to.replace(/\/$/, '')}${url || '/'}`;
+}
 
 /** "http://10.0.0.5:8080", "10.0.0.5:8080", "tcp://nas.lan:5432" → host + port. */
 export function parseExternalUrl(raw: string, protocol: 'http' | 'tcp' | 'none'): { url: string; host: string; port: number } {

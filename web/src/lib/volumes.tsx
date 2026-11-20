@@ -357,7 +357,7 @@ function HostFolderDialog({ serviceId, onClose }: { serviceId: string; onClose: 
 function ShareDialog({ volumeId, onClose }: { volumeId: string; onClose: () => void }) {
   const cur = useStore((s) => s.current);
   const v = cur?.volumes[volumeId];
-  const services = cur ? cur.order.map((id) => cur.services[id]).filter((x) => x && x.id !== v?.serviceId && x.source.type !== 'external') : [];
+  const services = cur ? cur.order.map((id) => cur.services[id]).filter((x) => x && x.id !== v?.serviceId && x.source.type !== 'external' && x.source.type !== 'redirect') : [];
   const [target, setTarget] = useState(services[0]?.id ?? '');
   const [path, setPath] = useState(v?.mountPath ?? '/data');
   const [busy, setBusy] = useState(false);
@@ -413,7 +413,7 @@ type DockerVolume = { name: string; sizeBytes: number | null; compose: string | 
 /** Take over a Docker volume that already exists on the server (e.g. a Compose project's database). */
 function AdoptDialog({ serviceId, onClose }: { serviceId?: string; onClose: () => void }) {
   const cur = useStore((s) => s.current);
-  const services = cur ? cur.order.map((id) => cur.services[id]).filter((x) => x && x.source.type !== 'external') : [];
+  const services = cur ? cur.order.map((id) => cur.services[id]).filter((x) => x && x.source.type !== 'external' && x.source.type !== 'redirect') : [];
   const [target, setTarget] = useState(serviceId ?? '');
   const svc = target ? cur?.services[target] : undefined;
   const server = svc?.server?.id ?? 'local';

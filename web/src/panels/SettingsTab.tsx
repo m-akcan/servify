@@ -291,6 +291,38 @@ function PublishedPorts({ service: s }: { service: ServiceView }) {
   );
 }
 
+/** Where a redirect service sends visitors. */
+function RedirectSettings({ service: s }: { service: ServiceView }) {
+  const src = s.source.type === 'redirect' ? s.source : null;
+  if (!src) return null;
+  return (
+    <>
+      <Field label="Redirect to" hint="Visitors of this service's domains are sent here.">
+        <CommitInput mono value={src.to} onCommit={(v) => void patch(s.id, { redirect: v })} />
+      </Field>
+      <div className="setting-row">
+        <div className="grow">
+          <div className="title">Keep the path</div>
+          <div className="desc">/blog?page=2 goes to the same path on the new address. Off: everything lands on the address above.</div>
+        </div>
+        <Switch checked={src.keepPath} onChange={(v) => void patch(s.id, { keepPath: v })} />
+      </div>
+      <Field label="Kind">
+        <Segmented<string>
+          value={String(src.code)}
+          onChange={(v) => void patch(s.id, { redirectCode: Number(v) })}
+          options={[
+            { value: '308', label: 'Permanent (308)' },
+            { value: '301', label: '301' },
+            { value: '307', label: 'Temporary (307)' },
+            { value: '302', label: '302' },
+          ]}
+        />
+      </Field>
+    </>
+  );
+}
+
 /** The target of an external route, and whether it answers. */
 function ExternalAddress({ service: s }: { service: ServiceView }) {
   const src = s.source.type === 'external' ? s.source : null;
@@ -301,6 +333,15 @@ function ExternalAddress({ service: s }: { service: ServiceView }) {
       <Field label="Address" hint="Host and port on your network, plain HTTP (Servify does the HTTPS). For TCP routes, the TCP proxy port forwards here.">
         <CommitInput mono value={src.url} onCommit={(v) => void patch(s.id, { external: v })} />
       </Field>
+      {s.protocol === 'tcp' && (
+        <div className="setting-row">
+          <div className="grow">
+            <div className="title">Forward UDP too</div>
+            <div className="desc">The TCP proxy port {s.publicTcpPort ?? ''} also relays UDP to the same address — for game servers and voice chat.</div>
+          </div>
+          <Switch checked={!!src.udp} onChange={(v) => void patch(s.id, { udp: v })} />
+        </div>
+      )}
       <div className="faint" style={{ fontSize: 12 }}>
         {t?.healthy === true ? `Answering · checked ${t.lastProbe ? new Date(t.lastProbe).toLocaleTimeString() : ''}` : t?.healthy === false ? 'Not answering — the router shows a “service unavailable” page until it does.' : 'Checking…'}
       </div>
@@ -341,7 +382,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
   const [domainDraft, setDomainDraft] = useState('');
   const id = s.id;
   const src = s.source;
-  const ext = src.type === 'external';
+  const ext = src.type === 'external' || src.type === 'redirect';
 
   return (
     <div className="settings">
@@ -351,9 +392,14 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         </Field>
       </Section>
 
-      {ext && (
+      {src.type === 'external' && (
         <Section title="Address" icon="external" desc="This service is a route: the router sends its traffic to another machine. Nothing runs here.">
           <ExternalAddress service={s} />
+        </Section>
+      )}
+      {src.type === 'redirect' && (
+        <Section title="Redirect" icon="arrowUpRight" desc="Its domains answer with a redirect. Nothing runs here.">
+          <RedirectSettings service={s} />
         </Section>
       )}
       {!ext && (

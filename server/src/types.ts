@@ -4,8 +4,17 @@ export type SourceImage = { type: 'image'; image: string };
 export type SourceGit = { type: 'git'; repo: string; branch?: string; rootDir?: string; dockerfile?: string; token?: string };
 export type SourceLocal = { type: 'local'; path: string; dockerfile?: string };
 /** An address on another machine: nothing is deployed, the router just sends traffic there. */
-export type SourceExternal = { type: 'external'; url: string; host: string; port: number };
-export type Source = SourceImage | SourceGit | SourceLocal | SourceExternal;
+export type SourceExternal = {
+  type: 'external';
+  url: string;
+  host: string;
+  port: number;
+  /** TCP routes: forward UDP on the same proxy port too (game servers, voice). */
+  udp?: boolean;
+};
+/** A domain that only redirects (e.g. a bare domain to its www, an old name to the new one). */
+export type SourceRedirect = { type: 'redirect'; to: string; code: 301 | 302 | 307 | 308; keepPath: boolean };
+export type Source = SourceImage | SourceGit | SourceLocal | SourceExternal | SourceRedirect;
 
 export type Protocol = 'http' | 'tcp' | 'none';
 export type LbStrategy = 'round-robin' | 'least-conn' | 'ip-hash' | 'random';

@@ -45,6 +45,11 @@ export const config = {
     .map((s) => s.trim())
     .filter(Boolean)
     .map((s) => resolve(s.replace(/^~(?=$|\/)/, homedir()))),
+  /** Proxies in front of Servify (IPs or IPv4 CIDRs, comma-separated) whose X-Forwarded-Proto is believed. */
+  trustedProxies: (process.env.SERVIFY_TRUSTED_PROXIES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
   inContainer: existsSync('/.dockerenv') || process.env.SERVIFY_IN_CONTAINER === '1',
   webDist: resolve(import.meta.dirname, '../../web/dist'),
   version: '0.1.0',

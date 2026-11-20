@@ -7,10 +7,12 @@
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import dgram from 'node:dgram';
 import { createHash } from 'node:crypto';
 import { config } from './config.ts';
 import { services as servicesTable, projects as projectsTable } from './db.ts';
 import { upstreamsFor, noteConn, anyReplicaStarting } from './engine.ts';
+import { redirectLocation } from './external.ts';
 import { bus } from './events.ts';
 import type { Service } from './types.ts';
 import { publicDomain } from './vars.ts';
@@ -115,13 +117,38 @@ const agent = new http.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs:
 
 const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'proxy-authorization', 'proxy-authenticate']);
 
+const ipv4 = (ip: string) => ip.replace(/^::ffff:/, '');
+const ipToInt = (ip: string) => ip.split('.').reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
+/** Is the direct peer one of SERVIFY_TRUSTED_PROXIES (e.g. Nginx Proxy Manager in front of Servify)? */
+export function fromTrustedProxy(remote: string | undefined): boolean {
+  if (!remote || !config.trustedProxies.length) return false;
+  const ip = ipv4(remote);
+  for (const t of config.trustedProxies) {
+    if (!t.includes('/')) {
+      if (ipv4(t) === ip) return true;
+      continue;
+    }
+    const [base, bits] = t.split('/');
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip) || !/^\d+\.\d+\.\d+\.\d+$/.test(base)) continue;
+    const mask = Number(bits) === 0 ? 0 : (~0 << (32 - Number(bits))) >>> 0;
+    if ((ipToInt(ip) & mask) === (ipToInt(base) & mask)) return true;
+  }
+  return false;
+}
+
+/** The scheme the visitor used: ours, or what a trusted proxy in front says (it terminated HTTPS). */
+function visitorProto(req: http.IncomingMessage, proto: 'http' | 'https'): string {
+  const said = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase();
+  return said && (said === 'http' || said === 'https') && fromTrustedProxy(req.socket.remoteAddress) ? said : proto;
+}
+
 function forwardHeaders(req: http.IncomingMessage, svc: Service, proto: 'http' | 'https' = 'http') {
   const h: http.OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) h[k] = v;
   const ip = req.socket.remoteAddress ?? '';
   h['x-forwarded-for'] = req.headers['x-forwarded-for'] ? `${req.headers['x-forwarded-for']}, ${ip}` : ip;
   h['x-forwarded-host'] = req.headers.host ?? '';
-  h['x-forwarded-proto'] = proto;
+  h['x-forwarded-proto'] = visitorProto(req, proto);
   h['x-servify-service'] = svc.slug;
   return h;
 }
@@ -204,7 +231,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
     // Unknown token: it may be the app's own (e.g. its own ACME client) — route it, just never redirect it.
   }
   // Hosts with a trusted certificate are served over HTTPS only.
-  if (proto === 'http' && !isChallenge && getSettings().https.enabled && getSettings().https.redirectHttp && hasPublicCert(hostOnly(req.headers.host))) {
+  if (visitorProto(req, proto) === 'http' && !isChallenge && getSettings().https.enabled && getSettings().https.redirectHttp && hasPublicCert(hostOnly(req.headers.host))) {
     const port = config.httpsPort === 443 ? '' : `:${config.httpsPort}`;
     res.writeHead(308, { location: `https://${hostOnly(req.headers.host)}${port}${req.url ?? '/'}` });
     return res.end();
@@ -212,6 +239,11 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
   const svc = lookup(req.headers.host);
   const clientIp = req.socket.remoteAddress ?? '';
   if (!svc) return unavailable(res, null, req.headers.host ?? '');
+  if (svc.source.type === 'redirect') {
+    count(svc.id, null, 0, false);
+    res.writeHead(svc.source.code, { location: redirectLocation(svc, req.url), 'content-length': '0' });
+    return res.end();
+  }
   const t0 = performance.now();
   const tried = new Set<string>();
 
@@ -281,6 +313,10 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
 function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer, proto: 'http' | 'https' = 'http') {
   const svc = lookup(req.headers.host);
   if (!svc) return socket.destroy();
+  if (svc.source.type === 'redirect') {
+    socket.end(`HTTP/1.1 ${svc.source.code} Redirect\r\nLocation: ${redirectLocation(svc, req.url)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+    return;
+  }
   const up = pickUpstream(svc, socket.remoteAddress ?? '');
   if (!up) {
     socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n');
@@ -372,6 +408,73 @@ function syncTcp() {
   }
 }
 
+// ───────────── UDP for external TCP routes (same port number, e.g. a game server's query + game traffic) ─────────────
+
+type UdpRelay = { port: number; socket: dgram.Socket; clients: Map<string, { up: dgram.Socket; last: number }> };
+const udpRelays = new Map<string, UdpRelay>();
+const udpRetryAt = new Map<string, number>();
+const UDP_IDLE_MS = 120_000;
+
+function syncUdp() {
+  const want = new Map<string, { port: number; host: string; target: number }>();
+  for (const s of servicesTable.all()) {
+    if (s.source.type === 'external' && s.source.udp && s.publicTcpPort && !s.stopped) want.set(s.id, { port: s.publicTcpPort, host: s.source.host, target: s.source.port });
+  }
+  for (const [sid, r] of udpRelays) {
+    const w = want.get(sid);
+    if (!w || w.port !== r.port) {
+      for (const c of r.clients.values()) c.up.close();
+      r.socket.close();
+      udpRelays.delete(sid);
+    }
+  }
+  for (const [sid, w] of want) {
+    if (udpRelays.has(sid) || (udpRetryAt.get(sid) ?? 0) > Date.now()) continue;
+    const socket = dgram.createSocket('udp4');
+    const r: UdpRelay = { port: w.port, socket, clients: new Map() };
+    // One upstream socket per client address, so replies find their way back; idle ones are closed.
+    socket.on('message', (msg, rinfo) => {
+      const key = `${rinfo.address}:${rinfo.port}`;
+      let c = r.clients.get(key);
+      if (!c) {
+        const up = dgram.createSocket(w.host.includes(':') ? 'udp6' : 'udp4');
+        up.on('message', (reply) => {
+          const cc = r.clients.get(key);
+          if (cc) cc.last = Date.now();
+          socket.send(reply, rinfo.port, rinfo.address);
+        });
+        up.on('error', () => {
+          up.close();
+          r.clients.delete(key);
+        });
+        c = { up, last: Date.now() };
+        r.clients.set(key, c);
+      }
+      c.last = Date.now();
+      c.up.send(msg, w.target, w.host);
+    });
+    socket.on('error', (e) => {
+      console.error(`[proxy] udp listener for ${sid} on :${w.port} failed: ${e.message} — retrying`);
+      udpRelays.delete(sid);
+      udpRetryAt.set(sid, Date.now() + 5000);
+      try {
+        socket.close();
+      } catch {}
+    });
+    socket.bind(w.port, config.proxyHost);
+    udpRelays.set(sid, r);
+  }
+  const now = Date.now();
+  for (const r of udpRelays.values()) {
+    for (const [key, c] of r.clients) {
+      if (now - c.last > UDP_IDLE_MS) {
+        c.up.close();
+        r.clients.delete(key);
+      }
+    }
+  }
+}
+
 export function tcpPortInUse(port: number, exceptServiceId?: string): boolean {
   for (const s of servicesTable.all()) if (s.publicTcpPort === port && s.id !== exceptServiceId) return true;
   return port === config.port || port === config.proxyPort || port === config.httpsPort;
@@ -398,6 +501,8 @@ async function startHttps() {
   const server = https.createServer({ ...(await defaultContextOptions()), SNICallback: sniCallback }, (req, res) => handle(req, res, 'https'));
   server.on('upgrade', (req, socket, head) => handleUpgrade(req, socket as net.Socket, head, 'https'));
   server.keepAliveTimeout = 65_000;
+  // No overall request deadline (Node's default is 5 minutes): big uploads and long downloads must finish.
+  server.requestTimeout = 0;
   let port = config.httpsPort;
   const tryListen = (attempts: number) => {
     server.once('error', (e: NodeJS.ErrnoException) => {
@@ -419,8 +524,13 @@ export function startProxy(): Promise<number> {
   const server = http.createServer((req, res) => handle(req, res, 'http'));
   server.on('upgrade', (req, socket, head) => handleUpgrade(req, socket as net.Socket, head, 'http'));
   server.keepAliveTimeout = 65_000;
-  setInterval(syncTcp, 1000);
+  server.requestTimeout = 0; // see startHttps
+  setInterval(() => {
+    syncTcp();
+    syncUdp();
+  }, 1000);
   syncTcp();
+  syncUdp();
   return new Promise((resolve, reject) => {
     let port = config.proxyPort;
     const tryListen = (attempts: number) => {

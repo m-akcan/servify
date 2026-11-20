@@ -120,6 +120,7 @@ export function isHeld(serviceId: string, index: number) {
 
 export function upstreamsFor(svc: Service): Runtime[] {
   if (svc.source.type === 'external') return externalUpstreams(svc);
+  if (svc.source.type === 'redirect') return []; // the router answers redirects itself
   const out: Runtime[] = [];
   for (const r of runtime.values()) {
     if (r.serviceId !== svc.id) continue;
@@ -171,7 +172,7 @@ export function refreshServiceStatus(serviceId: string) {
   const svc = servicesTable.get(serviceId);
   if (!svc) return;
   if (busy.has(serviceId)) return;
-  if (svc.source.type === 'external') return; // its status comes from probing the target (external.ts)
+  if (svc.source.type === 'external' || svc.source.type === 'redirect') return; // routes: probed (external.ts) or always up
   if (!isOnline(nodeOf(svc))) return; // unknown, not down: keep the last status until the server is back
   let next = svc.status;
   if (svc.stopped) next = 'stopped';

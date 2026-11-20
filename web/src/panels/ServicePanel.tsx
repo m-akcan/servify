@@ -53,7 +53,7 @@ export function ServicePanel({ service: s, tab, onClose, onTab }: { service: Ser
           </div>
         </div>
         <div className="row" style={{ gap: 4, alignSelf: 'flex-start' }}>
-          {s.source.type !== 'external' && (
+          {s.source.type !== 'external' && s.source.type !== 'redirect' && (
             <Button variant={s.pendingChanges.length ? 'primary' : 'secondary'} size="sm" icon="rocket" onClick={() => void deploy(s)} loading={false}>
               {s.pendingChanges.length ? 'Deploy changes' : 'Deploy'}
             </Button>

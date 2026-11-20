@@ -93,3 +93,6 @@
 - [x] Compose import: host folders (owner + allowlist, `:ro`/`:z`), UDP → published ports, `adoptVolumes`.
 - [x] `scripts/acceptance-hosting.mjs`: 51/51. MCP: 48 tools.
 - [ ] SELinux relabel untested (no Fedora host here); not yet tried on the real server.
+
+## Round 8 — replacing Nginx Proxy Manager
+- [x] Redirect services (308/301/307/302, keep path), UDP forwarding on external TCP routes (per-client relay, idle timeout), no router request deadline (Node's default 5 min cut long uploads), `SERVIFY_TRUSTED_PROXIES` for X-Forwarded-Proto behind NPM.
