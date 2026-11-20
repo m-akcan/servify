@@ -96,6 +96,22 @@ export function LogsTab({ service: s }: { service: ServiceView }) {
             <Icon name={paused ? 'play' : 'pause'} size={14} />
           </button>
         </Tooltip>
+        <Tooltip label="Download visible logs">
+          <button
+            className="btn btn-ghost btn-sm btn-icon"
+            aria-label="Download"
+            onClick={() => {
+              const text = view.map((l) => `${new Date(l.ts).toISOString()} ${l.tag ?? ''} ${l.text}`.replace(/  +/g, ' ')).join('\n');
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+              a.download = `${s.slug}-${new Date().toISOString().slice(0, 19)}.log`;
+              a.click();
+              setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            }}
+          >
+            <Icon name="download" size={14} />
+          </button>
+        </Tooltip>
         <Tooltip label="Clear">
           <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setLines([])} aria-label="Clear">
             <Icon name="trash" size={14} />
