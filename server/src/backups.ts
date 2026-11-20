@@ -16,7 +16,8 @@ import { Transform, type Readable, type Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip, createGzip } from 'node:zlib';
 import { backupsTable, deployments as deploymentsTable, projects as projectsTable, services as servicesTable, volumesTable } from './db.ts';
-import { docker, dockerHostEnv, normalizeImageRef } from './docker.ts';
+import { normalizeImageRef } from './docker.ts';
+import { dockerFor, dockerForContainer, nodeOf } from './nodes.ts';
 import { busy, drainAndRemove, replicasOf, requestReconcile, volumeName, refreshServiceStatus } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
@@ -82,9 +83,11 @@ const READY: Record<Exclude<BackupMethod, 'volume'>, string> = {
 
 // ───────────────────────────── docker CLI plumbing ─────────────────────────────
 
-function cli(args: string[], io: { stdin?: Readable; stdout?: Writable } = {}): Promise<{ code: number; stderr: string }> {
+/** The docker CLI against the service's server (backup helpers and dumps run there; data streams back here). */
+function cli(svc: Service, args: string[], io: { stdin?: Readable; stdout?: Writable } = {}): Promise<{ code: number; stderr: string }> {
+  const hostEnv = dockerFor(nodeOf(svc)).hostEnv;
   return new Promise((resolve, reject) => {
-    const child = spawn('docker', args, { env: { ...process.env, DOCKER_HOST: dockerHostEnv }, stdio: [io.stdin ? 'pipe' : 'ignore', io.stdout ? 'pipe' : 'ignore', 'pipe'] });
+    const child = spawn('docker', args, { env: { ...process.env, DOCKER_HOST: hostEnv }, stdio: [io.stdin ? 'pipe' : 'ignore', io.stdout ? 'pipe' : 'ignore', 'pipe'] });
     let stderr = '';
     child.stderr!.on('data', (b: Buffer) => {
       stderr += b.toString();
@@ -101,8 +104,9 @@ function cli(args: string[], io: { stdin?: Readable; stdout?: Writable } = {}): 
   });
 }
 
-async function ensureHelper() {
-  if (!(await docker.inspectImage(HELPER_IMAGE))) await docker.pullImage(normalizeImageRef(HELPER_IMAGE));
+async function ensureHelper(svc: Service) {
+  const d = dockerFor(nodeOf(svc));
+  if (!(await d.inspectImage(HELPER_IMAGE))) await d.pullImage(normalizeImageRef(HELPER_IMAGE));
 }
 
 function runningReplica(svc: Service) {
@@ -208,18 +212,18 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
   const tmp = join(tmpDir, `${rec.id}.part`);
   try {
     if (method === 'volume') {
-      await ensureHelper();
+      await ensureHelper(svc);
       const vols = volumesOf(svc);
       if (svc.templateId === 'redis') {
         const r = runningReplica(svc);
-        if (r) await docker.exec(r.containerId, ['/bin/sh', '-c', 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning SAVE >/dev/null 2>&1 || true'], 10 * 60_000).catch(() => {});
+        if (r) await dockerForContainer(r.containerId).exec(r.containerId, ['/bin/sh', '-c', 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning SAVE >/dev/null 2>&1 || true'], 10 * 60_000).catch(() => {});
       }
       const mounts = vols.flatMap((v) => {
         const src = dockerVolumeFor(svc.id, v);
         return src ? ['-v', `${src}:/backup/${v.name}:ro`] : [];
       });
       const out = createWriteStream(tmp);
-      const r = await cli(['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'czf', '-', '-C', '/backup', '.'], { stdout: out });
+      const r = await cli(svc, ['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'czf', '-', '-C', '/backup', '.'], { stdout: out });
       await new Promise<void>((res) => out.end(res));
       if (r.code !== 0) throw new Error(`tar exited with ${r.code}: ${r.stderr.slice(-400)}`);
     } else {
@@ -228,7 +232,7 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
       const gz = createGzip({ level: 6 });
       const out = createWriteStream(tmp);
       const done = pipeline(gz, out);
-      const r = await cli(['exec', rep.containerId, 'sh', '-c', DUMP[method]], { stdout: gz });
+      const r = await cli(svc, ['exec', rep.containerId, 'sh', '-c', DUMP[method]], { stdout: gz });
       gz.end();
       await done;
       if (r.code !== 0) throw new Error(`${method} exited with ${r.code}: ${r.stderr.slice(-400) || 'no output'}`);
@@ -321,7 +325,7 @@ async function waitReady(svc: Service, method: BackupMethod, timeoutMs = 240_000
     const rep = replicasOf(svc.id).find((r) => r.deploymentId === fresh.activeDeploymentId && r.state === 'healthy' && (!fresh.cluster || r.index === fresh.cluster.primary));
     if (rep) {
       if (method === 'volume') return rep;
-      const r = await docker.exec(rep.containerId, ['/bin/sh', '-c', READY[method as Exclude<BackupMethod, 'volume'>]], 15_000).catch(() => ({ exitCode: 1 }));
+      const r = await dockerForContainer(rep.containerId).exec(rep.containerId, ['/bin/sh', '-c', READY[method as Exclude<BackupMethod, 'volume'>]], 15_000).catch(() => ({ exitCode: 1 }));
       if (r.exitCode === 0) return rep;
     }
     await sleep(1500);
@@ -366,7 +370,7 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
   try {
     safety = await runBackup(svc, 'pre-restore', actor, b.destinationId);
     await pipeline(await openBackupStream(b), createWriteStream(tmp));
-    await ensureHelper();
+    await ensureHelper(svc);
 
     // Take the service over from the reconciler, stop it and empty its volumes.
     busy.set(svc.id, new Set(['restore']));
@@ -386,10 +390,10 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
       const src = dockerVolumeFor(svc.id, v);
       return src ? ['-v', `${src}:/backup/${v.name}`] : [];
     });
-    const wipe = await cli(['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
+    const wipe = await cli(svc, ['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
     if (wipe.code !== 0) throw new Error(`could not clear the volumes: ${wipe.stderr.slice(-300)}`);
     if (b.method === 'volume') {
-      const r = await cli(['run', '--rm', '-i', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'xzf', '-', '-C', '/backup'], { stdin: createReadStream(tmp) });
+      const r = await cli(svc, ['run', '--rm', '-i', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'xzf', '-', '-C', '/backup'], { stdin: createReadStream(tmp) });
       if (r.code !== 0) throw new Error(`extracting the archive failed: ${r.stderr.slice(-400)}`);
     }
     busy.delete(svc.id);
@@ -399,7 +403,7 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
     const rep = await waitReady(svc, b.method);
     if (b.method !== 'volume') {
       const input = b.method === 'pg_dumpall' ? createReadStream(tmp).pipe(createGunzip()).pipe(forceDrops()) : createReadStream(tmp).pipe(createGunzip());
-      const r = await cli(['exec', '-i', rep.containerId, 'sh', '-c', RESTORE[b.method]], { stdin: input });
+      const r = await cli(svc, ['exec', '-i', rep.containerId, 'sh', '-c', RESTORE[b.method]], { stdin: input });
       if (r.code !== 0) throw new Error(`replaying the dump failed (exit ${r.code}): ${r.stderr.slice(-400)}`);
     }
     const rec = backupsTable.get(b.id);

@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
-import { docker, dockerHostEnv } from './docker.ts';
+import type { DockerClient } from './docker.ts';
+import { dockerFor, nodeOf } from './nodes.ts';
 import { config } from './config.ts';
 import { detect, DEFAULT_IGNORE } from './detect.ts';
 import type { Deployment, Project, Service } from './types.ts';
@@ -76,14 +77,14 @@ function imageTag(project: Project, svc: Service, dep: Deployment) {
 
 let cliBuildAvailable: boolean | null = null;
 
-async function cliBuild(ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log): Promise<boolean> {
+async function cliBuild(d: DockerClient, ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log): Promise<boolean> {
   if (cliBuildAvailable === false) return false;
   const args = ['build', '--progress=plain', '-t', tag, '-f', dockerfile];
   for (const [k, v] of Object.entries(labels)) args.push('--label', `${k}=${v}`);
   args.push(ctx);
   let missingBuildx = false;
   const r = await run('docker', args, {
-    env: { DOCKER_HOST: dockerHostEnv, DOCKER_BUILDKIT: '1', BUILDKIT_PROGRESS: 'plain' },
+    env: { DOCKER_HOST: d.hostEnv, DOCKER_BUILDKIT: '1', BUILDKIT_PROGRESS: 'plain' },
     onLine: (l) => {
       if (/buildx component is missing|unknown flag: --progress|docker: not found/i.test(l)) missingBuildx = true;
       // Drop BuildKit's per-chunk download/extract progress; keep the "done" lines.
@@ -104,7 +105,7 @@ async function cliBuild(ctx: string, dockerfile: string, tag: string, labels: Re
   return true;
 }
 
-async function apiBuild(ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log) {
+async function apiBuild(d: DockerClient, ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log) {
   // Dockerfile may live outside the context: tar both into a single stream.
   const relDf = relative(ctx, dockerfile);
   const inside = !relDf.startsWith('..') && !isAbsolute(relDf);
@@ -116,7 +117,7 @@ async function apiBuild(ctx: string, dockerfile: string, tag: string, labels: Re
     args.push('-C', dir, dfName);
   }
   const tar = spawn('tar', args, { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, COPYFILE_DISABLE: '1' } });
-  await docker.buildFromTar(tar.stdout, tag, dfName, log, labels);
+  await d.buildFromTar(tar.stdout, tag, dfName, log, labels);
 }
 
 export async function buildSource(svc: Service, project: Project, dep: Deployment, log: Log): Promise<BuildResult> {
@@ -176,8 +177,10 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     const labels = { 'servify.managed': 'true', 'servify.instance': INSTANCE_ID, 'servify.service': svc.id, 'servify.deployment': dep.id };
     log(`▸ Building image ${tag}`);
     const t0 = Date.now();
-    const usedCli = await cliBuild(ctx, dockerfile, tag, labels, log);
-    if (!usedCli) await apiBuild(ctx, dockerfile, tag, labels, log);
+    // Builds run on the service's server (the context is streamed to its Docker).
+    const d = dockerFor(nodeOf(svc));
+    const usedCli = await cliBuild(d, ctx, dockerfile, tag, labels, log);
+    if (!usedCli) await apiBuild(d, ctx, dockerfile, tag, labels, log);
     log(`✓ Built in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     return { image: tag, commitSha, commitMessage, builder: usedCli ? `${builder} · buildkit` : builder };
   } finally {

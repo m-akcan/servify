@@ -10,7 +10,9 @@ import { id, slugify, secret, HttpError, assert } from './util.ts';
 import { getTemplate, templates } from './templates.ts';
 import { queueDeployment, readDeploymentLog, isDeploying } from './deployer.ts';
 import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, deployedSchedule } from './engine.ts';
-import { docker, demuxLines } from './docker.ts';
+import { demuxLines } from './docker.ts';
+import { dockerFor, dockerForContainer, nodeOf, nodeName, onlineNodes, isOnline, LOCAL } from './nodes.ts';
+import { nodesTable } from './db.ts';
 import { referencedServices, publicUrl, resolveEnv, hostUrl } from './vars.ts';
 import { certsTable } from './db.ts';
 import { isLocalHost } from './certs.ts';
@@ -58,6 +60,10 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.jobRunning = isJobRunning(s.id);
   out.backupMethod = backupMethod(s);
   out.clusterStatus = clusterStatus(s);
+  const node = nodeOf(s);
+  out.server = { id: node, name: node === LOCAL ? 'This machine' : nodeName(node), online: isOnline(node) };
+  // Private names (service.project.internal / ${{ x.HOST }}) only resolve on the same server in this version.
+  out.crossServerRefs = referencedServicesOn(s);
   out.restoring = isRestoring(s.id);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
@@ -172,7 +178,9 @@ export async function deleteProject(actor: Actor, projectId: string) {
   projectsTable.delete(p.id);
   bus.publish({ type: 'project.deleted', projectId: p.id });
   recordActivity(actor, 'project.deleted', p.parentId ? `Deleted environment ${p.envName ?? p.slug} of ${p.name}` : `Deleted project ${p.name}`);
-  setTimeout(() => docker.removeNetwork(networkName(p.id)), 15_000);
+  setTimeout(() => {
+    for (const n of onlineNodes()) void dockerFor(n).removeNetwork(networkName(p.id)).catch(() => {});
+  }, 15_000);
 }
 
 // ───────────────────────────── services ─────────────────────────────
@@ -211,6 +219,7 @@ export const createServiceInput = z.object({
   x: z.number().optional(),
   y: z.number().optional(),
   deploy: z.boolean().optional().describe('Deploy immediately (default true)'),
+  server: z.string().optional().describe('Server to run on (id or name from list_servers). Default: this machine.'),
 });
 export type CreateServiceInput = z.infer<typeof createServiceInput>;
 
@@ -369,6 +378,7 @@ export async function createService(actor: Actor, projectId: string, raw: Create
   Object.assign(env, input.env ?? {});
   const protocol = input.protocol ?? tpl?.protocol ?? 'http';
   const pos = input.x !== undefined && input.y !== undefined ? { x: input.x, y: input.y } : placeNew(project.id);
+  const nodeId = resolveServer(input.server);
 
   const svc: Service = {
     id: id('svc'),
@@ -395,6 +405,7 @@ export async function createService(actor: Actor, projectId: string, raw: Create
     buildCommand: input.buildCommand ?? null,
     resources: { cpus: null, memoryMb: null },
     autoDeploy: source.type === 'git',
+    nodeId: nodeId === LOCAL ? null : nodeId,
     x: pos.x,
     y: pos.y,
     status: 'idle',
@@ -608,6 +619,42 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   return serializeService(svc);
 }
 
+/** A server reference (id or name) → node id. */
+export function resolveServer(ref: string | null | undefined): string {
+  if (!ref || ref === LOCAL || /^this machine$/i.test(ref)) return LOCAL;
+  const n = nodesTable.get(ref) ?? nodesTable.all().find((x) => x.name.toLowerCase() === ref.toLowerCase());
+  assert(n, 404, `server not found: ${ref}`);
+  return n.id;
+}
+
+/** Siblings this service references by variable that run on another server (their private names won't resolve). */
+export function referencedServicesOn(s: Service): string[] {
+  const siblings = servicesTable.all('WHERE project_id = ?', s.projectId);
+  return referencedServices(s, siblings)
+    .map((sid) => siblings.find((x) => x.id === sid))
+    .filter((x): x is Service => !!x && nodeOf(x) !== nodeOf(s))
+    .map((x) => x.name);
+}
+
+/** Run a service on another server: redeploy there (zero downtime for stateless services), then retire the old replicas. */
+export async function moveService(actor: Actor, serviceId: string, serverRef: string) {
+  const svc = getServiceOrThrow(serviceId);
+  const target = resolveServer(serverRef);
+  const from = nodeOf(svc);
+  if (target === from) return serializeService(svc);
+  assert(!svc.volumes.length, 409, `${svc.name} has volumes, and data can't move between servers — back it up, detach the volumes, then move it (or restore the backup on the new server)`);
+  assert(isOnline(target), 409, `${nodeName(target)} is offline`);
+  svc.nodeId = target === LOCAL ? null : target;
+  svc.updatedAt = Date.now();
+  servicesTable.put(svc);
+  bus.publish({ type: 'service.updated', service: svc });
+  recordActivity(actor, 'service.moved', `Moved ${svc.name} from ${nodeName(from)} to ${nodeName(target)}`, svc.projectId, svc.id);
+  const active = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
+  if (active?.image && !svc.stopped) queueDeployment(svc, 'config', actor, { image: active.image, port: active.port, fromDeployment: active });
+  else requestReconcile();
+  return serializeService(servicesTable.get(svc.id)!);
+}
+
 export async function scaleService(actor: Actor, serviceId: string, replicas: number) {
   const svc = getServiceOrThrow(serviceId);
   const before = svc.replicas;
@@ -682,17 +729,21 @@ export function startService(actor: Actor, serviceId: string) {
 
 export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; keepVolumes?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
+  assert(isOnline(nodeOf(svc)), 409, `${svc.name} runs on ${nodeName(nodeOf(svc))}, which is offline — bring it back online before deleting`);
   servicesTable.delete(svc.id);
   bus.publish({ type: 'service.deleted', serviceId: svc.id, projectId: svc.projectId });
   if (!opts.quiet) recordActivity(actor, 'service.deleted', `Deleted ${svc.name}`, svc.projectId, null);
   const cids = replicasOf(svc.id).map((r) => r.containerId);
   await drainAndRemove(cids, 1000);
   // Remove any stragglers by label, then volumes and built images.
-  const left = await docker.listContainers([`servify.service=${svc.id}`]); // service ids are globally unique
-  await Promise.all(left.map((c) => docker.removeContainer(c.Id, true)));
+  for (const n of onlineNodes()) {
+    const d = dockerFor(n);
+    const left = await d.listContainers([`servify.service=${svc.id}`]).catch(() => []); // service ids are globally unique
+    await Promise.all(left.map((c) => d.removeContainer(c.Id, true)));
+  }
   await releaseServiceVolumes(svc, !!opts.keepVolumes);
   for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) {
-    if (d.image?.startsWith('servify/')) await docker.removeImage(d.image);
+    if (d.image?.startsWith('servify/') && isOnline(nodeOf(svc))) await dockerFor(nodeOf(svc)).removeImage(d.image);
     deploymentsTable.delete(d.id);
   }
 }
@@ -759,7 +810,7 @@ export async function execInService(actor: Actor, serviceId: string, command: st
   assert(target, 400, `${svc.name} has no running replica${replica !== undefined ? ` #${replica}` : ''}`);
   recordActivity(actor, 'service.exec', `Ran \`${command.slice(0, 80)}\` in ${svc.name}#${target.index}`, svc.projectId, svc.id);
   // Long enough for migrations and one-off scripts; the deadline only stops a command that never exits.
-  return docker.exec(target.containerId, ['/bin/sh', '-c', command], 10 * 60_000);
+  return dockerForContainer(target.containerId).exec(target.containerId, ['/bin/sh', '-c', command], 10 * 60_000);
 }
 
 export function serviceMetrics(serviceId: string, seconds = 300) {

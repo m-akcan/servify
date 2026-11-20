@@ -44,12 +44,6 @@ export const dockerTarget = resolveTarget();
 export const dockerHostEnv =
   'socketPath' in dockerTarget ? `unix://${dockerTarget.socketPath}` : `tcp://${dockerTarget.host}:${dockerTarget.port}`;
 
-let apiPrefix = '';
-
-// Node's global agent kills sockets after 5s idle — fatal for pulls, builds, log follows and the
-// event stream, which can be silent for much longer. Calls reuse sockets; streams get their own.
-const callAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
-const streamAgent = new http.Agent({ keepAlive: false, maxSockets: Infinity });
 
 export class DockerError extends Error {
   status: number;
@@ -68,85 +62,10 @@ type ReqOpts = {
   stream?: boolean;
 };
 
-function buildPath(path: string, query?: ReqOpts['query']): string {
-  let p = apiPrefix + path;
-  if (query) {
-    const qs = new URLSearchParams();
-    for (const [k, v] of Object.entries(query)) if (v !== undefined) qs.set(k, String(v));
-    const s = qs.toString();
-    if (s) p += (p.includes('?') ? '&' : '?') + s;
-  }
-  return p;
-}
-
-function rawRequest(method: string, path: string, opts: ReqOpts = {}): Promise<http.IncomingMessage> {
-  return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = { ...opts.headers };
-    let payload: string | undefined;
-    if (opts.body !== undefined) {
-      payload = JSON.stringify(opts.body);
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = String(Buffer.byteLength(payload));
-    }
-    const req = http.request(
-      { ...dockerTarget, method, path: buildPath(path, opts.query), headers, timeout: opts.timeout, agent: opts.stream ? streamAgent : callAgent },
-      (res) => {
-        if (opts.stream) {
-          res.socket?.setTimeout(0);
-          res.socket?.setKeepAlive(true, 30_000);
-        }
-        resolve(res);
-      },
-    );
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error(`docker ${method} ${path} timed out`)));
-    if (opts.rawBody) {
-      opts.rawBody.pipe(req);
-      opts.rawBody.on('error', (e) => req.destroy(e));
-    } else {
-      if (payload) req.write(payload);
-      req.end();
-    }
-  });
-}
-
 async function readBody(res: http.IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const c of res) chunks.push(c as Buffer);
   return Buffer.concat(chunks).toString('utf8');
-}
-
-async function call<T = any>(method: string, path: string, opts: ReqOpts = {}): Promise<T> {
-  const res = await rawRequest(method, path, opts);
-  const text = await readBody(res);
-  const status = res.statusCode ?? 500;
-  if (status >= 400) {
-    let msg = text;
-    try {
-      msg = JSON.parse(text).message ?? text;
-    } catch {}
-    throw new DockerError(status, msg.trim() || `docker ${method} ${path} failed (${status})`);
-  }
-  if (!text) return undefined as T;
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    return text as T;
-  }
-}
-
-async function stream(method: string, path: string, opts: ReqOpts = {}): Promise<http.IncomingMessage> {
-  const res = await rawRequest(method, path, { ...opts, stream: true });
-  const status = res.statusCode ?? 500;
-  if (status >= 400) {
-    const text = await readBody(res);
-    let msg = text;
-    try {
-      msg = JSON.parse(text).message ?? text;
-    } catch {}
-    throw new DockerError(status, msg.trim());
-  }
-  return res;
 }
 
 /** Iterate newline-delimited JSON objects from a stream. */
@@ -214,206 +133,298 @@ export type ContainerSummary = {
   Created: number;
 };
 
-const networkInflight = new Map<string, Promise<string>>();
 
 function filtersParam(f: Record<string, string[]>) {
   return JSON.stringify(f);
 }
 
-export const docker = {
-  async init(): Promise<{ version: string; apiVersion: string; os: string }> {
-    apiPrefix = '';
-    const v = await call<any>('GET', '/version', { timeout: 5000 });
-    apiPrefix = `/v${v.ApiVersion}`;
-    return { version: v.Version, apiVersion: v.ApiVersion, os: `${v.Os}/${v.Arch}` };
-  },
-  async ping(): Promise<boolean> {
-    try {
-      await call('GET', '/_ping', { timeout: 3000 });
-      return true;
-    } catch {
-      return false;
-    }
-  },
-  info: () => call<any>('GET', '/info'),
+/** A Docker Engine API client bound to one endpoint (the local daemon, or a remote server through its tunnel). */
+export function createDockerClient(target: DockerTarget) {
+  const hostEnv = 'socketPath' in target ? `unix://${target.socketPath}` : `tcp://${target.host}:${target.port}`;
+  const networkInflight = new Map<string, Promise<string>>();
+  let apiPrefix = '';
 
-  listContainers(labels: string[] = [], all = true): Promise<ContainerSummary[]> {
-    return call('GET', '/containers/json', {
-      query: { all, filters: filtersParam({ label: labels }) },
-    });
-  },
-  inspectContainer: (id: string) => call<any>('GET', `/containers/${id}/json`),
-  /** Containers (running or not) that mount a given volume. */
-  containersUsingVolume: (volume: string, all = false): Promise<ContainerSummary[]> =>
-    call('GET', '/containers/json', { query: { all, filters: filtersParam({ volume: [volume] }) } }),
-  /** Disk usage per volume (can be slow on big volumes — poll sparingly). */
-  volumeUsage: async (): Promise<Map<string, number>> => {
-    const r = await call<any>('GET', '/system/df', { query: { type: 'volume' }, timeout: 120_000 });
-    return new Map(((r?.Volumes ?? []) as any[]).map((v) => [v.Name as string, Number(v.UsageData?.Size ?? -1)]));
-  },
-  async createContainer(name: string, spec: unknown): Promise<string> {
-    const r = await call<{ Id: string }>('POST', '/containers/create', { query: { name }, body: spec });
-    return r.Id;
-  },
-  startContainer: (id: string) => call('POST', `/containers/${id}/start`),
-  stopContainer: (id: string, t = 10) => call('POST', `/containers/${id}/stop`, { query: { t }, timeout: (t + 15) * 1000 }),
-  restartContainer: (id: string, t = 5) => call('POST', `/containers/${id}/restart`, { query: { t } }),
-  killContainer: (id: string) => call('POST', `/containers/${id}/kill`),
-  removeContainer: (id: string, force = true) =>
-    call('DELETE', `/containers/${id}`, { query: { force, v: false } }).catch((e) => {
-      if (e instanceof DockerError && (e.status === 404 || e.status === 409)) return;
-      throw e;
-    }),
+  // Node's global agent kills sockets after 5s idle — fatal for pulls, builds, log follows and the
+  // event stream, which can be silent for much longer. Calls reuse sockets; streams get their own.
+  const callAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+  const streamAgent = new http.Agent({ keepAlive: false, maxSockets: Infinity });
 
-  async inspectImage(ref: string): Promise<any | null> {
-    try {
-      return await call('GET', `/images/${encodeURIComponent(ref)}/json`);
-    } catch (e) {
-      if (e instanceof DockerError && e.status === 404) return null;
-      throw e;
+  function buildPath(path: string, query?: ReqOpts['query']): string {
+    let p = apiPrefix + path;
+    if (query) {
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) if (v !== undefined) qs.set(k, String(v));
+      const s = qs.toString();
+      if (s) p += (p.includes('?') ? '&' : '?') + s;
     }
-  },
-  async pullImage(ref: string, onLine?: (line: string) => void): Promise<void> {
-    let [image, tag] = splitImageRef(ref);
-    const res = await stream('POST', '/images/create', { query: { fromImage: image, tag } });
-    const lastStatus = new Map<string, string>();
-    for await (const msg of jsonLines(res)) {
-      if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
-      if (!onLine) continue;
-      const key = msg.id ?? '';
-      const status = `${msg.status ?? ''}`;
-      // Collapse noisy progress updates into a single line per layer state.
-      if (lastStatus.get(key) === status) continue;
-      lastStatus.set(key, status);
-      onLine(key ? `${key}: ${status}` : status);
-    }
-  },
-  removeImage: (ref: string) => call('DELETE', `/images/${encodeURIComponent(ref)}`, { query: { force: false } }).catch(() => {}),
-  listImages: (labels: string[] = []) => call<any[]>('GET', '/images/json', { query: { filters: filtersParam({ label: labels }) } }),
+    return p;
+  }
 
-  async buildFromTar(tar: Readable, tag: string, dockerfile: string, onLine: (l: string) => void, labels: Record<string, string> = {}) {
-    const res = await stream('POST', '/build', {
-      query: { t: tag, dockerfile, rm: true, forcerm: true, labels: JSON.stringify(labels) },
-      rawBody: tar,
-      headers: { 'Content-Type': 'application/x-tar' },
-    });
-    for await (const msg of jsonLines(res)) {
-      if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
-      if (msg.stream) for (const l of String(msg.stream).split('\n')) if (l.trim()) onLine(l);
-      if (msg.status) onLine(String(msg.status));
-    }
-  },
-
-  ensureNetwork(name: string, labels: Record<string, string>): Promise<string> {
-    // Memoize in-flight creation so concurrent replica starts don't race.
-    const pending = networkInflight.get(name);
-    if (pending) return pending;
-    const p = (async () => {
-      try {
-        const n = await call<any>('GET', `/networks/${name}`);
-        return n.Id as string;
-      } catch (e) {
-        if (!(e instanceof DockerError && e.status === 404)) throw e;
+  function rawRequest(method: string, path: string, opts: ReqOpts = {}): Promise<http.IncomingMessage> {
+    return new Promise((resolve, reject) => {
+      const headers: Record<string, string> = { ...opts.headers };
+      let payload: string | undefined;
+      if (opts.body !== undefined) {
+        payload = JSON.stringify(opts.body);
+        headers['Content-Type'] = 'application/json';
+        headers['Content-Length'] = String(Buffer.byteLength(payload));
       }
+      const req = http.request(
+        { ...target, method, path: buildPath(path, opts.query), headers, timeout: opts.timeout, agent: opts.stream ? streamAgent : callAgent },
+        (res) => {
+          if (opts.stream) {
+            res.socket?.setTimeout(0);
+            res.socket?.setKeepAlive(true, 30_000);
+          }
+          resolve(res);
+        },
+      );
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error(`docker ${method} ${path} timed out`)));
+      if (opts.rawBody) {
+        opts.rawBody.pipe(req);
+        opts.rawBody.on('error', (e) => req.destroy(e));
+      } else {
+        if (payload) req.write(payload);
+        req.end();
+      }
+    });
+  }
+
+  async function call<T = any>(method: string, path: string, opts: ReqOpts = {}): Promise<T> {
+    const res = await rawRequest(method, path, opts);
+    const text = await readBody(res);
+    const status = res.statusCode ?? 500;
+    if (status >= 400) {
+      let msg = text;
       try {
-        const r = await call<any>('POST', '/networks/create', {
-          body: { Name: name, Driver: 'bridge', CheckDuplicate: true, Labels: labels },
-        });
-        return r.Id as string;
+        msg = JSON.parse(text).message ?? text;
+      } catch {}
+      throw new DockerError(status, msg.trim() || `docker ${method} ${path} failed (${status})`);
+    }
+    if (!text) return undefined as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return text as T;
+    }
+  }
+
+  async function stream(method: string, path: string, opts: ReqOpts = {}): Promise<http.IncomingMessage> {
+    const res = await rawRequest(method, path, { ...opts, stream: true });
+    const status = res.statusCode ?? 500;
+    if (status >= 400) {
+      const text = await readBody(res);
+      let msg = text;
+      try {
+        msg = JSON.parse(text).message ?? text;
+      } catch {}
+      throw new DockerError(status, msg.trim());
+    }
+    return res;
+  }
+
+  const client = {
+    async init(): Promise<{ version: string; apiVersion: string; os: string }> {
+      apiPrefix = '';
+      const v = await call<any>('GET', '/version', { timeout: 5000 });
+      apiPrefix = `/v${v.ApiVersion}`;
+      return { version: v.Version, apiVersion: v.ApiVersion, os: `${v.Os}/${v.Arch}` };
+    },
+    async ping(): Promise<boolean> {
+      try {
+        await call('GET', '/_ping', { timeout: 3000 });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    info: () => call<any>('GET', '/info'),
+
+    listContainers(labels: string[] = [], all = true): Promise<ContainerSummary[]> {
+      return call('GET', '/containers/json', {
+        query: { all, filters: filtersParam({ label: labels }) },
+      });
+    },
+    inspectContainer: (id: string) => call<any>('GET', `/containers/${id}/json`),
+    /** Containers (running or not) that mount a given volume. */
+    containersUsingVolume: (volume: string, all = false): Promise<ContainerSummary[]> =>
+      call('GET', '/containers/json', { query: { all, filters: filtersParam({ volume: [volume] }) } }),
+    /** Disk usage per volume (can be slow on big volumes — poll sparingly). */
+    volumeUsage: async (): Promise<Map<string, number>> => {
+      const r = await call<any>('GET', '/system/df', { query: { type: 'volume' }, timeout: 120_000 });
+      return new Map(((r?.Volumes ?? []) as any[]).map((v) => [v.Name as string, Number(v.UsageData?.Size ?? -1)]));
+    },
+    async createContainer(name: string, spec: unknown): Promise<string> {
+      const r = await call<{ Id: string }>('POST', '/containers/create', { query: { name }, body: spec });
+      return r.Id;
+    },
+    startContainer: (id: string) => call('POST', `/containers/${id}/start`),
+    stopContainer: (id: string, t = 10) => call('POST', `/containers/${id}/stop`, { query: { t }, timeout: (t + 15) * 1000 }),
+    restartContainer: (id: string, t = 5) => call('POST', `/containers/${id}/restart`, { query: { t } }),
+    killContainer: (id: string) => call('POST', `/containers/${id}/kill`),
+    removeContainer: (id: string, force = true) =>
+      call('DELETE', `/containers/${id}`, { query: { force, v: false } }).catch((e) => {
+        if (e instanceof DockerError && (e.status === 404 || e.status === 409)) return;
+        throw e;
+      }),
+
+    async inspectImage(ref: string): Promise<any | null> {
+      try {
+        return await call('GET', `/images/${encodeURIComponent(ref)}/json`);
       } catch (e) {
-        if (e instanceof DockerError && e.status === 409) return (await call<any>('GET', `/networks/${name}`)).Id as string;
+        if (e instanceof DockerError && e.status === 404) return null;
         throw e;
       }
-    })().finally(() => networkInflight.delete(name));
-    networkInflight.set(name, p);
-    return p;
-  },
-  removeNetwork: (name: string) => call('DELETE', `/networks/${name}`).catch(() => {}),
-  disconnectNetwork: (network: string, container: string) =>
-    call('POST', `/networks/${network}/disconnect`, { body: { Container: container, Force: true } }).catch((e) => {
-      if (e instanceof DockerError && (e.status === 404 || /is not connected/.test(e.message))) return;
-      throw e;
-    }),
-  connectNetwork: (network: string, container: string, aliases: string[] = []) =>
-    call('POST', `/networks/${network}/connect`, {
-      body: { Container: container, EndpointConfig: { Aliases: aliases } },
-    }).catch((e) => {
-      if (e instanceof DockerError && /already exists|is already/.test(e.message)) return;
-      throw e;
-    }),
-
-  createVolume: (name: string, labels: Record<string, string>) =>
-    call('POST', '/volumes/create', { body: { Name: name, Labels: labels } }),
-  removeVolume: (name: string) => call('DELETE', `/volumes/${name}`).catch(() => {}),
-
-  /** Block until the container exits; returns its exit code. */
-  async waitContainer(id: string): Promise<number> {
-    const res = await stream('POST', `/containers/${id}/wait`);
-    let body = '';
-    for await (const c of res) body += c.toString('utf8');
-    try {
-      return JSON.parse(body).StatusCode ?? -1;
-    } catch {
-      return -1;
-    }
-  },
-
-  /** Tar stream of a path inside a container (GET /containers/{id}/archive). */
-  archive: (id: string, path: string) => stream('GET', `/containers/${id}/archive`, { query: { path } }),
-
-  stats: (id: string) => call<any>('GET', `/containers/${id}/stats`, { query: { stream: false, 'one-shot': true }, timeout: 8000 }),
-
-  logs(id: string, opts: { follow?: boolean; tail?: number | 'all'; since?: number; timestamps?: boolean }) {
-    return stream('GET', `/containers/${id}/logs`, {
-      query: {
-        stdout: true,
-        stderr: true,
-        follow: opts.follow ?? false,
-        tail: opts.tail ?? 200,
-        since: opts.since,
-        timestamps: opts.timestamps ?? true,
-      },
-    });
-  },
-
-  events(labels: string[]) {
-    return stream('GET', '/events', {
-      query: { filters: filtersParam({ type: ['container'], label: labels }) },
-    });
-  },
-
-  async exec(id: string, cmd: string[], timeoutMs = 30000): Promise<{ exitCode: number; output: string }> {
-    const ex = await call<{ Id: string }>('POST', `/containers/${id}/exec`, {
-      body: { AttachStdout: true, AttachStderr: true, Tty: false, Cmd: cmd },
-      timeout: Math.min(timeoutMs, 10_000),
-    });
-    // A hard deadline: once the stream is open the socket has no idle timeout, so a command that never exits (or a
-    // daemon that never answers) would otherwise hang the caller forever.
-    let res: http.IncomingMessage | undefined;
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      res?.destroy(new Error(`exec timed out after ${timeoutMs} ms`));
-    }, timeoutMs);
-    try {
-      res = await stream('POST', `/exec/${ex.Id}/start`, { body: { Detach: false, Tty: false }, timeout: timeoutMs });
-      if (timedOut) res.destroy();
-      const lines: string[] = [];
-      for await (const f of demuxLines(res)) {
-        lines.push(f.text);
-        if (lines.length > 2000) lines.shift();
+    },
+    async pullImage(ref: string, onLine?: (line: string) => void): Promise<void> {
+      let [image, tag] = splitImageRef(ref);
+      const res = await stream('POST', '/images/create', { query: { fromImage: image, tag } });
+      const lastStatus = new Map<string, string>();
+      for await (const msg of jsonLines(res)) {
+        if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
+        if (!onLine) continue;
+        const key = msg.id ?? '';
+        const status = `${msg.status ?? ''}`;
+        // Collapse noisy progress updates into a single line per layer state.
+        if (lastStatus.get(key) === status) continue;
+        lastStatus.set(key, status);
+        onLine(key ? `${key}: ${status}` : status);
       }
-      if (timedOut) throw new Error(`exec timed out after ${timeoutMs} ms`);
-      const info = await call<any>('GET', `/exec/${ex.Id}/json`, { timeout: 5000 });
-      return { exitCode: info.ExitCode ?? -1, output: lines.join('\n') };
-    } catch (e) {
-      if (timedOut) throw new Error(`exec timed out after ${timeoutMs} ms`);
-      throw e;
-    } finally {
-      clearTimeout(timer);
-    }
-  },
-};
+    },
+    removeImage: (ref: string) => call('DELETE', `/images/${encodeURIComponent(ref)}`, { query: { force: false } }).catch(() => {}),
+    listImages: (labels: string[] = []) => call<any[]>('GET', '/images/json', { query: { filters: filtersParam({ label: labels }) } }),
+
+    async buildFromTar(tar: Readable, tag: string, dockerfile: string, onLine: (l: string) => void, labels: Record<string, string> = {}) {
+      const res = await stream('POST', '/build', {
+        query: { t: tag, dockerfile, rm: true, forcerm: true, labels: JSON.stringify(labels) },
+        rawBody: tar,
+        headers: { 'Content-Type': 'application/x-tar' },
+      });
+      for await (const msg of jsonLines(res)) {
+        if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
+        if (msg.stream) for (const l of String(msg.stream).split('\n')) if (l.trim()) onLine(l);
+        if (msg.status) onLine(String(msg.status));
+      }
+    },
+
+    ensureNetwork(name: string, labels: Record<string, string>): Promise<string> {
+      // Memoize in-flight creation so concurrent replica starts don't race.
+      const pending = networkInflight.get(name);
+      if (pending) return pending;
+      const p = (async () => {
+        try {
+          const n = await call<any>('GET', `/networks/${name}`);
+          return n.Id as string;
+        } catch (e) {
+          if (!(e instanceof DockerError && e.status === 404)) throw e;
+        }
+        try {
+          const r = await call<any>('POST', '/networks/create', {
+            body: { Name: name, Driver: 'bridge', CheckDuplicate: true, Labels: labels },
+          });
+          return r.Id as string;
+        } catch (e) {
+          if (e instanceof DockerError && e.status === 409) return (await call<any>('GET', `/networks/${name}`)).Id as string;
+          throw e;
+        }
+      })().finally(() => networkInflight.delete(name));
+      networkInflight.set(name, p);
+      return p;
+    },
+    removeNetwork: (name: string) => call('DELETE', `/networks/${name}`).catch(() => {}),
+    disconnectNetwork: (network: string, container: string) =>
+      call('POST', `/networks/${network}/disconnect`, { body: { Container: container, Force: true } }).catch((e) => {
+        if (e instanceof DockerError && (e.status === 404 || /is not connected/.test(e.message))) return;
+        throw e;
+      }),
+    connectNetwork: (network: string, container: string, aliases: string[] = []) =>
+      call('POST', `/networks/${network}/connect`, {
+        body: { Container: container, EndpointConfig: { Aliases: aliases } },
+      }).catch((e) => {
+        if (e instanceof DockerError && /already exists|is already/.test(e.message)) return;
+        throw e;
+      }),
+
+    createVolume: (name: string, labels: Record<string, string>) =>
+      call('POST', '/volumes/create', { body: { Name: name, Labels: labels } }),
+    removeVolume: (name: string) => call('DELETE', `/volumes/${name}`).catch(() => {}),
+
+    /** Block until the container exits; returns its exit code. */
+    async waitContainer(id: string): Promise<number> {
+      const res = await stream('POST', `/containers/${id}/wait`);
+      let body = '';
+      for await (const c of res) body += c.toString('utf8');
+      try {
+        return JSON.parse(body).StatusCode ?? -1;
+      } catch {
+        return -1;
+      }
+    },
+
+    /** Tar stream of a path inside a container (GET /containers/{id}/archive). */
+    archive: (id: string, path: string) => stream('GET', `/containers/${id}/archive`, { query: { path } }),
+
+    stats: (id: string) => call<any>('GET', `/containers/${id}/stats`, { query: { stream: false, 'one-shot': true }, timeout: 8000 }),
+
+    logs(id: string, opts: { follow?: boolean; tail?: number | 'all'; since?: number; timestamps?: boolean }) {
+      return stream('GET', `/containers/${id}/logs`, {
+        query: {
+          stdout: true,
+          stderr: true,
+          follow: opts.follow ?? false,
+          tail: opts.tail ?? 200,
+          since: opts.since,
+          timestamps: opts.timestamps ?? true,
+        },
+      });
+    },
+
+    events(labels: string[]) {
+      return stream('GET', '/events', {
+        query: { filters: filtersParam({ type: ['container'], label: labels }) },
+      });
+    },
+
+    async exec(id: string, cmd: string[], timeoutMs = 30000): Promise<{ exitCode: number; output: string }> {
+      const ex = await call<{ Id: string }>('POST', `/containers/${id}/exec`, {
+        body: { AttachStdout: true, AttachStderr: true, Tty: false, Cmd: cmd },
+        timeout: Math.min(timeoutMs, 10_000),
+      });
+      // A hard deadline: once the stream is open the socket has no idle timeout, so a command that never exits (or a
+      // daemon that never answers) would otherwise hang the caller forever.
+      let res: http.IncomingMessage | undefined;
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        res?.destroy(new Error(`exec timed out after ${timeoutMs} ms`));
+      }, timeoutMs);
+      try {
+        res = await stream('POST', `/exec/${ex.Id}/start`, { body: { Detach: false, Tty: false }, timeout: timeoutMs });
+        if (timedOut) res.destroy();
+        const lines: string[] = [];
+        for await (const f of demuxLines(res)) {
+          lines.push(f.text);
+          if (lines.length > 2000) lines.shift();
+        }
+        if (timedOut) throw new Error(`exec timed out after ${timeoutMs} ms`);
+        const info = await call<any>('GET', `/exec/${ex.Id}/json`, { timeout: 5000 });
+        return { exitCode: info.ExitCode ?? -1, output: lines.join('\n') };
+      } catch (e) {
+        if (timedOut) throw new Error(`exec timed out after ${timeoutMs} ms`);
+        throw e;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+  return Object.assign(client, { target, hostEnv });
+}
+
+export type DockerClient = ReturnType<typeof createDockerClient>;
+
+/** The Docker daemon on this machine. */
+export const docker = createDockerClient(dockerTarget);
 
 export function splitImageRef(ref: string): [string, string] {
   // Handles registry:port/name:tag and name@sha256:...

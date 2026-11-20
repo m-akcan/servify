@@ -7,7 +7,8 @@
  */
 import { EventEmitter } from 'node:events';
 import { db } from './db.ts';
-import { docker, demuxLines } from './docker.ts';
+import { demuxLines } from './docker.ts';
+import { dockerForContainer } from './nodes.ts';
 import { allRuntime } from './engine.ts';
 import { bus } from './events.ts';
 import type { Replica } from './types.ts';
@@ -69,7 +70,7 @@ function attach(r: Replica) {
   (async () => {
     try {
       const since = lastTs(r.containerId);
-      res = await docker.logs(r.containerId, { follow: true, tail: since ? 'all' : 1000, since: since ? since / 1000 : undefined });
+      res = await dockerForContainer(r.containerId).logs(r.containerId, { follow: true, tail: since ? 'all' : 1000, since: since ? since / 1000 : undefined });
       if (dead) return res.destroy();
       for await (const f of demuxLines(res)) {
         const { ts, text } = parseTs(f.text);

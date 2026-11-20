@@ -40,6 +40,8 @@ export interface VolumeRecord {
   /** Per-replica sets: all members share a setId (= member 0's id); replicaIndex says whose data it is. */
   setId?: string | null;
   replicaIndex?: number | null;
+  /** The server whose Docker holds the data (null/undefined = this machine). Volumes never cross servers. */
+  nodeId?: string | null;
   /** Where it is (or was last) mounted. */
   mountPath: string;
   /** Canvas position while detached. */
@@ -115,6 +117,8 @@ export interface Service {
   aliases?: string[];
   /** Replicated database cluster managed by Servify (primary + standbys, failover). */
   cluster?: ClusterConfig | null;
+  /** The server it runs on (null/undefined = this machine). */
+  nodeId?: string | null;
   x: number;
   y: number;
   status: ServiceStatus;
@@ -252,6 +256,8 @@ export type ReplicaState = 'starting' | 'healthy' | 'unhealthy' | 'draining' | '
 
 export interface Replica {
   containerId: string;
+  /** The server running it ('local' = this machine). */
+  nodeId: string;
   name: string;
   serviceId: string;
   deploymentId: string;
@@ -354,3 +360,38 @@ export type ServerEvent =
   | { type: 'volume.updated'; volume: VolumeRecord }
   | { type: 'volume.deleted'; volumeId: string; projectId: string }
   | { type: 'hello'; version: string };
+
+/** Another machine whose Docker runs services for this Servify (connected through `servify agent`). */
+export interface ServerNode {
+  id: string;
+  name: string;
+  /** sha256 of the agent token; the token itself is shown once. */
+  tokenHash: string;
+  tokenPrefix: string;
+  createdAt: number;
+  lastSeenAt: number | null;
+  info: ServerInfo | null;
+}
+
+export interface ServerInfo {
+  hostname: string;
+  os: string;
+  arch: string;
+  cpus: number;
+  memBytes: number;
+  dockerVersion: string;
+  agentVersion: string;
+  address: string | null;
+}
+
+export interface PublicServer {
+  id: string;
+  name: string;
+  local: boolean;
+  status: 'online' | 'offline' | 'pending';
+  lastSeenAt: number | null;
+  connectedAt: number | null;
+  info: ServerInfo | null;
+  services: number;
+  replicas: number;
+}

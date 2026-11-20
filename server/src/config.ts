@@ -34,6 +34,11 @@ export const config = {
   /** Set to "none" to disable dashboard auth entirely (only sensible on a single-user machine). */
   authMode: (process.env.SERVIFY_AUTH ?? 'password') as 'password' | 'none',
   /** When Servify itself runs inside Docker it talks to replicas over the bridge network. */
+  /** Where `servify agent` on other servers connects (TLS). Started only once a server is added. */
+  agentHost: process.env.SERVIFY_AGENT_HOST ?? '0.0.0.0',
+  agentPort: envInt('SERVIFY_AGENT_PORT', 7701),
+  /** Address other servers use to reach this one (shown in the join command). Defaults to the first LAN IPv4. */
+  agentPublicHost: process.env.SERVIFY_AGENT_PUBLIC_HOST ?? '',
   inContainer: existsSync('/.dockerenv') || process.env.SERVIFY_IN_CONTAINER === '1',
   webDist: resolve(import.meta.dirname, '../../web/dist'),
   version: '0.1.0',

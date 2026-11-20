@@ -5,7 +5,7 @@ import { recordActivity, SYSTEM, type Actor } from './events.ts';
 import { updateService, deployService } from './ops.ts';
 import { latestCommit } from './builder.ts';
 import { isDeploying } from './deployer.ts';
-import { docker } from './docker.ts';
+import { dockerFor, nodeOf, isOnline } from './nodes.ts';
 import { db } from './db.ts';
 import { readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -71,7 +71,8 @@ async function imageGc() {
     const deps = deploymentsTable.all('WHERE service_id = ? ORDER BY created_at DESC', svc.id).filter((d) => d.image?.startsWith('servify/'));
     const keep = new Set(deps.slice(0, 5).map((d) => d.image));
     if (svc.activeDeploymentId) keep.add(deploymentsTable.get(svc.activeDeploymentId)?.image ?? null);
-    for (const d of deps.slice(5)) if (d.image && !keep.has(d.image)) await docker.removeImage(d.image);
+    if (!isOnline(nodeOf(svc))) continue;
+    for (const d of deps.slice(5)) if (d.image && !keep.has(d.image)) await dockerFor(nodeOf(svc)).removeImage(d.image);
   }
 }
 

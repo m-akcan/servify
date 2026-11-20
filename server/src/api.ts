@@ -21,6 +21,7 @@ import { tokensTable, deployments as deploymentsTable } from './db.ts';
 import { HttpError } from './util.ts';
 import { config } from './config.ts';
 import { docker, dockerTarget } from './docker.ts';
+import { dockerForContainer, listServers, addServer, renameServer, rotateServerToken, removeServer } from './nodes.ts';
 import { readDeploymentLog } from './deployer.ts';
 import type { ServerEvent } from './types.ts';
 import { Readable } from 'node:stream';
@@ -277,7 +278,7 @@ api.get('/services/:id/volumes/:name/download', async (c) => {
   if (!vol) throw new HttpError(404, 'volume not found');
   const rep = replicasOf(svc.id).find((r) => r.dockerState === 'running');
   if (!rep) throw new HttpError(409, 'start the service to download its data');
-  const res = await docker.archive(rep.containerId, vol.mountPath);
+  const res = await dockerForContainer(rep.containerId).archive(rep.containerId, vol.mountPath);
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
   return new Response(Readable.toWeb(res) as ReadableStream, {
     headers: {
@@ -305,6 +306,26 @@ api.get('/backups/:id/download', async (c) => {
     headers: { 'content-type': 'application/gzip', 'content-disposition': `attachment; filename="${b.key.split('/').pop()}"` },
   });
 });
+// ─── servers ───
+api.get('/servers', (c) => c.json(listServers()));
+api.post('/servers', async (c) => {
+  const { name } = await jsonBody<{ name: string }>(c);
+  return c.json(await addServer(actor(c), name ?? ''), 201);
+});
+api.patch('/servers/:id', async (c) => {
+  const { name } = await jsonBody<{ name: string }>(c);
+  return c.json(renameServer(actor(c), c.req.param('id'), name ?? ''));
+});
+api.post('/servers/:id/token', async (c) => c.json(await rotateServerToken(actor(c), c.req.param('id'))));
+api.delete('/servers/:id', async (c) => {
+  await removeServer(actor(c), c.req.param('id'));
+  return c.json({ ok: true });
+});
+api.post('/services/:id/move', async (c) => {
+  const { server } = await jsonBody<{ server: string }>(c);
+  return c.json(await ops.moveService(actor(c), c.req.param('id'), server ?? ''));
+});
+
 api.post('/services/:id/cluster/switchover', async (c) => {
   const { to } = await jsonBody<{ to?: number }>(c);
   return c.json(await switchover(actor(c), ops.getServiceOrThrow(c.req.param('id')).id, to));

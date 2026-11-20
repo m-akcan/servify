@@ -1,4 +1,4 @@
-import { docker } from './docker.ts';
+import { dockerForContainer, isOnline } from './nodes.ts';
 import { drainTraffic } from './proxy.ts';
 import { allRuntime, setReplicaRps, setReplicaStats } from './engine.ts';
 import { bus } from './events.ts';
@@ -94,13 +94,13 @@ function memMb(s: any): number | null {
 }
 
 async function pollStats() {
-  const reps = allRuntime().filter((r) => r.dockerState === 'running');
+  const reps = allRuntime().filter((r) => r.dockerState === 'running' && isOnline(r.nodeId));
   const live = new Set(reps.map((r) => r.containerId));
   for (const k of prevCpu.keys()) if (!live.has(k)) prevCpu.delete(k);
   await Promise.all(
     reps.map(async (r) => {
       try {
-        const s = await docker.stats(r.containerId);
+        const s = await dockerForContainer(r.containerId).stats(r.containerId);
         setReplicaStats(r.containerId, cpuPercent(r.containerId, s), memMb(s));
       } catch {}
     }),

@@ -15,7 +15,8 @@
  */
 import { services as servicesTable } from './db.ts';
 import type { Service, Replica } from './types.ts';
-import { docker, normalizeImageRef } from './docker.ts';
+import { normalizeImageRef, type DockerClient } from './docker.ts';
+import { dockerFor, dockerForContainer, nodeOf, isOnline } from './nodes.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
 import { busy, holds, replicasOf, replicaAliases, adopt, networkName, requestReconcile, drainAndRemove } from './engine.ts';
@@ -72,7 +73,7 @@ function runningOf(svc: Service): Replica[] {
 
 async function sql(cid: string, query: string, timeoutMs = 3000): Promise<string | null> {
   try {
-    const r = await docker.exec(cid, ['sh', '-c', `psql -X -U "\${POSTGRES_USER:-postgres}" -d postgres -tAF'|' -c ${JSON.stringify(query)}`], timeoutMs);
+    const r = await dockerForContainer(cid).exec(cid, ['sh', '-c', `psql -X -U "\${POSTGRES_USER:-postgres}" -d postgres -tAF'|' -c ${JSON.stringify(query)}`], timeoutMs);
     return r.exitCode === 0 ? r.output.trim() : null;
   } catch {
     return null;
@@ -94,7 +95,7 @@ async function fence(svc: Service, index: number, why: string) {
   set.add(index);
   holds.set(svc.id, set);
   const cids = replicasOf(svc.id).filter((r) => r.index === index).map((r) => r.containerId);
-  for (const cid of cids) await docker.removeContainer(cid, true).catch(() => {});
+  for (const cid of cids) await Promise.resolve().then(() => dockerForContainer(cid).removeContainer(cid, true)).catch(() => {});
   await drainAndRemove(cids, 0).catch(() => {});
   stateOf(svc.id).members.set(index, { index, role: 'fenced', lsn: null, lagBytes: null, streaming: null, syncState: null, containerId: null });
   recordActivity(SYSTEM_ACTOR, 'cluster.fenced', `Fenced ${svc.name} #${index}: ${why}`, svc.projectId, svc.id);
@@ -105,8 +106,8 @@ function release(svc: Service, index: number) {
   requestReconcile();
 }
 
-async function ensureHelper() {
-  if (!(await docker.inspectImage(HELPER_IMAGE))) await docker.pullImage(normalizeImageRef(HELPER_IMAGE));
+async function ensureHelper(d: DockerClient) {
+  if (!(await d.inspectImage(HELPER_IMAGE))) await d.pullImage(normalizeImageRef(HELPER_IMAGE));
 }
 
 /** Empty one member's data volume (it then re-clones from the primary on start). */
@@ -115,38 +116,40 @@ async function wipeMember(svc: Service, index: number) {
   if (!mount) throw new Error('cluster has no per-replica volume');
   const vol = dockerVolumeFor(svc.id, mount, index);
   if (!vol) throw new Error(`volume of #${index} not found`);
-  await ensureHelper();
-  const cid = await docker.createContainer(`svf-wipe-${svc.slug}-${index}-${Date.now().toString(36)}`, {
+  const d = dockerFor(nodeOf(svc));
+  await ensureHelper(d);
+  const cid = await d.createContainer(`svf-wipe-${svc.slug}-${index}-${Date.now().toString(36)}`, {
     Image: HELPER_IMAGE,
     Cmd: ['sh', '-c', 'find /v -mindepth 1 -delete'],
     HostConfig: { Mounts: [{ Type: 'volume', Source: vol, Target: '/v' }], NetworkMode: 'none' },
     Labels: { 'servify.helper': 'wipe' },
   });
   try {
-    await docker.startContainer(cid);
-    const code = await docker.waitContainer(cid);
+    await d.startContainer(cid);
+    const code = await d.waitContainer(cid);
     if (code !== 0) throw new Error(`wipe exited ${code}`);
   } finally {
-    await docker.removeContainer(cid, true).catch(() => {});
+    await d.removeContainer(cid, true).catch(() => {});
   }
 }
 
 /** Give the primary the service name; standbys `<name>-read`. Reconnects containers whose names are wrong. */
 async function syncAliases(svc: Service) {
   const net = networkName(svc.projectId);
+  const d = dockerFor(nodeOf(svc));
   for (const r of runningOf(svc)) {
     const want = replicaAliases(svc, r.index);
     let have: string[] = [];
     try {
-      const info = await docker.inspectContainer(r.containerId);
+      const info = await d.inspectContainer(r.containerId);
       have = info.NetworkSettings?.Networks?.[net]?.Aliases ?? [];
     } catch {
       continue;
     }
     const managed = (list: string[]) => list.filter((a) => a === svc.slug || a === `${svc.slug}-read`).sort().join(',');
     if (managed(want) === managed(have) && have.includes(`${svc.slug}-${r.index}`)) continue;
-    await docker.disconnectNetwork(net, r.containerId);
-    await docker.connectNetwork(net, r.containerId, want);
+    await d.disconnectNetwork(net, r.containerId);
+    await d.connectNetwork(net, r.containerId, want);
     await adopt(r.containerId); // container mode routes by IP: refresh it
   }
 }
@@ -157,7 +160,7 @@ async function repoint(svc: Service, primary: number) {
   for (const r of runningOf(svc)) {
     if (r.index === primary) continue;
     const script = `psql -X -U "\${POSTGRES_USER:-postgres}" -d postgres -v ON_ERROR_STOP=1 -c "alter system set primary_conninfo = 'host=${host} port=5432 user=\${POSTGRES_USER:-postgres} password=\${POSTGRES_PASSWORD} application_name=${svc.slug}-${r.index}'" -c "select pg_reload_conf()"`;
-    await docker.exec(r.containerId, ['sh', '-c', script], 8000).catch(() => {});
+    await dockerForContainer(r.containerId).exec(r.containerId, ['sh', '-c', script], 8000).catch(() => {});
   }
 }
 
@@ -331,6 +334,7 @@ async function tick() {
 async function manage(svc: Service) {
   const st = stateOf(svc.id);
   if (st.operation) return;
+  if (!isOnline(nodeOf(svc))) return; // can't see it: never fail over or fence blind
   if (isRestoring(svc.id)) return; // a restore wipes and re-initialises every member
   const deploying = busy.has(svc.id);
   const reps = runningOf(svc);

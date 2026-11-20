@@ -1,5 +1,6 @@
 /** Scheduled jobs: run a service's active image as a one-off container on its cron schedule. */
-import { docker, demuxLines } from './docker.ts';
+import { demuxLines } from './docker.ts';
+import { dockerFor, nodeOf, onlineNodes } from './nodes.ts';
 import { services as servicesTable, deployments as deploymentsTable, projects as projectsTable, runsTable } from './db.ts';
 import type { JobRun, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
@@ -49,6 +50,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
   bus.publish({ type: 'job.run', run });
   bus.publish({ type: 'service.updated', service: svc });
   let cid: string | null = null;
+  const docker = dockerFor(nodeOf(svc)); // jobs run on the service's server
   try {
     const network = networkName(project.id);
     await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
@@ -138,15 +140,19 @@ function tick() {
 
 /** Kill and remove any job containers of a service (used by stop / delete). */
 export async function killJobs(serviceId: string) {
-  const list = await docker.listContainers([`servify.job=true`, `${LABEL.service}=${serviceId}`]).catch(() => []);
-  await Promise.allSettled(list.map((c) => docker.removeContainer(c.Id, true)));
+  for (const n of onlineNodes()) {
+    const d = dockerFor(n);
+    const list = await d.listContainers([`servify.job=true`, `${LABEL.service}=${serviceId}`]).catch(() => []);
+    await Promise.allSettled(list.map((c) => d.removeContainer(c.Id, true)));
+  }
 }
 
 export function startScheduler() {
   // Job containers can't be resumed after a restart: clean up this instance's leftovers.
-  void docker
+  const local = dockerFor(null);
+  void local
     .listContainers([`servify.job=true`, `${LABEL.instance}=${INSTANCE_ID}`])
-    .then((list) => Promise.allSettled(list.map((c) => docker.removeContainer(c.Id, true))))
+    .then((list) => Promise.allSettled(list.map((c) => local.removeContainer(c.Id, true))))
     .catch(() => {});
   // Mark runs interrupted by a restart, then check the clock every few seconds.
   for (const r of runsTable.all(`WHERE json_extract(data, '$.status') = 'running'`)) {

@@ -16,6 +16,7 @@ import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 import { listCertificates } from './certs.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume } from './volumes.ts';
 import { switchover, clusterStatus } from './pgcluster.ts';
+import { listServers } from './nodes.ts';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
 
@@ -508,6 +509,25 @@ export function buildMcpServer(principal: Principal): McpServer {
     wrap(async ({ service, to }: { service: string; to?: number }) => {
       guard();
       return switchover(actor, ops.getServiceOrThrow(service).id, to);
+    }),
+  );
+
+  server.registerTool(
+    'list_servers',
+    { description: 'Machines this Servify runs services on: this machine plus servers connected with `servify agent` (status, Docker version, how many services/replicas each runs). Add servers in the dashboard (Servers).', inputSchema: {} },
+    wrap(() => listServers()),
+  );
+
+  server.registerTool(
+    'move_service',
+    {
+      description: 'Run a service on another server (id or name from list_servers; "local" = this machine). Redeploys there, then retires the old replicas. Services with volumes cannot move (data stays on its server). Private service names only resolve between services on the same server.',
+      inputSchema: { service: svcRef, server: z.string() },
+      annotations: { destructiveHint: true },
+    },
+    wrap(async ({ service, server: target }: { service: string; server: string }) => {
+      guard();
+      return ops.moveService(actor, service, target);
     }),
   );
 

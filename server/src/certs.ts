@@ -358,3 +358,32 @@ export function startCertificates() {
   soon();
   setInterval(() => void syncCertificates().catch(() => {}), 10 * 60_000);
 }
+
+// ───────────────────────────── agent listener ─────────────────────────────
+
+/** Self-signed certificate for the server-agent listener. Agents pin its SHA-256 fingerprint (from the join command). */
+let agentTls: Promise<{ certPem: string; keyPem: string; fingerprint: string }> | null = null;
+export function agentTlsMaterial() {
+  agentTls ??= (async () => {
+    let mat = (() => {
+      const stored = kv.get('agent_tls');
+      return stored ? openJson<CaMaterial>(stored) : null;
+    })();
+    if (!mat) {
+      const keys = await webcrypto.subtle.generateKey(ALG, true, ['sign', 'verify']);
+      const cert = await x509.X509CertificateGenerator.createSelfSigned({
+        serialNumber: randomBytes(8).toString('hex'),
+        name: 'CN=Servify agent endpoint, O=Servify',
+        notBefore: new Date(Date.now() - 3600_000),
+        notAfter: new Date(Date.now() + 20 * 365 * 86400_000),
+        keys: keys as any,
+        signingAlgorithm: ALG,
+        extensions: [new x509.ExtendedKeyUsageExtension([x509.ExtendedKeyUsage.serverAuth]), new x509.BasicConstraintsExtension(false)],
+      });
+      mat = { certPem: cert.toString('pem').trim() + '\n', keyPem: pem('PRIVATE KEY', await webcrypto.subtle.exportKey('pkcs8', keys.privateKey)) };
+      kv.set('agent_tls', sealJson(mat));
+    }
+    return { ...mat, fingerprint: new X509Certificate(mat.certPem).fingerprint256 };
+  })();
+  return agentTls;
+}

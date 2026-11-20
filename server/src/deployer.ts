@@ -4,7 +4,8 @@
  */
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
-import { docker, normalizeImageRef, dockerHostEnv } from './docker.ts';
+import { normalizeImageRef, type DockerClient } from './docker.ts';
+import { dockerFor, nodeOf, nodeName, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
 import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable } from './db.ts';
 import type { Deployment, DeployTrigger, Service } from './types.ts';
@@ -38,15 +39,15 @@ export function setRollingOrder(fn: typeof rollingOrderHook) {
 function rollingOrder(svc: Service, want: number): number[] {
   return rollingOrderHook?.(svc, want) ?? Array.from({ length: want }, (_, i) => i);
 }
-import { iconForStack } from './ops.ts';
+import { iconForStack, referencedServicesOn } from './ops.ts';
 
 const lock = new KeyedLock();
 
 /** `docker pull` through the CLI, which uses the user's credential store. */
-function cliPull(ref: string, log: (l: string) => void): Promise<boolean> {
+function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promise<boolean> {
   return new Promise((resolve) => {
     log(`▸ Retrying pull with the docker CLI (uses your docker login credentials)`);
-    const child = spawn('docker', ['pull', ref], { env: { ...process.env, DOCKER_HOST: dockerHostEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('docker', ['pull', ref], { env: { ...process.env, DOCKER_HOST: d.hostEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
     const onData = (b: Buffer) => {
       for (const l of b.toString('utf8').split(/\r?\n/)) if (l.trim() && !/Downloading|Extracting|Waiting/.test(l)) log(l);
     };
@@ -188,17 +189,32 @@ async function runDeployment(depId: string, actor: Actor) {
     saveDep(dep);
     setServiceStatus(svc.id, 'building');
     const src = dep.config.source;
+    const node = nodeOf(svc);
+    const d = dockerFor(node);
+    if (node !== LOCAL) log(`▸ Deploying on server ${nodeName(node)}`);
+    const crossRefs = referencedServicesOn(svc);
+    if (crossRefs.length) log(`! ${svc.name} references ${crossRefs.join(', ')} on another server — private names (and \${{ ….HOST }}) only resolve on the same server. Move them together, or use their public URL / TCP address.`);
+    // Images live per server: a rollback or a move may need the image built or pulled again there.
+    if (dep.image && !(await d.inspectImage(dep.image))) {
+      if (src.type === 'image') {
+        log(`▸ ${dep.image} is not on ${nodeName(node)} yet`);
+        dep.image = null;
+      } else if (dep.image.startsWith('servify/')) {
+        log(`▸ ${dep.image} is not on ${nodeName(node)} — rebuilding`);
+        dep.image = null;
+      }
+    }
     if (!dep.image) {
       if (src.type === 'image') {
         const ref = normalizeImageRef(src.image);
-        const local = await docker.inspectImage(ref);
+        const local = await d.inspectImage(ref);
         if (!local || ref.endsWith(':latest')) {
           log(`▸ Pulling ${ref}`);
           try {
-            await docker.pullImage(ref, (l) => log(l));
+            await d.pullImage(ref, (l) => log(l));
           } catch (e) {
             // The Engine API doesn't see `docker login` credentials; the CLI does (private registries).
-            const viaCli = await cliPull(ref, log);
+            const viaCli = await cliPull(d, ref, log);
             if (!viaCli) {
               if (!local) throw e;
               log(`! pull failed (${(e as Error).message}); using cached image`);
@@ -227,7 +243,7 @@ async function runDeployment(depId: string, actor: Actor) {
     }
 
     // ─── port detection ───
-    const img = await docker.inspectImage(dep.image!);
+    const img = await d.inspectImage(dep.image!);
     if (!img) throw new Error(`image ${dep.image} not found after build`);
     const exposed = Object.keys(img.Config?.ExposedPorts ?? {})
       .filter((p) => p.endsWith('/tcp'))

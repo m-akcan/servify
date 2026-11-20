@@ -5,6 +5,7 @@
  *   servify mcp                MCP stdio bridge → a running Servify (SERVIFY_URL, SERVIFY_TOKEN)
  *   servify token <name> [--read]   create an API token directly in the local database
  *   servify service install | uninstall | status | print   run in the background, start at login/boot
+ *   servify agent --join <url> --token <t> --fingerprint <fp>   let a Servify run services on this machine
  */
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -43,10 +44,12 @@ if (cmd === 'start') {
   const { createToken } = await import(pathToFileURL(join(here, '../src/auth.ts')).href);
   const { token, record } = createToken(name, rest.includes('--read') ? 'read' : 'write');
   console.log(`Created ${record.scope} token "${record.name}":\n\n  ${token}\n\nIt won't be shown again.`);
+} else if (cmd === 'agent') {
+  await import(pathToFileURL(join(here, 'agent.mjs')).href);
 } else if (cmd === 'service') {
   const { serviceCommand } = await import(pathToFileURL(join(here, 'service.mjs')).href);
   await serviceCommand(rest[0] ?? 'status', fileURLToPath(import.meta.url));
 } else {
-  console.log('usage: servify [start | mcp | token <name> [--read] | service install|uninstall|status|print]');
+  console.log('usage: servify [start | mcp | token <name> [--read] | service install|uninstall|status|print | agent --join …]');
   process.exit(cmd === 'help' || cmd === '--help' ? 0 : 1);
 }

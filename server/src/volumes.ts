@@ -8,7 +8,7 @@
  */
 import { volumesTable, services as servicesTable, projects as projectsTable } from './db.ts';
 import type { Service, Volume, VolumeRecord } from './types.ts';
-import { docker } from './docker.ts';
+import { dockerFor, nodeOf, nodeName, onlineNodes } from './nodes.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { HttpError, id, slugify } from './util.ts';
 import { INSTANCE_ID, LABEL, busy, drainAndRemove, replicasOf, requestReconcile, refreshServiceStatus } from './engine.ts';
@@ -97,7 +97,7 @@ export function hasSharedVolume(mounts: Volume[] | undefined) {
 }
 
 export async function ensureDockerVolume(v: VolumeRecord) {
-  await docker.createVolume(v.dockerName, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, 'servify.volume': v.id, [LABEL.project]: v.projectId });
+  await dockerFor(v.nodeId).createVolume(v.dockerName, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, 'servify.volume': v.id, [LABEL.project]: v.projectId });
 }
 
 /**
@@ -129,6 +129,7 @@ export function syncServiceVolumes(svc: Service): Service {
       name,
       dockerName: `svf-vol-${vid.slice(4)}`,
       serviceId: svc.id,
+      nodeId: svc.nodeId ?? null,
       mountPath: m.mountPath,
       x: svc.x,
       y: svc.y + 240,
@@ -217,12 +218,14 @@ export async function createVolume(actor: Actor, projectId: string, input: { nam
   if (!project) throw new HttpError(404, 'project not found');
   const name = cleanName(input.name, project.id);
   const vid = id('vol');
+  const target = input.serviceId ? (servicesTable.get(input.serviceId) ?? servicesTable.all().find((s) => s.projectId === project.id && (s.slug === input.serviceId || s.name === input.serviceId))) : null;
   const v = save({
     id: vid,
     projectId: project.id,
     name,
     dockerName: `svf-vol-${vid.slice(4)}`,
     serviceId: null,
+    nodeId: target?.nodeId ?? null,
     mountPath: input.mountPath?.trim() || '/data',
     ...freeSpot(project.id, input.x ?? 0, input.y ?? 0),
     sizeBytes: 0,
@@ -247,10 +250,12 @@ export async function attachVolume(actor: Actor, volumeRef: string, serviceId: s
   const path = mountPath?.trim() || v.mountPath;
   checkMountPath(path);
   if (svc.volumes.some((m) => m.mountPath === path)) throw new HttpError(409, `${svc.name} already has a volume at ${path}`);
+  // Data never crosses servers: a volume lives in one server's Docker.
+  if (nodeOf(v) !== nodeOf(svc)) throw new HttpError(409, `${v.name} is stored on ${nodeName(nodeOf(v))} and ${svc.name} runs on ${nodeName(nodeOf(svc))} — volumes can't move between servers`);
   // A deploy in flight is fine: it keeps its own snapshot, and the redeploy below queues behind it.
   const members = membersOf(v);
   for (const m of members) {
-    if ((await docker.containersUsingVolume(m.dockerName)).length) throw new HttpError(409, `${v.name} is still mounted by a running container — wait a moment and retry`);
+    if ((await dockerFor(m.nodeId).containersUsingVolume(m.dockerName)).length) throw new HttpError(409, `${v.name} is still mounted by a running container — wait a moment and retry`);
   }
   for (const m of members) {
     await ensureDockerVolume(m);
@@ -336,9 +341,10 @@ export async function deleteVolume(actor: Actor, volumeRef: string) {
   const v = getVolumeOrThrow(volumeRef);
   if (v.serviceId) throw new HttpError(409, `${v.name} is attached to ${servicesTable.get(v.serviceId)?.name ?? 'a service'} — detach it first`);
   for (const m of membersOf(v)) {
-    const inUse = await docker.containersUsingVolume(m.dockerName, true);
-    for (const c of inUse) await docker.removeContainer(c.Id, true);
-    await docker.removeVolume(m.dockerName);
+    const d = dockerFor(m.nodeId);
+    const inUse = await d.containersUsingVolume(m.dockerName, true);
+    for (const c of inUse) await d.removeContainer(c.Id, true);
+    await d.removeVolume(m.dockerName);
     volumesTable.delete(m.id);
     bus.publish({ type: 'volume.deleted', volumeId: m.id, projectId: m.projectId });
   }
@@ -350,7 +356,7 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
   for (const m of svc.volumes) {
     const rec = m.volumeId ? volumesTable.get(m.volumeId) : volumesTable.all().find((r) => r.dockerName === legacyDockerName(svc.id, m.name));
     if (!rec) {
-      if (!keep) await docker.removeVolume(legacyDockerName(svc.id, m.name));
+      if (!keep) await dockerFor(svc.nodeId).removeVolume(legacyDockerName(svc.id, m.name));
       continue;
     }
     const spot = keep ? freeSpot(rec.projectId, svc.x + 38, svc.y, rec.id) : null;
@@ -360,7 +366,7 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
         Object.assign(member, spot);
         save(member);
       } else {
-        await docker.removeVolume(member.dockerName);
+        await dockerFor(member.nodeId).removeVolume(member.dockerName);
         volumesTable.delete(member.id);
         bus.publish({ type: 'volume.deleted', volumeId: member.id, projectId: member.projectId });
       }
@@ -371,7 +377,9 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
 /** Project deleted: remove its detached volumes too. */
 export async function deleteProjectVolumes(projectId: string) {
   for (const v of volumesTable.all('WHERE project_id = ?', projectId)) {
-    await docker.removeVolume(v.dockerName);
+    await Promise.resolve()
+      .then(() => dockerFor(v.nodeId).removeVolume(v.dockerName))
+      .catch(() => console.warn(`[volumes] ${v.name} stays on ${nodeName(nodeOf(v))} (offline) — remove it there by hand: docker volume rm ${v.dockerName}`));
     volumesTable.delete(v.id);
   }
 }
@@ -391,9 +399,14 @@ function withSize(v: VolumeRecord): VolumeRecord {
 
 async function pollSizes() {
   if (!volumesTable.all().length) return;
+  for (const node of onlineNodes()) await pollNodeSizes(node);
+}
+
+async function pollNodeSizes(node: string) {
+  if (!volumesTable.all().some((v) => nodeOf(v) === node)) return;
   try {
-    const usage = await docker.volumeUsage();
-    for (const v of volumesTable.all()) {
+    const usage = await dockerFor(node).volumeUsage();
+    for (const v of volumesTable.all().filter((x) => nodeOf(x) === node)) {
       const s = usage.get(v.dockerName);
       if (s === undefined || s < 0) continue;
       if (sizes.get(v.dockerName) !== s) {

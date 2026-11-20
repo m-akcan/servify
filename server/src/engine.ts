@@ -15,6 +15,7 @@ import { sleep, id as newId } from './util.ts';
 import { kv } from './db.ts';
 import { notify } from './notify.ts';
 import { mountsFor, hasSharedVolume } from './volumes.ts';
+import { LOCAL, nodeOf, isOnline, onlineNodes, dockerFor, dockerForContainer, setContainerNode, forgetContainer, containerNodeOf, forwardPort, pruneForwards, onNodeChange } from './nodes.ts';
 
 /** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
 export const INSTANCE_ID = (() => {
@@ -52,6 +53,13 @@ type Runtime = Replica & {
 };
 
 const runtime = new Map<string, Runtime>(); // containerId → runtime
+/** Remote replicas: the server-side published port behind each local forwarder. */
+const remotePorts = new Map<string, number>();
+function dropRuntime(cid: string) {
+  runtime.delete(cid);
+  remotePorts.delete(cid);
+  forgetContainer(cid);
+}
 /** Services with a deploy in flight: the deploy pipeline owns container lifecycle for them. */
 export const busy = new Map<string, Set<string>>(); // serviceId → deployment ids being rolled out
 /** Containers being drained before removal. */
@@ -116,7 +124,7 @@ export function upstreamsFor(svc: Service): Runtime[] {
     if (svc.cluster && r.index !== svc.cluster.primary) continue; // writes go to the primary only
     if (r.deploymentId !== svc.activeDeploymentId) continue;
     if (r.state !== 'healthy' || draining.has(r.containerId)) continue;
-    if (!r.host || !r.port) continue;
+    if (!r.host || !r.port || !isOnline(r.nodeId)) continue;
     out.push(r);
   }
   return out.sort((a, b) => a.index - b.index);
@@ -161,6 +169,7 @@ export function refreshServiceStatus(serviceId: string) {
   const svc = servicesTable.get(serviceId);
   if (!svc) return;
   if (busy.has(serviceId)) return;
+  if (!isOnline(nodeOf(svc))) return; // unknown, not down: keep the last status until the server is back
   let next = svc.status;
   if (svc.stopped) next = 'stopped';
   else if (!svc.activeDeploymentId) next = svc.status === 'failed' ? 'failed' : 'idle';
@@ -245,8 +254,11 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   if (!project) throw new Error('project missing');
   if (!dep.image) throw new Error('deployment has no image');
   const network = networkName(project.id);
-  await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
-  if (config.inContainer) await joinNetwork(network);
+  const node = nodeOf(svc);
+  const d = dockerFor(node);
+  const remote = node !== LOCAL;
+  await d.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
+  if (config.inContainer && !remote) await joinNetwork(network);
   const port = dep.port;
   const env = { ...(dep as any).resolvedEnv ?? dep.config.env };
   if (port && !env.PORT) env.PORT = String(port);
@@ -261,7 +273,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   // Only volumes currently attached to this service are mounted (volumes can move between services).
   const mounts = mountsFor(svc.id, dep.config.volumes, index);
   for (const m of mounts) {
-    await docker.createVolume(m.Source, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
+    await d.createVolume(m.Source, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
   }
 
   const exposed = port && dep.config.protocol !== 'none' ? { [`${port}/tcp`]: {} } : undefined;
@@ -281,7 +293,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
     HostConfig: {
       RestartPolicy: { Name: 'unless-stopped' },
       PortBindings:
-        exposed && !config.inContainer ? { [`${port}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '' }] } : undefined,
+        exposed && (remote || !config.inContainer) ? { [`${port}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '' }] } : undefined,
       Mounts: mounts,
       NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
       Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
@@ -301,22 +313,28 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   }
   const name = containerName(project, svc, dep, index);
   // A stale container with the same name (e.g. from a crash mid-create) must go first.
-  await docker.removeContainer(name, true).catch(() => {});
-  const cid = await docker.createContainer(name, spec);
-  await docker.startContainer(cid);
-  await adopt(cid);
+  await d.removeContainer(name, true).catch(() => {});
+  const cid = await d.createContainer(name, spec);
+  setContainerNode(cid, node);
+  await d.startContainer(cid);
+  await adopt(cid, node);
   return cid;
 }
 
 /** Inspect a container and register/refresh its runtime entry. */
-export async function adopt(cid: string): Promise<Runtime | null> {
+export async function adopt(cid: string, nodeId = containerNodeOf(cid)): Promise<Runtime | null> {
+  if (!isOnline(nodeId)) return runtime.get(cid) ?? null; // unknown while the server is offline: keep what we knew
+  const remote = nodeId !== LOCAL;
   let info: any;
   try {
-    info = await docker.inspectContainer(cid);
-  } catch {
-    runtime.delete(cid);
+    info = await dockerFor(nodeId).inspectContainer(cid);
+  } catch (e) {
+    if (!isOnline(nodeId)) return runtime.get(cid) ?? null;
+    if ((e as any)?.status !== 404) return runtime.get(cid) ?? null; // a transient error is not a deleted container
+    dropRuntime(cid);
     return null;
   }
+  setContainerNode(cid, nodeId);
   const labels = info.Config.Labels ?? {};
   const serviceId = labels[LABEL.service];
   const deploymentId = labels[LABEL.deployment];
@@ -324,11 +342,21 @@ export async function adopt(cid: string): Promise<Runtime | null> {
   const dep = deploymentsTable.get(deploymentId);
   const port = dep?.port ?? null;
   const network = networkName(labels[LABEL.project]);
-  if (config.inContainer) await joinNetwork(network);
+  if (config.inContainer && !remote) await joinNetwork(network);
   let host: string | null = null;
   let hostPort: number | null = null;
   if (port) {
-    if (config.inContainer) {
+    if (remote) {
+      // Published on the server's 127.0.0.1; reached through a local forwarder over the agent tunnel.
+      const b = info.NetworkSettings?.Ports?.[`${port}/tcp`]?.[0];
+      if (b?.HostPort) {
+        try {
+          hostPort = await forwardPort(nodeId, Number(b.HostPort));
+          host = '127.0.0.1';
+          remotePorts.set(cid, Number(b.HostPort));
+        } catch {}
+      }
+    } else if (config.inContainer) {
       host = info.NetworkSettings?.Networks?.[network]?.IPAddress || null;
       hostPort = port;
     } else {
@@ -344,6 +372,7 @@ export async function adopt(cid: string): Promise<Runtime | null> {
   const restarts = info.RestartCount ?? 0;
   const r: Runtime = prev ?? {
     containerId: cid,
+    nodeId,
     name: String(info.Name ?? '').replace(/^\//, ''),
     serviceId,
     deploymentId,
@@ -369,6 +398,7 @@ export async function adopt(cid: string): Promise<Runtime | null> {
     r.state = 'starting';
   }
   r.restarts = restarts;
+  r.nodeId = nodeId;
   r.dockerState = dockerState;
   r.host = host;
   r.port = hostPort;
@@ -466,7 +496,7 @@ function startProber() {
     const now = Date.now();
     for (const r of runtime.values()) {
       const svc = servicesTable.get(r.serviceId);
-      if (!svc) continue;
+      if (!svc || !isOnline(r.nodeId)) continue;
       const interval = r.state === 'healthy' ? svc.healthcheck.intervalSec * 1000 : 700;
       if (now - r.lastProbe >= interval) void probe(r, svc);
     }
@@ -502,7 +532,7 @@ export async function waitHealthy(cids: string[], svc: Service, timeoutMs: numbe
 
 export async function tailContainer(cid: string, lines = 30): Promise<string[]> {
   try {
-    const res = await docker.logs(cid, { tail: lines, timestamps: false });
+    const res = await dockerForContainer(cid).logs(cid, { tail: lines, timestamps: false });
     const out: string[] = [];
     for await (const f of demuxLines(res)) out.push(f.text);
     return out;
@@ -535,10 +565,18 @@ export async function drainAndRemove(cids: string[], graceMs = 8000) {
   await Promise.all(
     cids.map(async (c) => {
       try {
-        await docker.stopContainer(c, 10);
+        await dockerForContainer(c).stopContainer(c, 10);
       } catch {}
-      await docker.removeContainer(c, true).catch(() => {});
-      runtime.delete(c);
+      try {
+        await dockerForContainer(c).removeContainer(c, true);
+      } catch {
+        if (!isOnline(containerNodeOf(c))) {
+          // The server is offline: forget the container here; the reconciler removes it when the server is back.
+          draining.delete(c);
+          return;
+        }
+      }
+      dropRuntime(c);
       draining.delete(c);
     }),
   );
@@ -580,11 +618,24 @@ export async function reconcile(): Promise<void> {
 }
 
 async function reconcileOnce() {
-  const containers = (await docker.listContainers([`${LABEL.managed}=true`])).filter((c) => isOurs(c.Labels));
+  // Every online server's containers. Offline servers keep their last known runtime: unknown is not gone.
+  const nodes = onlineNodes();
+  const containers: (ContainerSummary & { node: string })[] = [];
+  const listed = new Set<string>();
+  for (const node of nodes) {
+    try {
+      const list = (await dockerFor(node).listContainers([`${LABEL.managed}=true`])).filter((c) => isOurs(c.Labels));
+      for (const c of list) containers.push({ ...c, node });
+      listed.add(node);
+    } catch (e) {
+      console.error(`[engine] could not list containers on ${node}:`, (e as Error).message);
+    }
+  }
   const live = new Set(containers.map((c) => c.Id));
-  for (const cid of [...runtime.keys()]) if (!live.has(cid)) runtime.delete(cid);
+  for (const [cid, r] of [...runtime]) if (listed.has(r.nodeId) && !live.has(cid)) dropRuntime(cid);
+  for (const c of containers) setContainerNode(c.Id, c.node);
 
-  const byService = new Map<string, ContainerSummary[]>();
+  const byService = new Map<string, (ContainerSummary & { node: string })[]>();
   for (const c of containers) {
     const sid = c.Labels[LABEL.service];
     if (!sid) continue;
@@ -595,8 +646,8 @@ async function reconcileOnce() {
   // Orphans: containers whose service no longer exists.
   for (const [sid, list] of byService) {
     if (!servicesTable.get(sid)) {
-      await Promise.allSettled(list.map((c) => docker.removeContainer(c.Id, true)));
-      for (const c of list) runtime.delete(c.Id);
+      await Promise.allSettled(list.map((c) => dockerFor(c.node).removeContainer(c.Id, true)));
+      for (const c of list) dropRuntime(c.Id);
       byService.delete(sid);
     }
   }
@@ -605,7 +656,7 @@ async function reconcileOnce() {
   for (const sid of ids) {
     try {
       for (const c of byService.get(sid) ?? []) {
-        if (!runtime.has(c.Id) || runtime.get(c.Id)!.dockerState !== c.State) await adopt(c.Id);
+        if (!runtime.has(c.Id) || runtime.get(c.Id)!.dockerState !== c.State) await adopt(c.Id, c.node);
       }
       // Re-read state right before acting: a deploy may have switched versions while this pass ran.
       const svc = servicesTable.get(sid);
@@ -614,9 +665,17 @@ async function reconcileOnce() {
         publishReplicas(svc);
         continue;
       }
+      const home = nodeOf(svc);
+      // Moved to another server: what is left on the old one goes once no deploy is rolling it out.
+      const strays = (byService.get(sid) ?? []).filter((c) => c.node !== home && !draining.has(c.Id));
+      if (strays.length) void drainAndRemove(strays.map((c) => c.Id), 4000);
+      if (!isOnline(home)) {
+        publishReplicas(svc);
+        continue; // never recreate or remove anything on a server we can't see
+      }
       converging.add(sid);
       try {
-        const fresh = (await docker.listContainers([`${LABEL.service}=${sid}`])).filter((c) => isOurs(c.Labels) && c.Labels[LABEL.managed] === 'true');
+        const fresh = (await dockerFor(home).listContainers([`${LABEL.service}=${sid}`])).filter((c) => isOurs(c.Labels) && c.Labels[LABEL.managed] === 'true');
         if (!busy.has(sid)) await convergeService(servicesTable.get(sid) ?? svc, fresh);
       } finally {
         converging.delete(sid);
@@ -625,6 +684,14 @@ async function reconcileOnce() {
     } catch (e) {
       console.error(`[engine] converge ${sid} failed:`, (e as Error).message);
     }
+  }
+
+  // Close forwarders that no replica uses any more.
+  for (const node of nodes) {
+    if (node === LOCAL) continue;
+    const keep = new Set<number>();
+    for (const [cid, port] of remotePorts) if (runtime.get(cid)?.nodeId === node) keep.add(port);
+    pruneForwards(node, keep);
   }
 }
 
@@ -650,6 +717,7 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
   if (toRemove.length) void drainAndRemove(toRemove, 4000);
 
   if (!dep || !dep.image || svc.stopped) return;
+  const d = dockerFor(nodeOf(svc));
 
   // Crash-loop detection: many restarts in a short window → back off.
   const recentCrashes = [...runtime.values()]
@@ -676,9 +744,9 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
       if (backingOff) continue;
       const r = runtime.get(c.Id);
       r?.crashTimes.push(Date.now());
-      await docker.startContainer(c.Id).catch(async () => {
-        await docker.removeContainer(c.Id, true).catch(() => {});
-        runtime.delete(c.Id);
+      await d.startContainer(c.Id).catch(async () => {
+        await d.removeContainer(c.Id, true).catch(() => {});
+        dropRuntime(c.Id);
       });
       await adopt(c.Id);
     }
@@ -687,36 +755,53 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
 
 // ───────────────────────────── docker events ─────────────────────────────
 
-async function watchEvents() {
-  for (;;) {
-    try {
-      const res = await docker.events([`${LABEL.managed}=true`]);
-      for await (const ev of jsonLines(res)) {
-        const cid: string = ev.id ?? ev.Actor?.ID;
-        const action: string = ev.Action ?? ev.status ?? '';
-        if (!cid) continue;
-        const attrs = ev.Actor?.Attributes ?? {};
-        if (attrs[LABEL.instance] && attrs[LABEL.instance] !== INSTANCE_ID) continue;
-        if (['die', 'start', 'restart', 'destroy', 'oom', 'stop', 'kill'].includes(action.split(':')[0])) {
-          if (action === 'destroy') runtime.delete(cid);
-          else await adopt(cid);
-          const r = runtime.get(cid);
-          const svcId = r?.serviceId ?? ev.Actor?.Attributes?.[LABEL.service];
-          const svc = svcId ? servicesTable.get(svcId) : null;
-          if (svc) publishReplicas(svc);
-          if (action === 'die' || action === 'destroy') requestReconcile();
+const watching = new Set<string>();
+/** Follow one server's Docker events while it is online. */
+async function watchEvents(node: string) {
+  if (watching.has(node)) return;
+  watching.add(node);
+  try {
+    while (isOnline(node)) {
+      try {
+        const res = await dockerFor(node).events([`${LABEL.managed}=true`]);
+        for await (const ev of jsonLines(res)) {
+          const cid: string = ev.id ?? ev.Actor?.ID;
+          const action: string = ev.Action ?? ev.status ?? '';
+          if (!cid) continue;
+          const attrs = ev.Actor?.Attributes ?? {};
+          if (attrs[LABEL.instance] && attrs[LABEL.instance] !== INSTANCE_ID) continue;
+          if (['die', 'start', 'restart', 'destroy', 'oom', 'stop', 'kill'].includes(action.split(':')[0])) {
+            if (action === 'destroy') dropRuntime(cid);
+            else await adopt(cid, node);
+            const r = runtime.get(cid);
+            const svcId = r?.serviceId ?? ev.Actor?.Attributes?.[LABEL.service];
+            const svc = svcId ? servicesTable.get(svcId) : null;
+            if (svc) publishReplicas(svc);
+            if (action === 'die' || action === 'destroy') requestReconcile();
+          }
         }
+      } catch (e) {
+        if (isOnline(node)) console.error(`[engine] docker event stream lost (${node}):`, (e as Error).message);
       }
-    } catch (e) {
-      console.error('[engine] docker event stream lost:', (e as Error).message);
+      await sleep(2000);
     }
-    await sleep(2000);
+  } finally {
+    watching.delete(node);
   }
 }
 
 export async function startEngine() {
   startProber();
-  void watchEvents();
+  void watchEvents(LOCAL);
+  onNodeChange((node, online) => {
+    if (!online) return;
+    // Back online: refresh what we knew (new forwarders), follow its events, and converge.
+    void (async () => {
+      for (const [cid, r] of [...runtime]) if (r.nodeId === node) await adopt(cid, node);
+      void watchEvents(node);
+      requestReconcile();
+    })();
+  });
   await reconcile();
   setInterval(() => requestReconcile(), 5000);
 }
