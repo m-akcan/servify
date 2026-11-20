@@ -1,0 +1,12 @@
+services:
+  servify:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7700:7700"   # dashboard, API, MCP
+      - "127.0.0.1:8080:8080"   # edge router / load balancer
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - servify-data:/data
+volumes:
+  servify-data:

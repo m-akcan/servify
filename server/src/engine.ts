@@ -4,6 +4,7 @@
  * Every Docker object Servify owns carries `servify.*` labels, so restarts re-adopt containers.
  */
 import net from 'node:net';
+import { hostname } from 'node:os';
 import http from 'node:http';
 import { docker, demuxLines, jsonLines, type ContainerSummary } from './docker.ts';
 import { services as servicesTable, projects as projectsTable, deployments as deploymentsTable } from './db.ts';
@@ -56,6 +57,19 @@ const draining = new Set<string>();
 const lastPublished = new Map<string, string>();
 /** Short-lived memo of crash-looping services to back off re-creation. */
 const backoffUntil = new Map<string, number>();
+
+const joined = new Set<string>();
+/** In-container mode: attach Servify's own container to a project network so it can reach replicas. */
+async function joinNetwork(network: string) {
+  if (joined.has(network)) return;
+  const self = process.env.HOSTNAME || hostname();
+  try {
+    await docker.connectNetwork(network, self);
+    joined.add(network);
+  } catch (e) {
+    console.error(`[engine] could not join ${network} (is HOSTNAME this container's id?):`, (e as Error).message);
+  }
+}
 
 export function networkName(projectId: string) {
   return `servify_${projectId}`;
@@ -166,6 +180,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   if (!dep.image) throw new Error('deployment has no image');
   const network = networkName(project.id);
   await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
+  if (config.inContainer) await joinNetwork(network);
   const port = dep.port;
   const env = { ...(dep as any).resolvedEnv ?? dep.config.env };
   if (port && !env.PORT) env.PORT = String(port);
@@ -233,6 +248,7 @@ async function adopt(cid: string): Promise<Runtime | null> {
   const dep = deploymentsTable.get(deploymentId);
   const port = dep?.port ?? null;
   const network = networkName(labels[LABEL.project]);
+  if (config.inContainer) await joinNetwork(network);
   let host: string | null = null;
   let hostPort: number | null = null;
   if (port) {

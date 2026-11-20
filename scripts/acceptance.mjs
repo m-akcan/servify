@@ -156,12 +156,113 @@ try {
   const resolved2 = await api('GET', `/services/${service.id}/variables/resolved`);
   check('cross-service variable reference resolves', resolved2.env.REDIS?.startsWith('redis://default:') && resolved2.unresolved.length === 0, JSON.stringify(resolved2.unresolved));
   void resolved;
+
+  // 7. failed deploy (stateless) keeps the old version serving
+  console.log('\n▸ failure safety');
+  await api('PATCH', `/services/${service.id}`, { startCommand: 'exit 3' });
+  const bad1 = await api('POST', `/services/${service.id}/deploy`);
+  const bd1 = await waitDeploy(bad1.id);
+  check('broken stateless deploy fails', bd1.status === 'failed', bd1.status);
+  check('old version still serves after failed deploy', (await hit(host)).status === 200);
+  await api('PATCH', `/services/${service.id}`, { startCommand: null });
+
+  // 8. volume service: data persists across redeploy, survives a failed deploy
+  const redisCmd = async (cmd) =>
+    new Promise((resolve) => {
+      const s = net.connect(svc.publicTcpPort, '127.0.0.1', () => s.write(`AUTH ${svc.env.REDIS_PASSWORD}\r\n${cmd}\r\n`));
+      let buf = '';
+      s.on('data', (c) => (buf += c));
+      setTimeout(() => (s.destroy(), resolve(buf)), 700);
+      s.on('error', () => resolve(''));
+    });
+  await redisCmd('SET servify-test persisted');
+  await redisCmd('SAVE');
+  const rr = await api('POST', `/services/${r.service.id}/restart`);
+  await waitDeploy(rr.id);
+  await waitFor(async () => (await healthyCount(r.service.id)) === 1, 60_000, 'redis healthy');
+  check('redis data survives a redeploy', (await redisCmd('GET servify-test')).includes('persisted'));
+  const origStart = svc.startCommand;
+  await api('PATCH', `/services/${r.service.id}`, { startCommand: 'exit 4' });
+  const bad2 = await api('POST', `/services/${r.service.id}/deploy`);
+  const bd2 = await waitDeploy(bad2.id);
+  check('broken stateful deploy fails', bd2.status === 'failed', bd2.status);
+  check('stateful service recovers old version', await waitFor(async () => (await healthyCount(r.service.id)) === 1, 60_000, 'redis recovery'));
+  check('redis data intact after failed deploy', (await redisCmd('GET servify-test')).includes('persisted'));
+  await api('PATCH', `/services/${r.service.id}`, { startCommand: origStart });
+
+  // 9. rollback
+  console.log('\n▸ rollback, stop/start, kill');
+  const rb = await api('POST', `/services/${service.id}/rollback`, { deploymentId: deployment.id });
+  const rbd = await waitDeploy(rb.id);
+  check('rollback deploy active', rbd.status === 'active', rbd.error ?? '');
+
+  // 10. stop / start
+  await api('POST', `/services/${service.id}/stop`);
+  check('stopped service returns 503', (await hit(host)).status === 503);
+  await api('POST', `/services/${service.id}/start`);
+  check('started service serves again', await waitFor(async () => (await hit(host)).status === 200, 60_000, 'start'));
+  await waitFor(async () => (await healthyCount(service.id)) === 2, 60_000, '2 healthy');
+
+  // 11. docker kill (not rm)
+  const m2 = await api('GET', `/services/${service.id}/metrics?seconds=1`);
+  const v2 = m2.replicas.find((x) => x.state === 'healthy');
+  execSync(`docker kill ${v2.containerId}`, { stdio: 'ignore' });
+  await sleep(1500);
+  check('killed replica comes back', await waitFor(async () => (await healthyCount(service.id)) === 2, 60_000, 'kill recovery'));
+
+  // 12. autoscale up under load
+  console.log('\n▸ autoscaling');
+  await api('POST', `/services/${service.id}/scale`, { replicas: 1 });
+  await api('PATCH', `/services/${service.id}`, { autoscale: { enabled: true, metric: 'rps', target: 10, min: 1, max: 4 } });
+  let stopLoad = false;
+  const load = (async () => {
+    while (!stopLoad) {
+      await hit(host);
+      await sleep(15);
+    }
+  })();
+  const scaled = await waitFor(async () => (await api('GET', `/services/${service.id}`)).replicas >= 2, 60_000, 'autoscale up');
+  stopLoad = true;
+  await load;
+  check('autoscaler adds replicas under load', scaled);
+  await api('PATCH', `/services/${service.id}`, { autoscale: { enabled: false } });
+
+  // 13. git auto-deploy from a local bare repository
+  if (!process.env.SKIP_GIT) {
+    console.log('\n▸ git auto-deploy (local bare repo, up to ~90s)');
+    const { mkdtempSync, cpSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join, dirname } = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const root = mkdtempSync(join(tmpdir(), 'servify-git-'));
+    const work = join(root, 'work');
+    const bare = join(root, 'repo.git');
+    cpSync(join(dirname(fileURLToPath(import.meta.url)), '../examples/node-api'), work, { recursive: true });
+    const g = (cmd, cwd = work) => execSync(cmd, { cwd, stdio: 'ignore' });
+    g(`git init -q -b main && git add -A && git -c user.email=t@t -c user.name=t commit -qm first`);
+    g(`git clone -q --bare ${work} ${bare}`, root);
+    const gs = await api('POST', `/projects/${project.id}/services`, { repo: `file://${bare}`, branch: 'main', name: 'gitapp' });
+    const gd = await waitDeploy(gs.deployment.id);
+    check('git service deployed', gd.status === 'active', gd.error ?? '');
+    writeFileSync(join(work, 'VERSION'), '2');
+    g(`git add -A && git -c user.email=t@t -c user.name=t commit -qm second && git push -q ${bare} main`);
+    const auto = await waitFor(async () => {
+      const deps = await api('GET', `/services/${gs.service.id}/deployments`);
+      return deps.some((d) => d.trigger === 'git' && d.status === 'active' && d.commitMessage === 'second');
+    }, 150_000, 'git auto-deploy');
+    check('new commit auto-deployed', auto);
+  }
 } catch (e) {
   failures++;
   console.error('  ✗ error:', e.message);
 } finally {
   if (!process.env.KEEP) {
     await api('DELETE', `/projects/${project.id}`).catch(() => {});
+    await sleep(2000);
+    const left = execSync(`docker ps -aq --filter label=servify.project=${project.id}`).toString().trim();
+    const vols = execSync(`docker volume ls -q --filter label=servify.managed=true`).toString().split('\n').filter((v) => v && project && v.includes('_'));
+    check('project delete removes all containers', left === '', left);
+    void vols;
     console.log('\ncleaned up');
   }
 }
