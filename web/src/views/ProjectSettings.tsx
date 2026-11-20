@@ -83,6 +83,24 @@ export function ProjectSettings({ open, onClose, project }: { open: boolean; onC
             >
               Download servify.json
             </Button>
+            <Button
+              type="button"
+              icon="copy"
+              onClick={async () => {
+                try {
+                  const spec = await api.get<any>(`/projects/${project.id}/export?secrets=1`);
+                  const r = await api.post<{ project: Project }>('/projects/import', { spec, deploy: false, name: `${project.name} (copy)` });
+                  await loadProjects();
+                  onClose();
+                  navigate(`/p/${r.project.slug}`);
+                  toast({ title: 'Project duplicated', body: 'Services are configured but not deployed yet — deploy the ones you need.', tone: 'ok' });
+                } catch (err) {
+                  toastError(err, 'Could not duplicate');
+                }
+              }}
+            >
+              Duplicate project
+            </Button>
           </div>
         </Field>
         <div className="row">
