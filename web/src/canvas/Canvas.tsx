@@ -416,6 +416,8 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
     >
       <div className="canvas-grid" ref={gridRef} />
       <div className="canvas-vignette" />
+      {/* Beneath the nodes: request streams flow into cards, never across them. */}
+      <Particles edges={edges} getCamera={getCamera} subscribeCamera={subscribeCamera} />
       <div className="world" ref={worldRef}>
         <EdgesLayer edges={edges} highlight={selectedId} draft={draft} />
         <IngressNode services={services} proxyPort={state.proxyPort} visible={hasIngress} />
@@ -460,7 +462,6 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
           </button>
         </div>
       )}
-      <Particles edges={edges} getCamera={getCamera} subscribeCamera={subscribeCamera} />
 
       <div className="canvas-chrome canvas-controls glass" style={{ left: 16 }}>
         <Tooltip label="Zoom out" kbd="−">
