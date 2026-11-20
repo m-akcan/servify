@@ -333,6 +333,18 @@ export const docker = {
     call('POST', '/volumes/create', { body: { Name: name, Labels: labels } }),
   removeVolume: (name: string) => call('DELETE', `/volumes/${name}`).catch(() => {}),
 
+  /** Block until the container exits; returns its exit code. */
+  async waitContainer(id: string): Promise<number> {
+    const res = await stream('POST', `/containers/${id}/wait`);
+    let body = '';
+    for await (const c of res) body += c.toString('utf8');
+    try {
+      return JSON.parse(body).StatusCode ?? -1;
+    } catch {
+      return -1;
+    }
+  },
+
   /** Tar stream of a path inside a container (GET /containers/{id}/archive). */
   archive: (id: string, path: string) => stream('GET', `/containers/${id}/archive`, { query: { path } }),
 

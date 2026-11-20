@@ -143,6 +143,7 @@ export function refreshServiceStatus(serviceId: string) {
   let next = svc.status;
   if (svc.stopped) next = 'stopped';
   else if (!svc.activeDeploymentId) next = svc.status === 'failed' ? 'failed' : 'idle';
+  else if (svc.schedule) next = 'running';
   else {
     const reps = replicasOf(serviceId).filter((r) => r.deploymentId === svc.activeDeploymentId);
     const healthy = reps.filter((r) => r.state === 'healthy').length;
@@ -163,7 +164,7 @@ export function refreshServiceStatus(serviceId: string) {
 }
 
 export function effectiveReplicas(svc: Service): number {
-  if (svc.stopped) return 0;
+  if (svc.stopped || svc.schedule) return 0; // cron services run as one-off jobs, not replicas
   if (svc.volumes.length > 0) return Math.min(1, svc.replicas);
   return Math.max(0, svc.replicas);
 }

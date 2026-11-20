@@ -15,6 +15,8 @@ CREATE INDEX IF NOT EXISTS activity_ts ON activity(created_at);
 CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, data TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, service_id TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS runs_service ON runs(service_id, created_at);
 `);
 
 type Row = { data: string };
@@ -54,7 +56,7 @@ function table<T extends { id: string; createdAt?: number }>(name: string, cols:
   };
 }
 
-import type { Project, Service, Deployment, ActivityEntry } from './types.ts';
+import type { Project, Service, Deployment, ActivityEntry, JobRun } from './types.ts';
 
 export type TokenRecord = {
   id: string;
@@ -72,6 +74,8 @@ export const activityTable = table<ActivityEntry & { createdAt: number }>('activ
   project_id: (a) => a.projectId,
   service_id: (a) => a.serviceId,
 });
+
+export const runsTable = table<JobRun>('runs', { service_id: (r) => r.serviceId });
 
 export const tokensTable = {
   insert(rec: TokenRecord, hash: string) {

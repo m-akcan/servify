@@ -24,6 +24,7 @@ import {
   LABEL,
 } from './engine.ts';
 import { buildSource } from './builder.ts';
+import { nextRun } from './cron.ts';
 
 const lock = new KeyedLock();
 const logStreams = new Map<string, WriteStream>();
@@ -117,7 +118,8 @@ export function queueDeployment(
           volumes: structuredClone(svc.volumes),
           resources: { ...svc.resources },
           source: structuredClone(svc.source),
-        },
+          schedule: svc.schedule ?? null,
+        } as any,
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,
@@ -202,6 +204,28 @@ async function runDeployment(depId: string, actor: Actor) {
     const { env, unresolved } = resolveEnv(svc, dep.config.env, project, siblings, dep.port);
     if (unresolved.length) log(`! unresolved variable references: ${unresolved.join(', ')}`);
     (dep as any).resolvedEnv = env;
+
+    // ─── scheduled job: nothing long-lived to start, the image is simply armed ───
+    if (svc.schedule) {
+      dep.status = 'active';
+      dep.finishedAt = Date.now();
+      saveDep(dep);
+      const prevActive = svc.activeDeploymentId;
+      if (prevActive && prevActive !== dep.id) {
+        const prev = deploymentsTable.get(prevActive);
+        if (prev && prev.status === 'active') {
+          prev.status = 'superseded';
+          saveDep(prev);
+        }
+      }
+      setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, stopped: false, detectedPort: dep.port });
+      const next = nextRun(svc.schedule);
+      log(`✓ Cron job armed — schedule "${svc.schedule}"${next ? `, next run ${next.toLocaleString()}` : ''}`);
+      const old = replicasOf(svc.id).map((r) => r.containerId);
+      if (old.length) await drainAndRemove(old, 2000);
+      recordActivity(actor, 'deployment.active', `${svc.name} armed on schedule ${svc.schedule}`, svc.projectId, svc.id);
+      return;
+    }
 
     // ─── deploy ───
     dep.status = 'deploying';

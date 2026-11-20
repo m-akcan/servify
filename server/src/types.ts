@@ -51,6 +51,8 @@ export interface Service {
   source: Source;
   protocol: Protocol;
   port: number | null;
+  /** Cron expression: the service runs as a scheduled one-off job instead of long-lived replicas. */
+  schedule?: string | null;
   /** Port detected from the image on the last successful deploy (used when `port` is auto). */
   detectedPort?: number | null;
   replicas: number;
@@ -197,6 +199,20 @@ export interface Template {
   startCommand?: string | null;
 }
 
+export interface JobRun {
+  id: string;
+  serviceId: string;
+  projectId: string;
+  status: 'running' | 'succeeded' | 'failed';
+  trigger: 'schedule' | 'manual' | 'agent';
+  actor: string;
+  startedAt: number;
+  finishedAt: number | null;
+  exitCode: number | null;
+  output: string;
+  createdAt: number;
+}
+
 /** Server → client realtime events. */
 export type ServerEvent =
   | { type: 'project.updated'; project: Project }
@@ -208,4 +224,5 @@ export type ServerEvent =
   | { type: 'replicas'; serviceId: string; projectId: string; replicas: Replica[] }
   | { type: 'traffic'; tick: number; services: Record<string, { rps: number; errors: number; p95: number; replicas: Record<string, number> }> }
   | { type: 'activity'; entry: ActivityEntry }
+  | { type: 'job.run'; run: JobRun }
   | { type: 'hello'; version: string };

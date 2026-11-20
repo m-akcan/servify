@@ -16,6 +16,8 @@ import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
 import { config } from './config.ts';
+import { validateCron, nextRun } from './cron.ts';
+import { runJob, listRuns, isJobRunning } from './cronjobs.ts';
 
 const PROJECT_COLORS = ['#d4f25a', '#7ce0c3', '#f2a65a', '#9fb4ff', '#f27a9b', '#c9a7ff', '#5ad1f2'];
 
@@ -31,6 +33,8 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.url = project && s.protocol === 'http' && s.publicHttp ? publicUrl(s, project) : null;
   out.tcpAddress = s.publicTcpPort ? `${config.proxyHost === '0.0.0.0' ? 'localhost' : config.proxyHost}:${s.publicTcpPort}` : null;
   out.pendingChanges = pendingChanges(s);
+  out.nextRunAt = s.schedule && s.activeDeploymentId && !s.stopped ? nextRun(s.schedule)?.getTime() ?? null : null;
+  out.jobRunning = isJobRunning(s.id);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
 
@@ -49,6 +53,7 @@ export function pendingChanges(s: Service): string[] {
   if (!d) return [];
   const out: string[] = [];
   const c = d.config;
+  if ((c as any).schedule !== undefined && ((c as any).schedule ?? null) !== (s.schedule ?? null)) out.push('schedule');
   if (JSON.stringify(c.env) !== JSON.stringify(s.env)) out.push('variables');
   if ((c.port ?? null) !== (s.port ?? null) && s.port !== null) out.push('port');
   if ((c.startCommand ?? null) !== (s.startCommand ?? null)) out.push('start command');
@@ -342,6 +347,7 @@ export const updateServiceInput = z.object({
   resources: z.object({ cpus: z.number().positive().max(64).nullable().optional(), memoryMb: z.number().int().min(16).nullable().optional() }).optional(),
   autoDeploy: z.boolean().optional(),
   secretKeys: z.array(z.string()).optional(),
+  schedule: z.string().nullable().optional().describe('Cron expression (e.g. "*/15 * * * *", "@daily"). Turns the service into a scheduled job; null to clear.'),
   x: z.number().optional(),
   y: z.number().optional(),
 });
@@ -419,6 +425,18 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.resources) set('resources', { ...svc.resources, ...patch.resources } as Service['resources'], 'resources');
   if (patch.autoDeploy !== undefined) set('autoDeploy', patch.autoDeploy, 'auto-deploy');
   if (patch.secretKeys !== undefined) set('secretKeys', patch.secretKeys, 'secrets');
+  if (patch.schedule !== undefined) {
+    const sched = patch.schedule?.trim() || null;
+    if (sched) {
+      const err = validateCron(sched);
+      if (err) throw new HttpError(400, `invalid schedule: ${err}`);
+      if (svc.protocol !== 'none') set('protocol', 'none', 'networking');
+      svc.publicHttp = false;
+      svc.publicTcpPort = null;
+      svc.autoscale = { ...svc.autoscale, enabled: false };
+    }
+    set('schedule', sched, 'schedule');
+  }
   const moved = patch.x !== undefined || patch.y !== undefined;
   if (patch.x !== undefined) svc.x = Math.round(patch.x);
   if (patch.y !== undefined) svc.y = Math.round(patch.y);
@@ -429,7 +447,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (changes.length && !opts.quiet) {
     recordActivity(actor, 'service.updated', `Updated ${svc.name}: ${changes.join(', ')}`, svc.projectId, svc.id);
   }
-  if (changes.includes('replicas')) requestReconcile();
+  if (changes.includes('replicas') || changes.includes('schedule')) requestReconcile();
   return serializeService(svc);
 }
 
@@ -870,4 +888,17 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   if (opts.deploy !== false) for (const s of created) deployService(actor, s.id);
   recordActivity(actor, 'project.imported', `Imported ${created.length} services into ${project.name}`, project.id);
   return { project, services: created.map((s) => s.id) };
+}
+
+export async function runServiceJob(actor: Actor, serviceId: string) {
+  const svc = getServiceOrThrow(serviceId);
+  // Fire and return the run immediately; completion arrives as a job.run event.
+  const p = runJob(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
+  p.catch(() => {});
+  await new Promise((r) => setTimeout(r, 50));
+  return listRuns(svc.id, 1)[0] ?? null;
+}
+
+export function serviceRuns(serviceId: string, limit = 30) {
+  return listRuns(getServiceOrThrow(serviceId).id, limit);
 }

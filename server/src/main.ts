@@ -14,6 +14,7 @@ import { startMetrics } from './metrics.ts';
 import { startBackgroundJobs } from './jobs.ts';
 import { sessionsTable } from './db.ts';
 import { recoverInterrupted } from './deployer.ts';
+import { startScheduler } from './cronjobs.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -86,6 +87,7 @@ async function main() {
   await startEngine();
   startMetrics();
   startBackgroundJobs();
+  startScheduler();
   setInterval(() => sessionsTable.prune(), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {

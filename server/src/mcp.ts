@@ -313,6 +313,23 @@ export function buildMcpServer(principal: Principal): McpServer {
   );
 
   server.registerTool(
+    'run_job',
+    { description: 'Run a scheduled (cron) service now as a one-off container. Use list_runs to see the outcome and output.', inputSchema: { service: svcRef } },
+    wrap(async ({ service }: { service: string }) => {
+      guard();
+      return ops.runServiceJob(actor, service);
+    }),
+  );
+
+  server.registerTool(
+    'list_runs',
+    { description: 'Recent runs of a scheduled job: status, exit code, output tail.', inputSchema: { service: svcRef, limit: z.number().int().min(1).max(100).optional() } },
+    wrap(({ service, limit }: { service: string; limit?: number }) =>
+      ops.serviceRuns(service, limit ?? 10).map((r) => ({ id: r.id, status: r.status, exitCode: r.exitCode, trigger: r.trigger, startedAt: new Date(r.startedAt).toISOString(), durationMs: r.finishedAt ? r.finishedAt - r.startedAt : null, output: r.output.slice(-2000) })),
+    ),
+  );
+
+  server.registerTool(
     'load_test',
     { description: 'Send synthetic HTTP traffic to a service through the load balancer (to verify scaling, balancing or autoscaling).', inputSchema: { service: svcRef, rps: z.number().min(1).max(500).optional(), seconds: z.number().int().min(1).max(300).optional() } },
     wrap(({ service, rps, seconds }: { service: string; rps?: number; seconds?: number }) => {

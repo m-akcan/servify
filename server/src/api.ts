@@ -210,6 +210,12 @@ api.get('/services/:id/volumes/:name/download', async (c) => {
     },
   });
 });
+api.post('/services/:id/run', async (c) => {
+  const svc = ops.getServiceOrThrow(c.req.param('id'));
+  const run = await ops.runServiceJob(actor(c), svc.id);
+  return c.json(run, 202);
+});
+api.get('/services/:id/runs', (c) => c.json(ops.serviceRuns(c.req.param('id'), Number(c.req.query('limit') ?? 30))));
 api.post('/services/:id/exec', async (c) => {
   const { command, replica } = await c.req.json<{ command: string; replica?: number }>();
   return c.json(await ops.execInService(actor(c), c.req.param('id'), command, replica));
