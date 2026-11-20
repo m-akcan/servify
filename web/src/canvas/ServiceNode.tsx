@@ -221,6 +221,26 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
     el.addEventListener('pointercancel', up);
   };
 
+  // One-shot celebrations: ripple when a deploy goes live, flash when one fails.
+  const [moment, setMoment] = useState<'live' | 'fail' | null>(null);
+  const prevStatus = useRef(s.status);
+  const prevLatest = useRef(latest?.status);
+  useEffect(() => {
+    const was = prevStatus.current;
+    prevStatus.current = s.status;
+    if ((was === 'building' || was === 'deploying') && s.status === 'running') setMoment('live');
+  }, [s.status]);
+  useEffect(() => {
+    const was = prevLatest.current;
+    prevLatest.current = latest?.status;
+    if (was && was !== 'failed' && latest?.status === 'failed') setMoment('fail');
+  }, [latest?.status]);
+  useEffect(() => {
+    if (!moment) return;
+    const t = setTimeout(() => setMoment(null), 1400);
+    return () => clearTimeout(t);
+  }, [moment]);
+
   const tone = serviceTone[s.status];
   const busy = isBusy(s.status) || (latest ? isBusy(latest.status) : false);
   const statusText = latest && latest.status === 'queued' ? 'Queued' : serviceLabel[s.status];
@@ -262,7 +282,8 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
         <span />
         <span />
       </div>
-      <div className="node-card">
+      {moment === 'live' && <div className="node-ripple" aria-hidden />}
+      <div className={`node-card ${moment === 'fail' ? 'flash-fail' : ''}`}>
         {busy && <div className="node-busy-ring" aria-hidden />}
         <div className="node-head">
           <ServiceGlyph icon={s.icon} name={s.name} size={34} />

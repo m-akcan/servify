@@ -713,3 +713,57 @@
 .cron-chip.running svg {
   animation: spin 1.2s linear infinite;
 }
+
+/* ───────────── moments ───────────── */
+.node-ripple {
+  position: absolute;
+  inset: -2px;
+  border-radius: var(--r-lg);
+  border: 2px solid var(--ok);
+  pointer-events: none;
+  animation: ripple 1.2s var(--ease-out) forwards;
+}
+@keyframes ripple {
+  0% {
+    opacity: 0.9;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.12);
+  }
+}
+.node-card.flash-fail {
+  animation: flash-fail 900ms var(--ease-out);
+}
+@keyframes flash-fail {
+  0% {
+    box-shadow: 0 0 0 0 var(--err-soft), 0 0 0 0 color-mix(in srgb, var(--err) 60%, transparent);
+  }
+  15% {
+    transform: translateX(-3px);
+  }
+  30% {
+    transform: translateX(3px);
+    box-shadow: 0 0 0 6px var(--err-soft), 0 0 40px -4px color-mix(in srgb, var(--err) 50%, transparent);
+  }
+  45% {
+    transform: translateX(-2px);
+  }
+  60% {
+    transform: none;
+  }
+}
+.edge-line.draw-in:not(:is(.edge-ingress:not(.active) *)) {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: edge-draw 900ms var(--ease-out) forwards;
+}
+@keyframes edge-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.edge-line.fade-edge {
+  animation: fade-in 600ms var(--ease-out);
+}

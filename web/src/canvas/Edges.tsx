@@ -66,7 +66,13 @@ export function EdgesLayer({ edges, highlight, draft }: { edges: EdgeSpec[]; hig
               </defs>
             )}
             <path d={d} className="edge-halo" />
-            <path d={d} className="edge-line" style={e.kind === 'ingress' && e.active && !hl ? { stroke: `url(#${gid})` } : undefined} markerEnd={e.kind === 'ref' ? 'url(#arrow)' : undefined} />
+            <path
+              d={d}
+              className={`edge-line ${e.kind === 'ingress' ? 'draw-in' : 'fade-edge'}`}
+              pathLength={e.kind === 'ingress' && e.active ? 1 : undefined}
+              style={e.kind === 'ingress' && e.active && !hl ? { stroke: `url(#${gid})` } : undefined}
+              markerEnd={e.kind === 'ref' ? 'url(#arrow)' : undefined}
+            />
             {e.label && (
               <EdgeLabel x={(bz.p0.x + bz.p3.x) / 2} y={(bz.p0.y + bz.p3.y) / 2} label={e.label} />
             )}
