@@ -2,7 +2,7 @@
 import { services as servicesTable, deployments as deploymentsTable } from './db.ts';
 import { metricsHistory } from './metrics.ts';
 import { recordActivity, SYSTEM, type Actor } from './events.ts';
-import { scaleService, deployService } from './ops.ts';
+import { updateService, deployService } from './ops.ts';
 import { latestCommit } from './builder.ts';
 import { isDeploying } from './deployer.ts';
 import { docker } from './docker.ts';
@@ -22,14 +22,16 @@ async function autoscale() {
     const perReplica = avgTotal / current;
     let desired = Math.ceil(avgTotal / Math.max(0.001, a.target));
     desired = Math.min(a.max, Math.max(a.min, desired || a.min));
+    // Step down gently (at most halve per step) so a quiet minute doesn't drop all capacity at once.
+    if (desired < current) desired = Math.max(desired, Math.floor(current / 2), a.min);
     if (desired === current) continue;
     const since = Date.now() - (lastScale.get(svc.id) ?? 0);
     // Scale up quickly, scale down conservatively.
     if (desired > current && since < 20_000) continue;
-    if (desired < current && (since < 90_000 || perReplica > a.target * 0.6)) continue;
+    if (desired < current && (since < 60_000 || perReplica > a.target * 0.6)) continue;
     lastScale.set(svc.id, Date.now());
     try {
-      await scaleService(AUTOSCALER, svc.id, desired);
+      await updateService(AUTOSCALER, svc.id, { replicas: desired }, { quiet: true });
       recordActivity(
         AUTOSCALER,
         'service.autoscaled',
