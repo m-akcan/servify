@@ -236,7 +236,7 @@ export function effectiveReplicas(svc: Service, dep?: Deployment | null): number
   if (svc.stopped || deployedSchedule(svc, deployed)) return 0; // cron services run as one-off jobs, not replicas
   // Cap on what is actually mounted (the deployed config), not just the editable setting:
   // removing a volume in settings must not let N replicas share the deployed volume.
-  if (hasSharedVolume(svc.volumes) || hasSharedVolume(deployed?.config.volumes)) return Math.min(1, svc.replicas);
+  if (hasSharedVolume(svc.volumes) || hasSharedVolume(deployed?.config.volumes) || svc.ports?.length || deployed?.config.ports?.length) return Math.min(1, svc.replicas);
   return Math.max(0, svc.replicas);
 }
 
@@ -277,7 +277,16 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
     await d.createVolume(m.Source, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
   }
 
-  const exposed = port && dep.config.protocol !== 'none' ? { [`${port}/tcp`]: {} } : undefined;
+  const exposed: Record<string, object> | undefined = port && dep.config.protocol !== 'none' ? { [`${port}/tcp`]: {} } : undefined;
+  // Router/probe binding (127.0.0.1, random port) plus any ports published straight on the server.
+  const bindings: Record<string, { HostIp: string; HostPort: string }[]> = {};
+  if (exposed && (remote || !config.inContainer)) bindings[`${port}/tcp`] = [{ HostIp: '127.0.0.1', HostPort: '' }];
+  const published = dep.config.ports ?? [];
+  for (const p of published) {
+    const key = `${p.container}/${p.protocol}`;
+    (bindings[key] ??= []).push({ HostIp: p.hostIp || '0.0.0.0', HostPort: String(p.host) });
+  }
+  const exposedAll = { ...(exposed ?? {}), ...Object.fromEntries(published.map((p) => [`${p.container}/${p.protocol}`, {}])) };
   const spec: any = {
     Image: dep.image,
     Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
@@ -290,11 +299,10 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
       [LABEL.deployment]: dep.id,
       [LABEL.index]: String(index),
     },
-    ExposedPorts: exposed,
+    ExposedPorts: Object.keys(exposedAll).length ? exposedAll : undefined,
     HostConfig: {
       RestartPolicy: { Name: 'unless-stopped' },
-      PortBindings:
-        exposed && (remote || !config.inContainer) ? { [`${port}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '' }] } : undefined,
+      PortBindings: Object.keys(bindings).length ? bindings : undefined,
       Mounts: [...mounts, ...host.mounts],
       ...(host.binds.length ? { Binds: host.binds } : {}),
       NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
@@ -321,6 +329,12 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   await d.startContainer(cid);
   await adopt(cid, node);
   return cid;
+}
+
+/** The router's binding: the 127.0.0.1 one when the same port is also published on the server. */
+function pickBinding(list: { HostIp?: string; HostPort?: string }[] | undefined) {
+  if (!list?.length) return null;
+  return list.find((b) => b.HostIp === '127.0.0.1') ?? list.find((b) => b.HostIp === '0.0.0.0' || !b.HostIp) ?? list[0];
 }
 
 /** Inspect a container and register/refresh its runtime entry. */
@@ -350,7 +364,7 @@ export async function adopt(cid: string, nodeId = containerNodeOf(cid)): Promise
   if (port) {
     if (remote) {
       // Published on the server's 127.0.0.1; reached through a local forwarder over the agent tunnel.
-      const b = info.NetworkSettings?.Ports?.[`${port}/tcp`]?.[0];
+      const b = pickBinding(info.NetworkSettings?.Ports?.[`${port}/tcp`]);
       if (b?.HostPort) {
         try {
           hostPort = await forwardPort(nodeId, Number(b.HostPort));
@@ -362,7 +376,7 @@ export async function adopt(cid: string, nodeId = containerNodeOf(cid)): Promise
       host = info.NetworkSettings?.Networks?.[network]?.IPAddress || null;
       hostPort = port;
     } else {
-      const b = info.NetworkSettings?.Ports?.[`${port}/tcp`]?.[0];
+      const b = pickBinding(info.NetworkSettings?.Ports?.[`${port}/tcp`]);
       if (b?.HostPort) {
         host = '127.0.0.1';
         hostPort = Number(b.HostPort);

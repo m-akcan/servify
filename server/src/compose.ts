@@ -22,6 +22,8 @@ export type ComposeService = {
   protocol: Protocol;
   port: number | null;
   publishedPort: number | null;
+  /** UDP (and other non-routed) ports published straight on the server — owner only at import. */
+  published: { container: number; host: number; protocol: 'tcp' | 'udp' }[];
   replicas: number;
   env: Record<string, string>;
   secretKeys: string[];
@@ -260,7 +262,8 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     // ── ports
     const ports = (svc.ports ?? []).map(parsePort).filter(Boolean) as NonNullable<ReturnType<typeof parsePort>>[];
     const expose = (svc.expose ?? []).map((p: unknown) => Number.parseInt(String(p), 10)).filter(Number.isFinite);
-    if (ports.some((p) => p.proto === 'udp')) w('UDP ports are not supported');
+    const udp = ports.filter((p) => p.proto === 'udp' && p.published);
+    if (udp.length) w(`UDP ${udp.map((p) => `${p.published}:${p.container}`).join(', ')} → published straight on the server (only if you import as the owner)`);
     const tcpPorts = ports.filter((p) => p.proto !== 'udp');
     // Like Compose: no ports/expose → nothing is published or health-probed on a port (it's still reachable
     // by name on the project network). Probing a template's port would fail for e.g. a redis image running a script.
@@ -352,7 +355,7 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     const dependsOn = Array.isArray(svc.depends_on) ? svc.depends_on.map(String) : Object.keys(svc.depends_on ?? {});
     const secretKeys = Object.keys(env).filter((k) => /SECRET|PASSWORD|TOKEN|KEY|PASS$/i.test(k));
 
-    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, replicas, env, secretKeys, volumes, cmd, entrypoint, healthPath, resources, dependsOn, x: 0, y: 0 });
+    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: 'udp' as const })), replicas, env, secretKeys, volumes, cmd, entrypoint, healthPath, resources, dependsOn, x: 0, y: 0 });
   }
   if (!out.length) throw new HttpError(400, 'no importable services in this compose file');
 
@@ -399,6 +402,7 @@ export function planToSpec(plan: ComposePlan) {
       env: s.env,
       secretKeys: s.secretKeys,
       volumes: s.volumes,
+      ports: s.published.length ? s.published : undefined,
       startCommand: null,
       cmd: s.cmd,
       entrypoint: s.entrypoint,

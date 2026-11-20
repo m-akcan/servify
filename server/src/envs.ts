@@ -68,6 +68,9 @@ export async function createEnvironment(
     s.domains = [];
     s.backup = null;
     s.publicTcpPort = null;
+    // Never shared with production: fixed host ports would collide, host folders and shares are production's data.
+    delete s.ports;
+    s.volumes = (s.volumes ?? []).filter((m) => !m.hostPath && !m.borrowed);
     if (branch && s.source?.type === 'git' && (!repo || repoKey(s.source.repo) === repo)) s.source = { ...s.source, branch };
   }
   const r = await importProject(actor, spec, { deploy: false, name: base.name });

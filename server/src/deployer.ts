@@ -140,7 +140,7 @@ export function queueDeployment(
     actor: actor.name,
     config: base
       ? // Rollbacks/restarts reuse the old image and settings, but always mount today's volumes.
-        { ...structuredClone(base.config), volumes: structuredClone(svc.volumes) }
+        { ...structuredClone(base.config), volumes: structuredClone(svc.volumes), ports: structuredClone(svc.ports ?? []) }
       : {
           env: { ...svc.env },
           port: svc.port,
@@ -149,6 +149,7 @@ export function queueDeployment(
           cmd: svc.cmd ?? null,
           entrypoint: svc.entrypoint ?? null,
           volumes: structuredClone(svc.volumes),
+          ports: structuredClone(svc.ports ?? []),
           resources: { ...svc.resources },
           source: structuredClone(svc.source),
           schedule: svc.schedule ?? null,
@@ -302,7 +303,8 @@ async function runDeployment(depId: string, actor: Actor) {
     for (let i = 0; converging.has(svc.id) && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
     // Shared volume → one replica, recreated. Per-replica volumes → rolled one index at a time (replica i's
     // data is never mounted by two containers). Stateless → surge.
-    const shared = hasSharedVolume(dep.config.volumes) || hasSharedVolume(svc.volumes);
+    // Fixed host ports can't be held by two containers at once: one replica, old one stopped first.
+    const shared = hasSharedVolume(dep.config.volumes) || hasSharedVolume(svc.volumes) || !!dep.config.ports?.length;
     const rolling = !shared && dep.config.volumes.some((v) => v.perReplica);
     const want = shared ? 1 : Math.max(1, svc.replicas);
     const oldContainers = replicasOf(svc.id)

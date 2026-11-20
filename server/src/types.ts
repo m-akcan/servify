@@ -129,6 +129,8 @@ export interface Service {
   cluster?: ClusterConfig | null;
   /** The server it runs on (null/undefined = this machine). */
   nodeId?: string | null;
+  /** Ports published straight on the server (owner only). Forces one replica and stop-first deploys. */
+  ports?: PublishedPort[];
   x: number;
   y: number;
   status: ServiceStatus;
@@ -158,8 +160,19 @@ export interface DeploymentConfig {
   cmd?: string[] | null;
   entrypoint?: string[] | null;
   volumes: Volume[];
+  /** Ports published straight on the server (today's, like volumes, also for rollbacks). */
+  ports?: PublishedPort[];
   resources: { cpus: number | null; memoryMb: number | null };
   source: Source;
+}
+
+/** A container port published directly on the server's network (game servers, UDP, anything not HTTP-routed). */
+export interface PublishedPort {
+  container: number;
+  host: number;
+  protocol: 'tcp' | 'udp';
+  /** Interface to listen on (default every interface). */
+  hostIp?: string | null;
 }
 
 export interface Deployment {

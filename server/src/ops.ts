@@ -89,6 +89,7 @@ export function pendingChanges(s: Service): string[] {
   if ((c.startCommand ?? null) !== (s.startCommand ?? null)) out.push('start command');
   if (JSON.stringify(c.cmd ?? null) !== JSON.stringify(s.cmd ?? null) || JSON.stringify(c.entrypoint ?? null) !== JSON.stringify(s.entrypoint ?? null)) out.push('command');
   if (JSON.stringify(c.volumes) !== JSON.stringify(s.volumes)) out.push('volumes');
+  if (JSON.stringify(c.ports ?? []) !== JSON.stringify(s.ports ?? [])) out.push('published ports');
   if (JSON.stringify(c.resources) !== JSON.stringify(s.resources)) out.push('resources');
   if (c.protocol !== s.protocol) out.push('networking');
   const a = { ...c.source, token: undefined } as any;
@@ -496,6 +497,10 @@ export const updateServiceInput = z.object({
     .nullable()
     .optional()
     .describe('Scheduled backups of the service data (databases are dumped, other volumes archived)'),
+  ports: z
+    .array(z.object({ container: z.number().int().min(1).max(65535), host: z.number().int().min(1).max(65535), protocol: z.enum(['tcp', 'udp']), hostIp: z.string().nullable().optional() }))
+    .optional()
+    .describe('Publish container ports straight on the server, TCP or UDP (game servers, voice…). Owner only. Forces one replica.'),
   cluster: z
     .object({ failoverAfterSec: z.number().int().min(0).max(3600).optional(), synchronous: z.boolean().optional() })
     .optional()
@@ -553,6 +558,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.replicas !== undefined) {
     const tpl = svc.templateId ? getTemplate(svc.templateId) : null;
     const deployedShared = svc.activeDeploymentId ? hasSharedVolume(deploymentsTable.get(svc.activeDeploymentId)?.config.volumes) : false;
+    if (patch.replicas > 1 && (svc.ports?.length || patch.ports?.length)) throw new HttpError(400, `${svc.name} publishes ports on the server; two replicas can't hold the same port. Services with published ports run as one replica.`);
     if (patch.replicas > 1 && (hasSharedVolume(svc.volumes) || deployedShared || tpl?.singleton)) {
       throw new HttpError(400, `${svc.name} has a persistent volume; replicas would corrupt its data. Stateful services run as a single replica.`);
     }
@@ -607,6 +613,10 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (!svc.cluster) throw new HttpError(400, `${svc.name} is not a database cluster`);
     set('cluster', { ...svc.cluster, ...patch.cluster }, 'cluster settings');
   }
+  if (patch.ports !== undefined) {
+    const next = await checkPorts(actor, svc, patch.ports);
+    set('ports', next.length ? next : undefined, 'published ports');
+  }
   if (patch.schedule !== undefined) {
     const sched = patch.schedule?.trim() || null;
     if (sched) {
@@ -657,6 +667,53 @@ function checkMounts(actor: Actor, svc: Service, mounts: NonNullable<UpdateServi
     if (m.selinux) throw new HttpError(400, 'SELinux relabelling only applies to host folders');
     return m;
   });
+}
+
+/** Published ports: owner only; no clashes with other services on that server or with Servify's own ports; free. */
+async function checkPorts(actor: Actor, svc: Service, ports: NonNullable<UpdateServiceInput['ports']>) {
+  const same = (a: { host: number; protocol: string; hostIp?: string | null }, b: { host: number; protocol: string; hostIp?: string | null }) => a.host === b.host && a.protocol === b.protocol;
+  const had = svc.ports ?? [];
+  const fresh = ports.filter((p) => !had.some((h) => same(h, p) && h.container === p.container && (h.hostIp ?? null) === (p.hostIp ?? null)));
+  if (fresh.length) requireOwner(actor, 'Published ports');
+  for (let i = 0; i < ports.length; i++) if (ports.slice(0, i).some((q) => same(q, ports[i]))) throw new HttpError(400, `${ports[i].host}/${ports[i].protocol} is listed twice`);
+  if (ports.length && svc.replicas > 1) throw new HttpError(400, `scale ${svc.name} to one replica first: two replicas can't hold the same host port`);
+  if (ports.length && svc.autoscale.enabled) throw new HttpError(400, 'turn autoscaling off first: services with published ports run as one replica');
+  const node = nodeOf(svc);
+  for (const p of fresh) {
+    if (p.hostIp && !/^[0-9.]+$|^[0-9a-f:]+$/i.test(p.hostIp)) throw new HttpError(400, `${p.hostIp} is not an IP address`);
+    const clash = servicesTable.all().find((o) => o.id !== svc.id && nodeOf(o) === node && (o.ports ?? []).some((q) => same(q, p)));
+    if (clash) throw new HttpError(409, `${p.host}/${p.protocol} is already published by ${clash.name}`);
+    if (node === LOCAL) {
+      const own = [config.port, config.proxyPort, config.httpsPort, config.agentPort];
+      if (p.protocol === 'tcp' && (own.includes(p.host) || tcpPortInUse(p.host))) throw new HttpError(409, `${p.host} is used by Servify itself (dashboard, router or a TCP proxy)`);
+      if (!(await hostPortFree(p.host, p.protocol, p.hostIp || '0.0.0.0'))) throw new HttpError(409, `${p.host}/${p.protocol} is busy on this machine`);
+    }
+  }
+  return ports.map((p) => ({ container: p.container, host: p.host, protocol: p.protocol, ...(p.hostIp ? { hostIp: p.hostIp } : {}) }));
+}
+
+function hostPortFree(port: number, protocol: 'tcp' | 'udp', host: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (protocol === 'udp') {
+      const s = dgram.createSocket(host.includes(':') ? 'udp6' : 'udp4');
+      s.once('error', () => resolve(false));
+      s.bind(port, host, () => s.close(() => resolve(true)));
+      return;
+    }
+    const s = netMod.createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, host, () => s.close(() => resolve(true)));
+  });
+}
+
+/** Imports: published ports only when the owner imports (a busy port shows up as a failed deploy). */
+function portablePorts(actor: Actor, ports: Service['ports'], dropped: string[]) {
+  if (!ports?.length) return undefined;
+  if (actor.type !== 'user') {
+    dropped.push(`published ports ${ports.map((p) => `${p.host}/${p.protocol}`).join(', ')} (owner only)`);
+    return undefined;
+  }
+  return ports;
 }
 
 /** Imports and copies: keep host folders only for the owner and when still allowed; never carry shares over. */
@@ -930,6 +987,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join as pjoin } from 'node:path';
 import { existsSync } from 'node:fs';
 import httpMod from 'node:http';
+import dgram from 'node:dgram';
+import netMod from 'node:net';
 
 /** Populate a project with a small, realistic stack so new users see everything working. */
 export async function seedDemo(actor: Actor, projectId: string) {
@@ -1035,7 +1094,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1108,6 +1167,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       aliases: (raw.aliases ?? []).filter((a) => /^[a-z0-9]([a-z0-9_.-]*[a-z0-9])?$/.test(a)),
       cmd: raw.cmd ?? null,
       entrypoint: raw.entrypoint ?? null,
+      ports: portablePorts(actor, raw.ports, droppedMounts),
       // A copy starts a fresh cluster: replica 0 initialises as the primary.
       cluster: raw.cluster ? { ...raw.cluster, primary: 0 } : svc.cluster ?? null,
     } satisfies Partial<Service>);
