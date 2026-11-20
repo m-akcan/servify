@@ -21,10 +21,12 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Self-healing.** A desired-state reconciler re-creates crashed or deleted replicas, backs off on crash loops, and re-adopts everything after a restart.
 - **Wire services visually.** Drag from a service's ⊕ port onto another to add a reference like `DATABASE_URL=${{ postgres.DATABASE_URL }}`; dashed edges show every dependency.
 - **Built-in test traffic.** Fire 10–150 req/s through the load balancer from the dashboard (or the `load_test` MCP tool) and watch it spread across replicas or trigger autoscaling.
+- **Cron jobs.** Give a service a schedule (`*/15 * * * *`, `@daily`, …) and it runs as a one-off container on time, with run history, exit codes, output and a "Run now" button.
+- **Backups.** Download any service's volume as a tarball in one click.
 - **Console.** Run one-off commands (migrations, diagnostics) inside any replica.
 - **Infrastructure as code.** Export a project as `servify.json`, import it anywhere — or let an agent write one and create a whole stack in a single call.
 - **Autoscaling** on requests/s or CPU, **variable references** (`${{ postgres.DATABASE_URL }}`), persistent **volumes**, **custom domains**, resource limits, **git auto-deploy**, live **logs** across replicas, **metrics**, an **activity** audit trail.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 27 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 29 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -90,7 +92,7 @@ claude mcp add --transport http servify http://localhost:7700/mcp --header "Auth
 { "mcpServers": { "servify": { "command": "node", "args": ["/path/to/servify/server/bin/servify.mjs", "mcp"], "env": { "SERVIFY_URL": "http://localhost:7700", "SERVIFY_TOKEN": "svf_…" } } } }
 ```
 
-Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `load_test`.
+Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `load_test`, `run_job`, `list_runs`.
 
 Example — an agent can create a full stack in one call with `import_project`:
 
@@ -120,7 +122,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
   -d '{"replicas":5}' http://localhost:7700/api/services/<service>/scale
 ```
 
-Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest}`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
+Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest,run}`, `/api/services/:id/runs`, `/api/services/:id/volumes/:name/download`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
 
 ## Configuration
 

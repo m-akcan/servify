@@ -27,6 +27,9 @@
 - [x] README, LICENSE.
 - [ ] Final: kill dev servers/curl loops; final acceptance run; advisor review.
 
+- [x] Independent code review (9 findings) — all fixed: deployed-volume replica cap, reconcile/deploy races (converging set + fresh per-service reads), stop during deploy, proxy counter leaks + upstream timeout, SSE abort ordering, read-only resolved vars, WS counting, TCP listener retry, per-service try/catch.
+- [x] Cron jobs (scheduler + one-off runner + UI + MCP), volume download, export/import, multi-select, drag-to-connect, semantic zoom.
+
 ## Fixed bugs worth remembering
 - Node ≥19 global http agent: 5s idle timeout aborted Docker pulls/events → dedicated agents in docker.ts.
 - Edge layer subscribed after nodes registered → sync on subscribe.
