@@ -74,6 +74,18 @@ export function CommandPalette() {
       { id: 'home', title: 'All projects', icon: 'grid', group: 'Navigate', run: () => navigate('/') },
       { id: 'agents', title: 'Agents, API tokens & MCP', icon: 'bot', group: 'Navigate', run: () => navigate('/agents') },
       ...projects.map((p) => ({ id: `p-${p.id}`, title: p.name, subtitle: `${p.serviceCount} services`, icon: 'layers' as IconName, group: 'Projects', run: () => navigate(projectPath(p.slug)) })),
+      ...projects
+        .filter((p) => p.id !== store.get().current?.project.id)
+        .flatMap((p) =>
+          p.services.map((sv) => ({
+            id: `ps-${sv.id}`,
+            title: sv.name,
+            subtitle: `in ${p.name}`,
+            icon: 'box' as IconName,
+            group: 'Other projects',
+            run: () => navigate(projectPath(p.slug, sv.id)),
+          })),
+        ),
       { id: 'theme', title: `Switch to ${resolvedTheme() === 'dark' ? 'light' : 'dark'} theme`, icon: resolvedTheme() === 'dark' ? 'sun' : 'moon', group: 'Preferences', run: () => setThemePref(resolvedTheme() === 'dark' ? 'light' : 'dark') },
     ];
     // eslint-disable-next-line react-hooks/exhaustive-deps
