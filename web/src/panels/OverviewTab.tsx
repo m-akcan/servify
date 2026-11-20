@@ -121,9 +121,9 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
 
   return (
     <div className="tab-pad col" style={{ gap: 18 }}>
-      <div className="stats">
-        <Stat label="Requests" value={t?.rps ?? 0} format={(n) => num(n)} unit="/s" icon="zap" />
-        <Stat label="p95" value={t?.p95 ?? 0} format={(n) => (n < 10 ? n.toFixed(1) : n.toFixed(0))} unit="ms" icon="clock" />
+      <div className="stats" style={s.protocol === 'none' ? { gridTemplateColumns: 'repeat(2, 1fr)' } : undefined}>
+        {s.protocol !== 'none' && <Stat label="Requests" value={t?.rps ?? 0} format={(n) => num(n)} unit="/s" icon="zap" />}
+        {s.protocol !== 'none' && <Stat label="p95" value={t?.p95 ?? 0} format={(n) => (n < 10 ? n.toFixed(1) : n.toFixed(0))} unit="ms" icon="clock" />}
         <Stat label="CPU" value={cpu} format={(n) => n.toFixed(n < 10 ? 1 : 0)} unit="%" icon="cpu" />
         <Stat label="Memory" value={memMb} format={(n) => mem(n).split(' ')[0]} unit={memMb >= 1024 ? 'GB' : 'MB'} icon="memory" />
       </div>

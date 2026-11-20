@@ -17,7 +17,8 @@ export function EventToasts() {
         if (d.trigger === 'restart' && d.status === 'active' && d.actor === 'you') return;
         const cur = store.get().current;
         const svc = cur?.services[d.serviceId];
-        const name = svc?.name ?? 'Service';
+        if (!svc) return; // other projects: visible in their activity feed instead
+        const name = svc.name;
         const by = d.actor !== 'you' ? ` · by ${d.actor}` : '';
         const open = () => {
           if (cur && svc) navigate(projectPath(cur.project.slug, svc.slug, 'deployments'));
@@ -27,7 +28,8 @@ export function EventToasts() {
       }
       if (ev.type === 'job.run' && ev.run.status !== 'running') {
         const svc = store.get().current?.services[ev.run.serviceId];
-        const name = svc?.name ?? 'Job';
+        if (!svc) return;
+        const name = svc.name;
         if (ev.run.status === 'failed') toast({ title: `${name} run failed`, body: `exit ${ev.run.exitCode ?? '?'} · ${ev.run.output.split('\n').filter(Boolean).pop()?.slice(0, 100) ?? ''}`, tone: 'err', duration: 7000 });
         else if (ev.run.trigger !== 'schedule') toast({ title: `${name} finished`, body: `exit 0 in ${Math.round(((ev.run.finishedAt ?? Date.now()) - ev.run.startedAt) / 100) / 10}s`, tone: 'ok' });
         return;
