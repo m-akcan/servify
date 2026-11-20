@@ -660,3 +660,16 @@
 .multi-pill b {
   color: var(--signal);
 }
+
+.node-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: -2px;
+  padding: 6px 8px;
+  border-radius: var(--r-sm);
+  background: var(--err-soft);
+  color: var(--err);
+  font-size: 10.5px;
+  animation: rise-in 300ms var(--ease-out);
+}

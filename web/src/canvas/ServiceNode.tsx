@@ -299,6 +299,12 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
           ) : null}
         </div>
         {busy && latest && STAGES.includes(latest.status as any) && <DeployTicker service={s} latest={latest} />}
+        {!busy && latest?.status === 'failed' && latest.error && (
+          <div className="node-error mono" title={latest.error}>
+            <Icon name="alert" size={11} />
+            <span className="truncate">{s.activeDeploymentId ? 'Last deploy failed — still serving previous version' : latest.error}</span>
+          </div>
+        )}
         <div className="node-foot">
           <Pips service={s} replicas={replicas} />
           <span className="node-replicas tnum">
