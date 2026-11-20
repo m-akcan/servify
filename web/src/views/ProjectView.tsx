@@ -357,7 +357,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
           setCreating(null);
           setTimeout(() => {
             canvasRef.current?.focus(id);
-            select(id);
+            select(id, 'deployments');
           }, 120);
         }}
       />

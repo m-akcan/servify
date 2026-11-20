@@ -167,7 +167,7 @@ export function AgentsView({ settings }: { settings?: boolean }) {
                   <span className="faint">{d}</span>
                 </div>
               ))}
-              <div className="faint" style={{ fontSize: 12, marginTop: 6 }}>+ 12 more: stop/start, delete, deployments, logs, projects…</div>
+              <div className="faint" style={{ fontSize: 12, marginTop: 6 }}>+ 15 more: export/import projects, load tests, stop/start, deployments, logs…</div>
             </div>
           </section>
 

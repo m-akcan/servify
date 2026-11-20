@@ -328,3 +328,10 @@
 :root[data-theme='light'] .spark-line {
   stroke: #7a9a00;
 }
+:root[data-theme='light'] [data-tone='signal'] {
+  --c: #5a7200;
+}
+:root[data-theme='light'] .token-icon,
+:root[data-theme='light'] .badge[data-tone='signal'] {
+  color: #4f6500;
+}
