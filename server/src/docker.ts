@@ -248,6 +248,7 @@ export function createDockerClient(target: DockerTarget) {
     },
     inspectContainer: (id: string) => call<any>('GET', `/containers/${id}/json`),
     /** Containers (running or not) that mount a given volume. */
+    listVolumes: async (): Promise<{ Name: string; Labels: Record<string, string> | null; CreatedAt?: string }[]> => ((await call<any>('GET', '/volumes')).Volumes ?? []),
     containersUsingVolume: (volume: string, all = false): Promise<ContainerSummary[]> =>
       call('GET', '/containers/json', { query: { all, filters: filtersParam({ volume: [volume] }) } }),
     /** Disk usage per volume (can be slow on big volumes — poll sparingly). */

@@ -39,6 +39,12 @@ export const config = {
   agentPort: envInt('SERVIFY_AGENT_PORT', 7701),
   /** Address other servers use to reach this one (shown in the join command). Defaults to the first LAN IPv4. */
   agentPublicHost: process.env.SERVIFY_AGENT_PUBLIC_HOST ?? '',
+  /** Folders services may mount from the host (comma-separated). Empty = host folders are off. */
+  hostMounts: (process.env.SERVIFY_HOST_MOUNTS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => resolve(s.replace(/^~(?=$|\/)/, homedir()))),
   inContainer: existsSync('/.dockerenv') || process.env.SERVIFY_IN_CONTAINER === '1',
   webDist: resolve(import.meta.dirname, '../../web/dist'),
   version: '0.1.0',

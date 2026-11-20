@@ -19,7 +19,7 @@ import { isLocalHost } from './certs.ts';
 import { getSettings, destinationById } from './settings.ts';
 import { backupMethod, backupService, listBackups, isRestoring } from './backups.ts';
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
-import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume } from './volumes.ts';
+import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { clusterStatus } from './pgcluster.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
@@ -465,9 +465,20 @@ export const updateServiceInput = z.object({
   domains: z.array(z.string()).optional(),
   publicTcpPort: z.number().int().min(0).max(65535).nullable().optional().describe('Host port for the TCP proxy; 0 = pick a free one; null = off'),
   volumes: z
-    .array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/'), volumeId: z.string().optional(), perReplica: z.boolean().optional() }))
+    .array(
+      z.object({
+        name: z.string().regex(/^[a-zA-Z0-9_.-]+$/),
+        mountPath: z.string().startsWith('/'),
+        volumeId: z.string().optional(),
+        perReplica: z.boolean().optional(),
+        hostPath: z.string().optional(),
+        selinux: z.enum(['z', 'Z']).nullable().optional(),
+        readOnly: z.boolean().optional(),
+        borrowed: z.boolean().optional(),
+      }),
+    )
     .optional()
-    .describe('Mounts. New entries (no volumeId) create a fresh volume. To remove one, use detach_volume.'),
+    .describe('Mounts. New entries (no volumeId) create a fresh volume. To remove one, use detach_volume. hostPath (owner only) mounts a folder of the server.'),
   startCommand: z.string().nullable().optional(),
   cmd: z.array(z.string()).nullable().optional().describe('Override only the image CMD (argv array). Ignored when startCommand is set.'),
   entrypoint: z.array(z.string()).nullable().optional().describe('Override only the image ENTRYPOINT (argv array).'),
@@ -531,9 +542,10 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (patch.protocol === 'http' && patch.publicHttp === undefined) svc.publicHttp = true;
   }
   if (patch.volumes !== undefined) {
+    patch.volumes = checkMounts(actor, svc, patch.volumes);
     // Removing a mount here would leave its data mounted until the next deploy; detaching is explicit.
     const keep = new Set(patch.volumes.map((v) => v.volumeId).filter(Boolean));
-    const dropped = svc.volumes.filter((v) => v.volumeId && !keep.has(v.volumeId));
+    const dropped = svc.volumes.filter((v) => v.volumeId && !v.borrowed && !keep.has(v.volumeId));
     if (dropped.length) throw new HttpError(400, `detach ${dropped.map((d) => d.name).join(', ')} instead (detach_volume / the volume's menu) — its data is kept`);
     for (const v of patch.volumes) if (!v.volumeId && svc.volumes.some((x) => x.mountPath === v.mountPath)) throw new HttpError(409, `${v.mountPath} is already in use`);
     set('volumes', patch.volumes.map((v) => ({ ...v, name: v.volumeId ? svc.volumes.find((x) => x.volumeId === v.volumeId)?.name ?? v.name : v.name })), 'volumes');
@@ -617,6 +629,53 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   }
   if (changes.includes('replicas') || changes.includes('schedule')) requestReconcile();
   return serializeService(svc);
+}
+
+/** Host folders, published ports and external routes reach outside the container sandbox: the owner decides. */
+export function requireOwner(actor: Actor, what: string) {
+  if (actor.type !== 'user') throw new HttpError(403, `${what} can only be set by the owner in the dashboard, not with an agent token`);
+}
+
+/**
+ * Validate a service's mount list. Host folders: owner only, allowlisted, existing. Read-only shares can only be
+ * kept (add them with share_volume). Throws on anything invalid.
+ */
+function checkMounts(actor: Actor, svc: Service, mounts: NonNullable<UpdateServiceInput['volumes']>) {
+  return mounts.map((m) => {
+    if (m.hostPath) {
+      const had = svc.volumes.find((x) => x.hostPath === m.hostPath && x.mountPath === m.mountPath && (x.selinux ?? null) === (m.selinux ?? null) && !!x.readOnly === !!m.readOnly);
+      if (!had) requireOwner(actor, 'Host folders');
+      if (m.perReplica || m.volumeId || m.borrowed) throw new HttpError(400, 'a host folder is just a path: no volume, per-replica or share options');
+      const hostPath = checkHostPath(m.hostPath, nodeOf(svc) === LOCAL);
+      return { name: m.name, mountPath: m.mountPath, hostPath, ...(m.selinux ? { selinux: m.selinux } : {}), ...(m.readOnly ? { readOnly: true } : {}) };
+    }
+    if (m.borrowed) {
+      const had = svc.volumes.find((x) => x.borrowed && x.volumeId === m.volumeId);
+      if (!had) throw new HttpError(400, 'add read-only shares with share_volume (or the volume’s “Share read-only”)');
+      return had;
+    }
+    if (m.selinux) throw new HttpError(400, 'SELinux relabelling only applies to host folders');
+    return m;
+  });
+}
+
+/** Imports and copies: keep host folders only for the owner and when still allowed; never carry shares over. */
+function portableMounts(actor: Actor, nodeId: string | null | undefined, mounts: Service['volumes'], dropped: string[]) {
+  return (mounts ?? []).filter((m) => {
+    if (m.borrowed) {
+      dropped.push(`read-only share ${m.mountPath}`);
+      return false;
+    }
+    if (!m.hostPath) return true;
+    try {
+      requireOwner(actor, 'Host folders');
+      m.hostPath = checkHostPath(m.hostPath, !nodeId || nodeId === LOCAL);
+      return true;
+    } catch (e) {
+      dropped.push(`host folder ${m.hostPath} (${(e as Error).message})`);
+      return false;
+    }
+  });
 }
 
 /** A server reference (id or name) → node id. */
@@ -954,7 +1013,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: src.volumes.map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -1006,6 +1065,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   const project = createProject(actor, { name: opts.name ?? spec.name ?? 'imported', color: spec.color });
   const tpls = new Map(templates.map((t) => [t.id, t]));
   const created: Service[] = [];
+  const droppedMounts: string[] = [];
   for (const raw of spec.services) {
     const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
     const src = raw.source ?? (tpl ? { type: 'image' as const, image: tpl.image } : undefined);
@@ -1036,7 +1096,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       autoscale: { ...svc.autoscale, ...(raw.autoscale ?? {}) },
       publicHttp: def(raw.publicHttp, svc.publicHttp),
       domains: [],
-      volumes: def(raw.volumes, svc.volumes).map(({ volumeId, ...v }: any) => v),
+      volumes: portableMounts(actor, svc.nodeId, def(raw.volumes, svc.volumes), droppedMounts).map(({ volumeId, ...v }: any) => v),
       env,
       secretKeys: [...new Set([...svc.secretKeys, ...(raw.secretKeys ?? [])])],
       startCommand: raw.startCommand === undefined ? svc.startCommand : raw.startCommand,
@@ -1065,8 +1125,8 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
     created.push(svc);
   }
   if (opts.deploy !== false) for (const s of created) deployService(actor, s.id);
-  recordActivity(actor, 'project.imported', `Imported ${created.length} services into ${project.name}`, project.id);
-  return { project, services: created.map((s) => s.id) };
+  recordActivity(actor, 'project.imported', `Imported ${created.length} services into ${project.name}${droppedMounts.length ? ` — left out: ${droppedMounts.join('; ')}` : ''}`, project.id);
+  return { project, services: created.map((s) => s.id), dropped: droppedMounts };
 }
 
 export async function backupNow(actor: Actor, serviceId: string, destinationId?: string) {
@@ -1083,9 +1143,39 @@ export function planComposeImport(input: { yaml: string; env?: string; basePath?
   return planCompose(input);
 }
 
-export async function importCompose(actor: Actor, input: { yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean }) {
+export async function importCompose(actor: Actor, input: { yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean; adoptVolumes?: boolean }) {
   const plan = planCompose(input);
-  const r = await importProject(actor, planToSpec(plan), { deploy: false, name: plan.name });
+  // Take over the Docker volumes Compose already created, instead of starting empty. Checked up front, so a volume
+  // still in use stops the import before anything is created.
+  const adopt: { slug: string; mountPath: string; dockerName: string; name: string }[] = [];
+  if (input.adoptVolumes) {
+    requireOwner(actor, 'Taking over existing Docker volumes');
+    const busyOnes: string[] = [];
+    for (const cs of plan.services) {
+      for (const m of cs.volumes) {
+        if (!m.dockerName || m.hostPath) continue;
+        const a = await adoptable(null, m.dockerName);
+        if (!a.exists) {
+          plan.warnings.push(`${cs.name}: no existing Docker volume ${m.dockerName} — it starts with a fresh one`);
+          continue;
+        }
+        if (a.claimed) {
+          plan.warnings.push(`${cs.name}: ${m.dockerName} already belongs to a Servify volume — it starts with a fresh one`);
+          continue;
+        }
+        if (a.users.length) busyOnes.push(`${m.dockerName} ← ${a.users.join(', ')}`);
+        adopt.push({ slug: cs.slug, mountPath: m.mountPath, dockerName: m.dockerName, name: m.name });
+      }
+    }
+    if (busyOnes.length) throw new HttpError(409, `these volumes are still referenced by Compose containers: ${busyOnes.join('; ')} — run \`docker compose down\` (without -v; the data stays), then import again`);
+  }
+  const spec = planToSpec(plan);
+  for (const sv of spec.services) sv.volumes = (sv.volumes ?? []).filter((m) => !adopt.some((a) => a.slug === sv.name && a.mountPath === m.mountPath));
+  const r = await importProject(actor, spec, { deploy: false, name: plan.name });
+  for (const a of adopt) {
+    const svc = servicesTable.all('WHERE project_id = ?', r.project.id).find((x) => x.slug === a.slug);
+    if (svc) await adoptVolume(actor, r.project.id, { dockerName: a.dockerName, serviceId: svc.id, mountPath: a.mountPath, name: `${svc.slug}-${a.name}`.slice(0, 48) });
+  }
   // Keep the published host port for TCP services when it's free (e.g. 5432:5432).
   for (const sid of r.services) {
     const svc = servicesTable.get(sid)!;
@@ -1096,7 +1186,7 @@ export async function importCompose(actor: Actor, input: { yaml: string; env?: s
   }
   if (input.deploy !== false) for (const sid of r.services) deployService(actor, sid);
   recordActivity(actor, 'project.compose', `Imported ${r.services.length} services from docker-compose${plan.warnings.length ? ` (${plan.warnings.length} warnings)` : ''}`, r.project.id);
-  return { ...r, warnings: plan.warnings };
+  return { ...r, warnings: [...plan.warnings, ...(r.dropped ?? []).map((d) => `left out: ${d}`)], adopted: adopt.map((a) => a.dockerName) };
 }
 
 export async function runServiceJob(actor: Actor, serviceId: string) {

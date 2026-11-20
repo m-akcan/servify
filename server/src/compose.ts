@@ -25,7 +25,7 @@ export type ComposeService = {
   replicas: number;
   env: Record<string, string>;
   secretKeys: string[];
-  volumes: { name: string; mountPath: string }[];
+  volumes: ComposeMount[];
   /** Compose semantics: `command` replaces only CMD, `entrypoint` only ENTRYPOINT. */
   cmd: string[] | null;
   entrypoint: string[] | null;
@@ -36,7 +36,9 @@ export type ComposeService = {
   x: number;
   y: number;
 };
-export type ComposePlan = { name: string; services: ComposeService[]; warnings: string[] };
+/** A volume (dockerName = the Docker volume Compose created for it, for taking it over) or a host folder. */
+export type ComposeMount = { name: string; mountPath: string; dockerName?: string; hostPath?: string; readOnly?: boolean; selinux?: 'z' | 'Z' | null; perReplica?: boolean };
+export type ComposePlan = { name: string; composeProject: string; services: ComposeService[]; warnings: string[] };
 
 const TCP_PORTS = new Set([5432, 3306, 6379, 27017, 9042, 5672, 1883, 11211, 9092, 2181, 4222, 26257, 8086, 9000]);
 
@@ -190,6 +192,10 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
   const services = deepInterpolate(doc.services, vars, missing) as Record<string, any>;
   if (missing.size) warnings.push(`Variables not set (left empty): ${[...missing].join(', ')}. Paste your .env to fill them in.`);
 
+  // Compose's own project name: how its named volumes are called in Docker (<project>_<volume>).
+  const composeProject = String(input.name?.trim() || doc.name || (base ? base.split('/').pop() : '') || 'compose').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  const topVolumes = (doc.volumes && typeof doc.volumes === 'object' ? doc.volumes : {}) as Record<string, any>;
+
   const out: ComposeService[] = [];
   const used = new Set<string>();
   for (const [name, raw] of Object.entries(services)) {
@@ -265,29 +271,52 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     const publishedPort = tcpPorts[0]?.published ?? null;
 
     // ── volumes
-    const volumes: { name: string; mountPath: string }[] = [];
+    const volumes: ComposeMount[] = [];
     for (const v of svc.volumes ?? []) {
       let src: string | undefined;
       let target: string | undefined;
       let type = 'volume';
+      let opts: string[] = [];
       if (typeof v === 'string') {
         const parts = v.split(':');
         if (parts.length === 1) target = parts[0];
         else [src, target] = parts;
+        opts = (parts[2] ?? '').split(',').filter(Boolean);
         if (src && (src.startsWith('.') || src.startsWith('/') || src.startsWith('~'))) type = 'bind';
       } else if (v && typeof v === 'object') {
         type = (v as any).type ?? 'volume';
         src = (v as any).source;
         target = (v as any).target;
+        if ((v as any).read_only) opts.push('ro');
+        if ((v as any).bind?.selinux) opts.push((v as any).bind.selinux);
       }
       if (!target?.startsWith('/')) continue;
+      const readOnly = opts.includes('ro');
+      const selinux = opts.includes('Z') ? 'Z' : opts.includes('z') ? 'z' : undefined;
       if (type === 'bind') {
-        w(`bind mount ${src}:${target} is not mounted (host folders are never exposed) — bake the files into the image or use a volume`);
+        // A host folder: kept only when the owner imports it and SERVIFY_HOST_MOUNTS allows that path.
+        let host = String(src ?? '');
+        if (host.startsWith('~')) host = join(process.env.HOME ?? '/root', host.slice(1));
+        else if (!host.startsWith('/')) {
+          if (!base) {
+            w(`host folder ${src}:${target} is relative — give the base folder of the compose file to keep it`);
+            continue;
+          }
+          host = resolve(base, host);
+        }
+        if (/docker\.sock/.test(host)) {
+          w(`the Docker socket (${host}) is never mounted`);
+          continue;
+        }
+        volumes.push({ name: (host.split('/').pop() || 'host').replace(/[^a-zA-Z0-9_.-]/g, '-'), mountPath: target, hostPath: host, ...(readOnly ? { readOnly } : {}), ...(selinux ? { selinux } : {}) });
+        w(`host folder ${host} → ${target}: mounted only if you import as the owner and SERVIFY_HOST_MOUNTS allows it`);
         continue;
       }
       if (type === 'tmpfs') continue;
       const vname = (src || target.split('/').filter(Boolean).join('-') || 'data').replace(/[^a-zA-Z0-9_.-]/g, '-');
-      volumes.push({ name: vname, mountPath: target });
+      const top = src ? topVolumes[src] : null;
+      const dockerName = src ? String(top?.name ?? (top?.external ? src : `${composeProject}_${src}`)) : undefined;
+      volumes.push({ name: vname, mountPath: target, ...(dockerName ? { dockerName } : {}), ...(readOnly ? { readOnly } : {}) });
     }
     if (tpl && !volumes.length && tpl.volumes.length) volumes.push(...tpl.volumes);
 
@@ -350,7 +379,7 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
   }
 
   const name = input.name?.trim() || doc.name || (base ? base.split('/').pop() : null) || 'compose';
-  return { name, services: out, warnings };
+  return { name, composeProject, services: out, warnings };
 }
 
 /** The plan as a servify.json spec (reuses the regular import path). */

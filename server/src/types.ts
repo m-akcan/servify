@@ -26,6 +26,14 @@ export interface Volume {
   volumeId?: string;
   /** One volume per replica (a "volume set") instead of one shared volume — for databases that replicate themselves. */
   perReplica?: boolean;
+  /** A folder on the server instead of a volume. Owner-only, and only under SERVIFY_HOST_MOUNTS. Never wiped or deleted. */
+  hostPath?: string;
+  /** SELinux relabel for a host folder ('z' shared, 'Z' private). Opt-in: relabelling a shared folder can break other users of it. */
+  selinux?: 'z' | 'Z' | null;
+  /** Mount read-only. */
+  readOnly?: boolean;
+  /** Another service's volume, mounted read-only (e.g. a backup sidecar). Never wiped, backed up or deleted from here. */
+  borrowed?: boolean;
 }
 
 /** A persistent volume. Lives in a project; attached to at most one service at a time. */
@@ -42,6 +50,8 @@ export interface VolumeRecord {
   replicaIndex?: number | null;
   /** The server whose Docker holds the data (null/undefined = this machine). Volumes never cross servers. */
   nodeId?: string | null;
+  /** An existing Docker volume Servify took over (its data predates Servify). */
+  adopted?: boolean;
   /** Where it is (or was last) mounted. */
   mountPath: string;
   /** Canvas position while detached. */

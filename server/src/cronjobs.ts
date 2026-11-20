@@ -11,7 +11,7 @@ import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from '.
 const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
 import { parseCron, cronMatches } from './cron.ts';
 import { notify } from './notify.ts';
-import { mountsFor } from './volumes.ts';
+import { mountsFor, hostMountsFor } from './volumes.ts';
 
 const running = new Set<string>();
 const SCHEDULER: Actor = { type: 'system', name: 'scheduler' };
@@ -55,12 +55,14 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     const network = networkName(project.id);
     await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
     const env = { ...((dep as any).resolvedEnv ?? dep.config.env), SERVIFY_JOB_RUN_ID: run.id };
+    const host = await hostMountsFor(svc, dep.config.volumes, docker);
     const spec: any = {
       Image: dep.image,
       Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
       Labels: { 'servify.job': 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id, [LABEL.service]: svc.id, 'servify.run': run.id },
       HostConfig: {
-        Mounts: mountsFor(svc.id, dep.config.volumes, 0),
+        Mounts: [...mountsFor(svc.id, dep.config.volumes, 0), ...host.mounts],
+        ...(host.binds.length ? { Binds: host.binds } : {}),
         NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
         Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
         Init: true,

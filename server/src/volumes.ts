@@ -11,9 +11,76 @@ import type { Service, Volume, VolumeRecord } from './types.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes } from './nodes.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { HttpError, id, slugify } from './util.ts';
+import { config } from './config.ts';
+import { posix } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import type { DockerClient } from './docker.ts';
 import { INSTANCE_ID, LABEL, busy, drainAndRemove, replicasOf, requestReconcile, refreshServiceStatus } from './engine.ts';
 
 const NAME_RE = /^[a-zA-Z0-9_.-]{1,48}$/;
+
+// ───────────────────────────── kinds of mounts ─────────────────────────────
+
+export const isHostMount = (m: Volume) => !!m.hostPath;
+export const isBorrowed = (m: Volume) => !!m.borrowed;
+/** Mounts whose volume this service owns (backed up, wiped on restore, deleted with it). */
+export const ownedMounts = (mounts: Volume[] | undefined) => (mounts ?? []).filter((m) => !m.hostPath && !m.borrowed);
+
+const DENY = ['/etc', '/proc', '/sys', '/dev', '/boot', '/root', '/run', '/var/run', '/var/lib/docker', '/usr', '/bin', '/sbin', '/lib', '/lib64'];
+const under = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith('/') ? dir : `${dir}/`);
+
+/**
+ * Validate a host folder: absolute, under SERVIFY_HOST_MOUNTS, never system folders, the Docker socket or Servify's
+ * own data. On this machine it must exist and its real path (symlinks resolved) must still be allowed.
+ */
+export function checkHostPath(raw: string, local = true): string {
+  if (!config.hostMounts.length) throw new HttpError(403, 'host folders are off — start Servify with SERVIFY_HOST_MOUNTS=/folder/one,/folder/two to allow folders under those paths');
+  if (!raw?.trim().startsWith('/') || raw.split('/').includes('..')) throw new HttpError(400, 'a host folder must be an absolute path without ".."');
+  const check = (p: string) => {
+    if (p === '/' || DENY.some((d) => under(p, d)) || /docker\.sock/.test(p) || under(p, config.dataDir)) throw new HttpError(403, `${p} can't be mounted (system folders, the Docker socket and Servify's data are off limits)`);
+    if (!config.hostMounts.some((a) => under(p, a))) throw new HttpError(403, `${p} is not under SERVIFY_HOST_MOUNTS (${config.hostMounts.join(', ')})`);
+  };
+  const p = posix.normalize(raw.trim()).replace(/(.)\/+$/, '$1');
+  check(p);
+  if (local) {
+    // Docker would silently create a missing folder (that's how "/path/to/media" mounts happen): refuse instead.
+    if (!existsSync(p)) throw new HttpError(400, `${p} doesn't exist on this machine`);
+    check(realpathSync(p));
+  }
+  return p;
+}
+
+/**
+ * Host folders of a container, re-validated at create time (rollbacks reuse old settings). Plain ones use Docker's
+ * `bind` mounts, which fail on a missing source; SELinux-relabelled ones need the legacy `Binds` syntax.
+ */
+export async function hostMountsFor(svc: Service, mounts: Volume[], d: DockerClient): Promise<{ mounts: { Type: 'bind'; Source: string; Target: string; ReadOnly: boolean }[]; binds: string[] }> {
+  const out = { mounts: [] as { Type: 'bind'; Source: string; Target: string; ReadOnly: boolean }[], binds: [] as string[] };
+  const local = nodeOf(svc) === 'local';
+  for (const m of mounts) {
+    if (!m.hostPath) continue;
+    const src = checkHostPath(m.hostPath, local);
+    if (m.selinux === 'z' || m.selinux === 'Z') {
+      if (!local) await assertRemotePath(d, src);
+      out.binds.push(`${src}:${m.mountPath}:${m.readOnly ? 'ro,' : ''}${m.selinux}`);
+    } else out.mounts.push({ Type: 'bind', Source: src, Target: m.mountPath, ReadOnly: !!m.readOnly });
+  }
+  return out;
+}
+
+/** On another server we can't stat the folder: a throwaway container with a `bind` mount fails if it's missing. */
+async function assertRemotePath(d: DockerClient, src: string) {
+  const image = 'alpine:3.20';
+  if (!(await d.inspectImage(image))) await d.pullImage(image);
+  let cid: string | null = null;
+  try {
+    cid = await d.createContainer(`svf-pathcheck-${Date.now().toString(36)}`, { Image: image, Cmd: ['true'], HostConfig: { Mounts: [{ Type: 'bind', Source: src, Target: '/check', ReadOnly: true }], NetworkMode: 'none' } });
+  } catch (e) {
+    throw new HttpError(400, `${src} doesn't exist on that server (${(e as Error).message})`);
+  } finally {
+    if (cid) await d.removeContainer(cid, true).catch(() => {});
+  }
+}
 
 /** Docker volume name used before volumes were first-class (kept for migrated volumes). */
 export function legacyDockerName(serviceId: string, name: string) {
@@ -62,6 +129,14 @@ export function leaderOf(v: VolumeRecord): VolumeRecord {
  * longer attached to this service (never mount someone else's data). Per-replica sets grow on demand.
  */
 export function dockerVolumeFor(serviceId: string, mount: Volume, index = 0): string | null {
+  if (mount.hostPath) return null;
+  if (mount.borrowed) {
+    // Read-only share of another service's volume: same project and same server, never a per-replica set.
+    const rec = mount.volumeId ? volumesTable.get(mount.volumeId) : null;
+    const svc = servicesTable.get(serviceId);
+    if (!rec || !svc || rec.projectId !== svc.projectId || nodeOf(rec) !== nodeOf(svc) || rec.setId) return null;
+    return rec.dockerName;
+  }
   if (mount.volumeId) {
     const rec = volumesTable.get(mount.volumeId);
     if (!rec) return null;
@@ -82,10 +157,11 @@ export function dockerVolumeFor(serviceId: string, mount: Volume, index = 0): st
 
 /** Docker mounts for replica `index`, skipping volumes that moved away. */
 export function mountsFor(serviceId: string, mounts: Volume[], index = 0) {
-  const out: { Type: 'volume'; Source: string; Target: string }[] = [];
+  const out: { Type: 'volume'; Source: string; Target: string; ReadOnly?: boolean }[] = [];
   for (const m of mounts) {
+    if (m.hostPath) continue; // host folders: hostMountsFor()
     const src = dockerVolumeFor(serviceId, m, index);
-    if (src) out.push({ Type: 'volume', Source: src, Target: m.mountPath });
+    if (src) out.push({ Type: 'volume', Source: src, Target: m.mountPath, ...(m.borrowed || m.readOnly ? { ReadOnly: true } : {}) });
     else console.warn(`[volumes] ${m.name} is no longer attached to ${serviceId} — not mounting it`);
   }
   return out;
@@ -93,7 +169,8 @@ export function mountsFor(serviceId: string, mounts: Volume[], index = 0) {
 
 /** Shared (single) volumes force one replica; per-replica sets don't. */
 export function hasSharedVolume(mounts: Volume[] | undefined) {
-  return (mounts ?? []).some((m) => !m.perReplica);
+  // Writable shared data forces one replica; read-only shares and per-replica sets don't.
+  return (mounts ?? []).some((m) => (m.hostPath ? !m.readOnly : m.borrowed ? false : !m.perReplica));
 }
 
 export async function ensureDockerVolume(v: VolumeRecord) {
@@ -107,6 +184,7 @@ export async function ensureDockerVolume(v: VolumeRecord) {
 export function syncServiceVolumes(svc: Service): Service {
   let changed = false;
   const next = svc.volumes.map((m) => {
+    if (m.hostPath || m.borrowed) return m; // not ours to create or claim
     if (m.volumeId && volumesTable.get(m.volumeId)) {
       for (const rec of membersOf(volumesTable.get(m.volumeId)!)) {
         if (rec.mountPath !== m.mountPath || rec.serviceId !== svc.id) {
@@ -152,10 +230,10 @@ export function syncServiceVolumes(svc: Service): Service {
 export function migrateVolumes() {
   let n = 0;
   for (const svc of servicesTable.all()) {
-    if (!svc.volumes.some((m) => !m.volumeId)) continue;
+    if (!svc.volumes.some((m) => !m.volumeId && !m.hostPath)) continue;
     const taken = new Set(volumesTable.all('WHERE project_id = ?', svc.projectId).map((v) => v.name));
     svc.volumes = svc.volumes.map((m) => {
-      if (m.volumeId) return m;
+      if (m.volumeId || m.hostPath) return m;
       const vid = id('vol');
       let name = `${svc.slug}-${m.name}`.slice(0, 48);
       for (let i = 2; taken.has(name); i++) name = `${svc.slug}-${m.name}-${i}`.slice(0, 48);
@@ -337,23 +415,148 @@ export function updateVolume(actor: Actor, volumeRef: string, patch: { name?: st
   return withSize(save(v));
 }
 
-export async function deleteVolume(actor: Actor, volumeRef: string) {
+/** Services that mount this volume read-only (shares). */
+export function borrowersOf(v: VolumeRecord): Service[] {
+  return servicesTable.all('WHERE project_id = ?', v.projectId).filter((s) => s.volumes.some((m) => m.borrowed && m.volumeId === v.id));
+}
+
+/** Containers outside this Servify that use a Docker volume (any state): never removed by us, and they block takeovers. */
+async function foreignUsers(d: DockerClient, dockerName: string) {
+  const all = await d.containersUsingVolume(dockerName, true);
+  return all.filter((c) => c.Labels?.[LABEL.instance] !== INSTANCE_ID);
+}
+
+/**
+ * Delete a volume and its data — or, with `keepData`, only forget it (the Docker volume stays, e.g. an adopted one you
+ * want to hand back). Never removes containers that aren't Servify's.
+ */
+export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keepData?: boolean } = {}) {
   const v = getVolumeOrThrow(volumeRef);
   if (v.serviceId) throw new HttpError(409, `${v.name} is attached to ${servicesTable.get(v.serviceId)?.name ?? 'a service'} — detach it first`);
+  const borrowers = borrowersOf(v);
+  if (borrowers.length) throw new HttpError(409, `${borrowers.map((b) => b.name).join(', ')} mount${borrowers.length === 1 ? 's' : ''} ${v.name} read-only — remove that first`);
   for (const m of membersOf(v)) {
-    const d = dockerFor(m.nodeId);
-    const inUse = await d.containersUsingVolume(m.dockerName, true);
-    for (const c of inUse) await d.removeContainer(c.Id, true);
-    await d.removeVolume(m.dockerName);
+    if (!opts.keepData) {
+      const d = dockerFor(m.nodeId);
+      const foreign = await foreignUsers(d, m.dockerName);
+      if (foreign.length) throw new HttpError(409, `${v.name} is still used by container${foreign.length === 1 ? '' : 's'} outside Servify: ${foreign.map((c) => c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12)).join(', ')} — remove ${foreign.length === 1 ? 'it' : 'them'} first, or forget the volume and keep its data`);
+      const ours = await d.containersUsingVolume(m.dockerName, true);
+      for (const c of ours) await d.removeContainer(c.Id, true);
+      await d.removeVolume(m.dockerName);
+    }
     volumesTable.delete(m.id);
     bus.publish({ type: 'volume.deleted', volumeId: m.id, projectId: m.projectId });
   }
-  recordActivity(actor, 'volume.deleted', `Deleted volume ${v.name} and its data`, v.projectId);
+  recordActivity(actor, 'volume.deleted', opts.keepData ? `Forgot volume ${v.name} (the Docker volume ${v.dockerName} and its data stay)` : `Deleted volume ${v.name} and its data`, v.projectId);
+}
+
+/** Can this Docker volume be taken over? (exists, not already a Servify volume, no outside container references it) */
+export async function adoptable(nodeId: string | null, dockerName: string) {
+  const d = dockerFor(nodeId);
+  const exists = (await d.listVolumes()).some((v: any) => v.Name === dockerName);
+  if (!exists) return { exists: false as const, claimed: false, users: [] as string[] };
+  const claimed = volumesTable.all().some((v) => v.dockerName === dockerName && nodeOf(v) === (nodeId || 'local'));
+  const users = (await foreignUsers(d, dockerName)).map((c) => `${c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12)} (${c.State})`);
+  return { exists: true as const, claimed, users };
+}
+
+/** Docker volumes on a server that no Servify record claims (candidates for adopting). */
+export async function unmanagedDockerVolumes(nodeId: string | null) {
+  const d = dockerFor(nodeId);
+  const claimed = new Set(volumesTable.all().filter((v) => nodeOf(v) === (nodeId || 'local')).map((v) => v.dockerName));
+  const list = (await d.listVolumes().catch(() => [])).filter((v: any) => !claimed.has(v.Name) && v.Labels?.[LABEL.instance] !== INSTANCE_ID);
+  const usage = await d.volumeUsage().catch(() => new Map<string, number>());
+  const out = [];
+  for (const v of list as any[]) {
+    const users = await d.containersUsingVolume(v.Name, true).catch(() => []);
+    out.push({ name: v.Name as string, sizeBytes: usage.get(v.Name) ?? null, compose: v.Labels?.['com.docker.compose.project'] ?? null, usedBy: users.map((c) => ({ name: c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12), state: c.State })) });
+  }
+  return out;
+}
+
+/**
+ * Take over an existing Docker volume (e.g. a Compose project's database) without copying: the record points at the
+ * same Docker volume. Refused while any container outside Servify — running or stopped — still references it: a
+ * stopped `restart: unless-stopped` container could come back and run a second database on the same files.
+ */
+export async function adoptVolume(actor: Actor, projectId: string, input: { dockerName: string; name?: string; serviceId?: string; mountPath?: string; server?: string | null; x?: number; y?: number }) {
+  const project = projectsTable.get(projectId) ?? projectsTable.all().find((p) => p.slug === projectId);
+  if (!project) throw new HttpError(404, 'project not found');
+  const target = input.serviceId ? (servicesTable.get(input.serviceId) ?? servicesTable.all().find((s) => s.projectId === project.id && (s.slug === input.serviceId || s.name === input.serviceId))) : null;
+  const nodeId = target ? (target.nodeId ?? null) : input.server && input.server !== 'local' ? input.server : null;
+  const d = dockerFor(nodeId);
+  const dockerName = input.dockerName?.trim();
+  if (!dockerName) throw new HttpError(400, 'which Docker volume?');
+  const existing = (await d.listVolumes()).find((v: any) => v.Name === dockerName);
+  if (!existing) throw new HttpError(404, `no Docker volume called ${dockerName} on ${nodeName(nodeId)}`);
+  const claimed = volumesTable.all().find((v) => v.dockerName === dockerName && nodeOf(v) === (nodeId || 'local'));
+  if (claimed) throw new HttpError(409, `${dockerName} already is the Servify volume ${claimed.name}`);
+  const users = await foreignUsers(d, dockerName);
+  if (users.length) throw new HttpError(409, `${dockerName} is still referenced by ${users.map((c) => `${c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12)} (${c.State})`).join(', ')} — stop and remove ${users.length === 1 ? 'that container' : 'those containers'} first (e.g. \`docker compose down\` without -v), the data stays`);
+  const name = cleanName(input.name || dockerName.replace(/^[^_]+_/, ''), project.id);
+  const vid = id('vol');
+  const v = save({
+    id: vid,
+    projectId: project.id,
+    name,
+    dockerName,
+    serviceId: null,
+    nodeId,
+    adopted: true,
+    mountPath: input.mountPath?.trim() || '/data',
+    ...freeSpot(project.id, input.x ?? 0, input.y ?? 0),
+    sizeBytes: null,
+    setId: null,
+    replicaIndex: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  recordActivity(actor, 'volume.adopted', `Took over the Docker volume ${dockerName} as ${name} (data untouched)`, project.id);
+  if (target) return attachVolume(actor, v.id, target.id, input.mountPath ?? '/data');
+  return withSize(v);
+}
+
+/** Mount another service's volume read-only into a service (same project and server), e.g. a backup sidecar. */
+export async function shareVolume(actor: Actor, volumeRef: string, serviceId: string, mountPath: string) {
+  const v = getVolumeOrThrow(volumeRef);
+  const svc = servicesTable.get(serviceId) ?? servicesTable.all().find((s) => s.projectId === v.projectId && (s.slug === serviceId || s.name === serviceId));
+  if (!svc) throw new HttpError(404, `service not found: ${serviceId}`);
+  if (svc.projectId !== v.projectId) throw new HttpError(400, 'shares only work within one project');
+  if (nodeOf(svc) !== nodeOf(v)) throw new HttpError(409, `${v.name} is on ${nodeName(nodeOf(v))} and ${svc.name} on ${nodeName(nodeOf(svc))} — shares only work on one server`);
+  if (v.setId) throw new HttpError(400, 'per-replica volume sets can’t be shared');
+  if (v.serviceId === svc.id) throw new HttpError(409, `${svc.name} already owns ${v.name}`);
+  const path = mountPath?.trim();
+  checkMountPath(path);
+  if (svc.volumes.some((m) => m.mountPath === path)) throw new HttpError(409, `${svc.name} already mounts something at ${path}`);
+  if (svc.volumes.some((m) => m.borrowed && m.volumeId === v.id)) throw new HttpError(409, `${svc.name} already mounts ${v.name}`);
+  svc.volumes = [...svc.volumes, { name: v.name, mountPath: path, volumeId: v.id, borrowed: true, readOnly: true }];
+  svc.updatedAt = Date.now();
+  servicesTable.put(svc);
+  bus.publish({ type: 'service.updated', service: svc });
+  recordActivity(actor, 'volume.shared', `${svc.name} mounts ${v.name} read-only at ${path}`, svc.projectId, svc.id);
+  const deployment = svc.activeDeploymentId && !svc.stopped ? await redeploy(actor, svc.id) : null;
+  return { volume: withSize(v), deployment };
+}
+
+/** Remove a read-only share or a host folder from a service (nothing is deleted). */
+export async function removeMount(actor: Actor, serviceId: string, mountPath: string) {
+  const svc = servicesTable.get(serviceId);
+  if (!svc) throw new HttpError(404, 'service not found');
+  const m = svc.volumes.find((x) => x.mountPath === mountPath);
+  if (!m) throw new HttpError(404, `${svc.name} mounts nothing at ${mountPath}`);
+  if (!m.borrowed && !m.hostPath) throw new HttpError(400, `${mountPath} is ${svc.name}'s own volume — detach it instead`);
+  svc.volumes = svc.volumes.filter((x) => x !== m);
+  svc.updatedAt = Date.now();
+  servicesTable.put(svc);
+  bus.publish({ type: 'service.updated', service: svc });
+  recordActivity(actor, 'volume.unmounted', `${svc.name} no longer mounts ${m.hostPath ?? m.name} at ${mountPath}`, svc.projectId, svc.id);
+  const deployment = svc.activeDeploymentId && !svc.stopped ? await redeploy(actor, svc.id) : null;
+  return { deployment };
 }
 
 /** Service deleted: its volumes are deleted too, or kept as detached volumes. */
 export async function releaseServiceVolumes(svc: Service, keep: boolean) {
-  for (const m of svc.volumes) {
+  for (const m of ownedMounts(svc.volumes)) {
     const rec = m.volumeId ? volumesTable.get(m.volumeId) : volumesTable.all().find((r) => r.dockerName === legacyDockerName(svc.id, m.name));
     if (!rec) {
       if (!keep) await dockerFor(svc.nodeId).removeVolume(legacyDockerName(svc.id, m.name));
@@ -365,6 +568,12 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
         member.serviceId = null;
         Object.assign(member, spot);
         save(member);
+      } else if (member.adopted || borrowersOf(rec).length) {
+        // Adopted data predates Servify, and shared data is still read by others: kept as a detached volume.
+        member.serviceId = null;
+        Object.assign(member, freeSpot(rec.projectId, svc.x + 38, svc.y, rec.id));
+        save(member);
+        console.log(`[volumes] kept ${member.name} (${member.adopted ? 'adopted' : 'still shared'}) when ${svc.name} was deleted`);
       } else {
         await dockerFor(member.nodeId).removeVolume(member.dockerName);
         volumesTable.delete(member.id);
@@ -377,6 +586,12 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
 /** Project deleted: remove its detached volumes too. */
 export async function deleteProjectVolumes(projectId: string) {
   for (const v of volumesTable.all('WHERE project_id = ?', projectId)) {
+    if (v.adopted) {
+      // Its data predates Servify: forget it, never delete it implicitly.
+      console.log(`[volumes] forgot adopted volume ${v.name}; the Docker volume ${v.dockerName} and its data stay`);
+      volumesTable.delete(v.id);
+      continue;
+    }
     await Promise.resolve()
       .then(() => dockerFor(v.nodeId).removeVolume(v.dockerName))
       .catch(() => console.warn(`[volumes] ${v.name} stays on ${nodeName(nodeOf(v))} (offline) — remove it there by hand: docker volume rm ${v.dockerName}`));

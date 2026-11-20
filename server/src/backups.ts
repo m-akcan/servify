@@ -21,7 +21,7 @@ import { dockerFor, dockerForContainer, nodeOf } from './nodes.ts';
 import { busy, drainAndRemove, replicasOf, requestReconcile, volumeName, refreshServiceStatus } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
-import { dockerVolumeFor, membersOf } from './volumes.ts';
+import { dockerVolumeFor, membersOf, ownedMounts } from './volumes.ts';
 import { destinationById, type Destination } from './settings.ts';
 import { s3Delete, s3Get, s3Put } from './s3.ts';
 import { config } from './config.ts';
@@ -42,8 +42,9 @@ function deployedImage(svc: Service): string {
 }
 
 function volumesOf(svc: Service) {
-  // The service's current attachments (volumes are first-class and can move between services).
-  return svc.volumes;
+  // Only volumes this service owns: never a host folder (a media library!) or another service's shared volume —
+  // those are neither archived nor wiped on restore.
+  return ownedMounts(svc.volumes);
 }
 
 export function backupMethod(svc: Service): BackupMethod | null {

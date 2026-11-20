@@ -14,7 +14,7 @@ import { replicasOf } from './engine.ts';
 import { restoreBackup } from './backups.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 import { listCertificates } from './certs.ts';
-import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume } from './volumes.ts';
+import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, clusterStatus } from './pgcluster.ts';
 import { listServers } from './nodes.ts';
 
@@ -399,7 +399,7 @@ export function buildMcpServer(principal: Principal): McpServer {
   server.registerTool(
     'import_compose',
     {
-      description: 'Create a project from a docker-compose.yml. Use dry_run first: it returns the mapped services and warnings (bind mounts, privileged… are never honoured).',
+      description: 'Create a project from a docker-compose.yml. Use dry_run first: it returns the mapped services and warnings (privileged, host networking, the Docker socket… are never honoured; host folders and taking over existing volumes need the owner in the dashboard).',
       inputSchema: {
         yaml: z.string().describe('Contents of docker-compose.yml'),
         env: z.string().optional().describe('Contents of the .env file used for ${VAR} interpolation'),
@@ -489,11 +489,32 @@ export function buildMcpServer(principal: Principal): McpServer {
 
   server.registerTool(
     'delete_volume',
-    { description: 'Permanently delete a detached volume and all its data.', inputSchema: { volume: z.string() }, annotations: { destructiveHint: true } },
-    wrap(async ({ volume }: { volume: string }) => {
+    { description: 'Permanently delete a detached volume and all its data (keep_data: only forget it, the Docker volume stays).', inputSchema: { volume: z.string(), keep_data: z.boolean().optional() }, annotations: { destructiveHint: true } },
+    wrap(async ({ volume, keep_data }: { volume: string; keep_data?: boolean }) => {
       guard();
-      await deleteVolume(actor, volume);
+      await deleteVolume(actor, volume, { keepData: !!keep_data });
       return { ok: true };
+    }),
+  );
+
+  server.registerTool(
+    'share_volume',
+    {
+      description: 'Mount a volume read-only into another service of the same project (e.g. a backup sidecar reading a game server\'s data). The service redeploys. Remove with unmount.',
+      inputSchema: { volume: z.string().describe('Volume id or "project/volume"'), service: svcRef, mount_path: z.string() },
+    },
+    wrap(async ({ volume, service, mount_path }: { volume: string; service: string; mount_path: string }) => {
+      guard();
+      return shareVolume(actor, volume, ops.getServiceOrThrow(service).id, mount_path);
+    }),
+  );
+
+  server.registerTool(
+    'unmount',
+    { description: 'Remove a read-only share or a host folder from a service (nothing is deleted). The service redeploys.', inputSchema: { service: svcRef, mount_path: z.string() } },
+    wrap(async ({ service, mount_path }: { service: string; mount_path: string }) => {
+      guard();
+      return removeMount(actor, ops.getServiceOrThrow(service).id, mount_path);
     }),
   );
 

@@ -14,7 +14,7 @@ import { config } from './config.ts';
 import { sleep, id as newId } from './util.ts';
 import { kv } from './db.ts';
 import { notify } from './notify.ts';
-import { mountsFor, hasSharedVolume } from './volumes.ts';
+import { mountsFor, hasSharedVolume, hostMountsFor } from './volumes.ts';
 import { LOCAL, nodeOf, isOnline, onlineNodes, dockerFor, dockerForContainer, setContainerNode, forgetContainer, containerNodeOf, forwardPort, pruneForwards, onNodeChange } from './nodes.ts';
 
 /** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
@@ -272,6 +272,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
 
   // Only volumes currently attached to this service are mounted (volumes can move between services).
   const mounts = mountsFor(svc.id, dep.config.volumes, index);
+  const host = await hostMountsFor(svc, dep.config.volumes, d); // re-validated: settings may predate today's rules
   for (const m of mounts) {
     await d.createVolume(m.Source, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
   }
@@ -294,7 +295,8 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
       RestartPolicy: { Name: 'unless-stopped' },
       PortBindings:
         exposed && (remote || !config.inContainer) ? { [`${port}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '' }] } : undefined,
-      Mounts: mounts,
+      Mounts: [...mounts, ...host.mounts],
+      ...(host.binds.length ? { Binds: host.binds } : {}),
       NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
       Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
       LogConfig: { Type: 'json-file', Config: { 'max-size': '10m', 'max-file': '3' } },

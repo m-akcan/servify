@@ -36,7 +36,7 @@ import { restoreBackup, deleteBackup, openBackupStream } from './backups.ts';
 import { backupsTable } from './db.ts';
 import { s3Test } from './s3.ts';
 import { keySource, keyPath } from './crypto.ts';
-import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume } from './volumes.ts';
+import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume, unmanagedDockerVolumes, adoptVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, rebuildMember } from './pgcluster.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 
@@ -191,7 +191,7 @@ api.post('/projects/import', async (c) => {
   return c.json(await ops.importProject(actor(c), body.spec, { deploy: body.deploy, name: body.name }), 201);
 });
 api.post('/projects/import-compose', async (c) => {
-  const body = await jsonBody<{ yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean; dryRun?: boolean }>(c);
+  const body = await jsonBody<{ yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean; dryRun?: boolean; adoptVolumes?: boolean }>(c);
   if (!body.yaml?.trim()) throw new HttpError(400, 'paste the contents of your docker-compose.yml');
   if (body.dryRun) return c.json(ops.planComposeImport(body));
   return c.json(await ops.importCompose(actor(c), body), 201);
@@ -205,8 +205,26 @@ api.post('/volumes/:id/attach', async (c) => {
 });
 api.post('/volumes/:id/detach', async (c) => c.json(await detachVolume(actor(c), c.req.param('id'))));
 api.delete('/volumes/:id', async (c) => {
-  await deleteVolume(actor(c), c.req.param('id'));
+  await deleteVolume(actor(c), c.req.param('id'), { keepData: c.req.query('keepData') === '1' });
   return c.json({ ok: true });
+});
+// Existing Docker volumes Servify doesn't manage yet (owner only: they may hold any app's data).
+api.get('/servers/:id/docker-volumes', async (c) => {
+  ops.requireOwner(actor(c), 'Listing other Docker volumes');
+  const id = c.req.param('id');
+  return c.json(await unmanagedDockerVolumes(id === 'local' ? null : id));
+});
+api.post('/projects/:id/volumes/adopt', async (c) => {
+  ops.requireOwner(actor(c), 'Taking over an existing Docker volume');
+  return c.json(await adoptVolume(actor(c), ops.getProjectOrThrow(c.req.param('id')).id, await jsonBody(c)), 201);
+});
+api.post('/volumes/:id/share', async (c) => {
+  const { serviceId, mountPath } = await jsonBody<{ serviceId: string; mountPath: string }>(c);
+  return c.json(await shareVolume(actor(c), c.req.param('id'), serviceId, mountPath));
+});
+api.post('/services/:id/unmount', async (c) => {
+  const { mountPath } = await jsonBody<{ mountPath: string }>(c);
+  return c.json(await removeMount(actor(c), ops.getServiceOrThrow(c.req.param('id')).id, mountPath));
 });
 api.get('/projects/:id/environments', (c) => c.json(environmentsOf(c.req.param('id'))));
 api.post('/projects/:id/environments', async (c) => {
