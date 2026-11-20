@@ -27,6 +27,30 @@ function DeployLog({ dep }: { dep: Deployment }) {
   return <LogView lines={lines} live={live} className="deploy-log" emptyText={live ? 'Starting…' : 'No log output.'} />;
 }
 
+/** What changed between two deployments' configs. */
+function diffConfigs(prev: Deployment | undefined, d: Deployment): string[] {
+  if (!prev) return [];
+  const out: string[] = [];
+  const a = prev.config;
+  const b = d.config;
+  const src = (x: Deployment['config']['source']) => (x.type === 'image' ? x.image : x.type === 'git' ? `${x.repo}${x.branch ? '@' + x.branch : ''}` : x.path);
+  if (src(a.source) !== src(b.source)) out.push(`source → ${src(b.source)}`);
+  if (prev.commitSha && d.commitSha && prev.commitSha !== d.commitSha) out.push(`commit ${prev.commitSha.slice(0, 7)} → ${d.commitSha.slice(0, 7)}`);
+  if ((a.port ?? null) !== (b.port ?? null)) out.push(`port ${a.port ?? 'auto'} → ${b.port ?? 'auto'}`);
+  if ((a.startCommand ?? '') !== (b.startCommand ?? '')) out.push('start command changed');
+  const ka = new Set(Object.keys(a.env));
+  const kb = new Set(Object.keys(b.env));
+  const added = [...kb].filter((k) => !ka.has(k));
+  const removed = [...ka].filter((k) => !kb.has(k));
+  const changed = [...kb].filter((k) => ka.has(k) && a.env[k] !== b.env[k]);
+  if (added.length) out.push(`+ ${added.join(', ')}`);
+  if (removed.length) out.push(`− ${removed.join(', ')}`);
+  if (changed.length) out.push(`~ ${changed.join(', ')}`);
+  if (JSON.stringify(a.volumes) !== JSON.stringify(b.volumes)) out.push('volumes changed');
+  if (JSON.stringify(a.resources) !== JSON.stringify(b.resources)) out.push('resources changed');
+  return out;
+}
+
 /** Turn common failure modes into a concrete next step. */
 function FailureHint({ d, s }: { d: Deployment; s: ServiceView }) {
   const e = d.error ?? '';
@@ -46,7 +70,8 @@ function FailureHint({ d, s }: { d: Deployment; s: ServiceView }) {
   );
 }
 
-function DeploymentRow({ d, s, expanded, onToggle }: { d: Deployment; s: ServiceView; expanded: boolean; onToggle: () => void }) {
+function DeploymentRow({ d, s, expanded, onToggle, prev }: { d: Deployment; s: ServiceView; expanded: boolean; onToggle: () => void; prev?: Deployment }) {
+  const changes = diffConfigs(prev, d);
   const wrap = useRef<HTMLDivElement>(null);
   useAutoHeight(wrap, [expanded]);
   const isActive = s.activeDeploymentId === d.id;
@@ -110,6 +135,15 @@ function DeploymentRow({ d, s, expanded, onToggle }: { d: Deployment; s: Service
               </>
             )}
           </div>
+          {changes.length > 0 && (
+            <div className="deploy-diff">
+              {changes.slice(0, 4).map((c) => (
+                <span key={c} className="diff-chip mono">
+                  {c}
+                </span>
+              ))}
+            </div>
+          )}
           {d.error && !expanded && <div className="deploy-error truncate">{d.error}</div>}
         </div>
         <div className="row" style={{ gap: 2 }} onClick={(e) => e.stopPropagation()}>
@@ -172,8 +206,8 @@ export function DeploymentsTab({ service: s }: { service: ServiceView }) {
   return (
     <div className="tab-pad">
       <div className="deploy-list">
-        {deps.map((d) => (
-          <DeploymentRow key={d.id} d={d} s={s} expanded={open === d.id} onToggle={() => setOpen(open === d.id ? null : d.id)} />
+        {deps.map((d, i) => (
+          <DeploymentRow key={d.id} d={d} s={s} prev={deps[i + 1]} expanded={open === d.id} onToggle={() => setOpen(open === d.id ? null : d.id)} />
         ))}
       </div>
     </div>
