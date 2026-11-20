@@ -35,6 +35,7 @@ import { backupsTable } from './db.ts';
 import { s3Test } from './s3.ts';
 import { keySource, keyPath } from './crypto.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume } from './volumes.ts';
+import { switchover, rebuildMember } from './pgcluster.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 
 type Env = { Variables: { principal: Principal } };
@@ -303,6 +304,15 @@ api.get('/backups/:id/download', async (c) => {
   return new Response(Readable.toWeb(stream) as ReadableStream, {
     headers: { 'content-type': 'application/gzip', 'content-disposition': `attachment; filename="${b.key.split('/').pop()}"` },
   });
+});
+api.post('/services/:id/cluster/switchover', async (c) => {
+  const { to } = await jsonBody<{ to?: number }>(c);
+  return c.json(await switchover(actor(c), ops.getServiceOrThrow(c.req.param('id')).id, to));
+});
+api.post('/services/:id/cluster/rebuild', async (c) => {
+  const { index } = await jsonBody<{ index: number }>(c);
+  await rebuildMember(actor(c), ops.getServiceOrThrow(c.req.param('id')).id, Number(index));
+  return c.json({ ok: true }, 202);
 });
 api.post('/services/:id/run', async (c) => {
   const svc = ops.getServiceOrThrow(c.req.param('id'));

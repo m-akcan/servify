@@ -50,6 +50,16 @@ export interface VolumeRecord {
   updatedAt: number;
 }
 
+export interface ClusterConfig {
+  kind: 'postgres';
+  /** Replica index of the primary of record. */
+  primary: number;
+  /** Promote a standby when the primary has been unreachable this long. 0 = manual only. */
+  failoverAfterSec: number;
+  /** Wait for at least one standby to confirm each commit (no data loss on failover). */
+  synchronous: boolean;
+}
+
 export interface Healthcheck {
   /** HTTP path to probe; null = TCP connect only. */
   path: string | null;
@@ -103,6 +113,8 @@ export interface Service {
   backup?: BackupConfig | null;
   /** Extra hostnames on the project network (e.g. the original Docker Compose service name). */
   aliases?: string[];
+  /** Replicated database cluster managed by Servify (primary + standbys, failover). */
+  cluster?: ClusterConfig | null;
   x: number;
   y: number;
   status: ServiceStatus;
@@ -303,6 +315,11 @@ export interface Template {
   singleton: boolean;
   healthPath?: string | null;
   startCommand?: string | null;
+  /** Default replica count (clusters). */
+  replicas?: number;
+  /** Seconds a fresh replica may take to become healthy (a standby clone can take a while). */
+  graceSec?: number;
+  cluster?: Omit<import('./types.ts').ClusterConfig, 'primary'>;
 }
 
 export interface JobRun {

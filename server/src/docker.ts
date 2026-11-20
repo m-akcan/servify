@@ -329,6 +329,11 @@ export const docker = {
     return p;
   },
   removeNetwork: (name: string) => call('DELETE', `/networks/${name}`).catch(() => {}),
+  disconnectNetwork: (network: string, container: string) =>
+    call('POST', `/networks/${network}/disconnect`, { body: { Container: container, Force: true } }).catch((e) => {
+      if (e instanceof DockerError && (e.status === 404 || /is not connected/.test(e.message))) return;
+      throw e;
+    }),
   connectNetwork: (network: string, container: string, aliases: string[] = []) =>
     call('POST', `/networks/${network}/connect`, {
       body: { Container: container, EndpointConfig: { Aliases: aliases } },

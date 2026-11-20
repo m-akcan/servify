@@ -15,6 +15,7 @@ import { restoreBackup } from './backups.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 import { listCertificates } from './certs.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume } from './volumes.ts';
+import { switchover, clusterStatus } from './pgcluster.ts';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
 
@@ -492,6 +493,21 @@ export function buildMcpServer(principal: Principal): McpServer {
       guard();
       await deleteVolume(actor, volume);
       return { ok: true };
+    }),
+  );
+
+  server.registerTool(
+    'cluster_status',
+    { description: 'Database cluster status: which replica is the primary, each standby\'s replication lag and sync state, failover settings.', inputSchema: { service: svcRef } },
+    wrap(({ service }: { service: string }) => clusterStatus(ops.getServiceOrThrow(service)) ?? 'not a cluster'),
+  );
+
+  server.registerTool(
+    'switchover',
+    { description: 'Gracefully move a database cluster\'s primary to a standby (the old primary is rebuilt as a standby). Use before maintenance.', inputSchema: { service: svcRef, to: z.number().int().min(0).optional().describe('Replica index to promote; default: the most up-to-date standby') }, annotations: { destructiveHint: true } },
+    wrap(async ({ service, to }: { service: string; to?: number }) => {
+      guard();
+      return switchover(actor, ops.getServiceOrThrow(service).id, to);
     }),
   );
 

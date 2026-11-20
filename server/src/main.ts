@@ -126,6 +126,7 @@ async function main() {
   startLogCollector();
   startEnvironments();
   (await import('./volumes.ts')).startVolumes();
+  (await import('./pgcluster.ts')).startClusters();
   setInterval(() => sessionsTable.prune(), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {

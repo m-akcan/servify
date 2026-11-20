@@ -19,6 +19,7 @@ import { backupMethod, backupService, listBackups, isRestoring } from './backups
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
 import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
+import { clusterStatus } from './pgcluster.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
@@ -56,6 +57,7 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.nextRunAt = live && !s.stopped ? nextRun(live)?.getTime() ?? null : null;
   out.jobRunning = isJobRunning(s.id);
   out.backupMethod = backupMethod(s);
+  out.clusterStatus = clusterStatus(s);
   out.restoring = isRestoring(s.id);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
@@ -378,9 +380,10 @@ export async function createService(actor: Actor, projectId: string, raw: Create
     source,
     protocol,
     port: input.port ?? tpl?.port ?? null,
-    replicas: tpl?.singleton ? 1 : Math.max(0, input.replicas ?? 1),
+    replicas: tpl?.singleton ? 1 : Math.max(0, input.replicas ?? tpl?.replicas ?? 1),
     strategy: 'round-robin',
-    healthcheck: { path: tpl?.healthPath ?? null, intervalSec: 5, timeoutSec: 3, graceSec: source.type === 'image' ? 90 : 120 },
+    healthcheck: { path: tpl?.healthPath ?? null, intervalSec: 5, timeoutSec: 3, graceSec: tpl?.graceSec ?? (source.type === 'image' ? 90 : 120) },
+    cluster: tpl?.cluster ? { ...tpl.cluster, primary: 0 } : null,
     autoscale: { enabled: false, min: 1, max: 5, metric: 'rps', target: 50 },
     publicHttp: protocol === 'http',
     domains: [],
@@ -526,6 +529,8 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (patch.replicas > 1 && (hasSharedVolume(svc.volumes) || deployedShared || tpl?.singleton)) {
       throw new HttpError(400, `${svc.name} has a persistent volume; replicas would corrupt its data. Stateful services run as a single replica.`);
     }
+    if (svc.cluster && patch.replicas <= svc.cluster.primary) throw new HttpError(400, `the primary is replica #${svc.cluster.primary} — switch the primary to a lower replica before scaling below ${svc.cluster.primary + 1}`);
+    if (svc.cluster && patch.replicas < 1) throw new HttpError(400, 'a cluster needs at least one replica (stop it instead)');
     set('replicas', patch.replicas, 'replicas');
   }
   if (patch.strategy !== undefined) set('strategy', patch.strategy, 'load balancing');
@@ -904,7 +909,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -971,6 +976,8 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       aliases: (raw.aliases ?? []).filter((a) => /^[a-z0-9]([a-z0-9_.-]*[a-z0-9])?$/.test(a)),
       cmd: raw.cmd ?? null,
       entrypoint: raw.entrypoint ?? null,
+      // A copy starts a fresh cluster: replica 0 initialises as the primary.
+      cluster: raw.cluster ? { ...raw.cluster, primary: 0 } : svc.cluster ?? null,
     } satisfies Partial<Service>);
     if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
     // Keep the template's fresh volume where the spec mounts the same path; drop the ones it doesn't use.

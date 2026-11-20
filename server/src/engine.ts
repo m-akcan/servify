@@ -91,10 +91,29 @@ export function replicasOf(serviceId: string): Replica[] {
 }
 
 /** Upstreams eligible for traffic: healthy replicas of the active deployment. */
+/**
+ * Network names of a replica. Clusters: only the primary answers to the service name (writes); standbys
+ * answer to `<name>-read`. Everyone keeps `<name>-<index>`.
+ */
+export function replicaAliases(svc: Service, index: number): string[] {
+  if (svc.cluster) {
+    const role = index === svc.cluster.primary ? [svc.slug] : [`${svc.slug}-read`];
+    return [...new Set([...role, `${svc.slug}-${index}`])];
+  }
+  return [...new Set([svc.slug, `${svc.slug}-${index}`, ...(svc.aliases ?? [])])];
+}
+
+/** Replica indexes the reconciler must leave alone (fenced cluster members being rebuilt). */
+export const holds = new Map<string, Set<number>>();
+export function isHeld(serviceId: string, index: number) {
+  return holds.get(serviceId)?.has(index) ?? false;
+}
+
 export function upstreamsFor(svc: Service): Runtime[] {
   const out: Runtime[] = [];
   for (const r of runtime.values()) {
     if (r.serviceId !== svc.id) continue;
+    if (svc.cluster && r.index !== svc.cluster.primary) continue; // writes go to the primary only
     if (r.deploymentId !== svc.activeDeploymentId) continue;
     if (r.state !== 'healthy' || draining.has(r.containerId)) continue;
     if (!r.host || !r.port) continue;
@@ -233,6 +252,11 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   if (port && !env.PORT) env.PORT = String(port);
   env.SERVIFY_REPLICA_INDEX = String(index);
   env.SERVIFY_DEPLOYMENT_ID = dep.id;
+  if (svc.cluster) {
+    // Role at creation; Servify re-points running standbys itself after a failover.
+    env.SERVIFY_PG_ROLE = index === svc.cluster.primary ? 'primary' : 'standby';
+    env.SERVIFY_PG_PRIMARY = `${svc.slug}-${svc.cluster.primary}`;
+  }
 
   // Only volumes currently attached to this service are mounted (volumes can move between services).
   const mounts = mountsFor(svc.id, dep.config.volumes, index);
@@ -265,7 +289,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
       Init: true,
     },
     NetworkingConfig: {
-      EndpointsConfig: { [network]: { Aliases: [...new Set([svc.slug, `${svc.slug}-${index}`, ...(svc.aliases ?? [])])] } },
+      EndpointsConfig: { [network]: { Aliases: replicaAliases(svc, index) } },
     },
   };
   if (dep.config.startCommand) {
@@ -285,7 +309,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
 }
 
 /** Inspect a container and register/refresh its runtime entry. */
-async function adopt(cid: string): Promise<Runtime | null> {
+export async function adopt(cid: string): Promise<Runtime | null> {
   let info: any;
   try {
     info = await docker.inspectContainer(cid);
@@ -639,6 +663,7 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
 
   for (let i = 0; i < want; i++) {
     if (busy.has(svc.id)) return; // a deploy just started: it owns the containers now
+    if (isHeld(svc.id, i)) continue; // fenced: never restart or recreate it until it's released
     const c = ofActive.get(i);
     if (!c) {
       if (backingOff) continue;

@@ -15,12 +15,12 @@ import { dirname, join } from 'node:path';
 import { Transform, type Readable, type Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip, createGzip } from 'node:zlib';
-import { backupsTable, deployments as deploymentsTable, projects as projectsTable, services as servicesTable } from './db.ts';
+import { backupsTable, deployments as deploymentsTable, projects as projectsTable, services as servicesTable, volumesTable } from './db.ts';
 import { docker, dockerHostEnv, normalizeImageRef } from './docker.ts';
 import { busy, drainAndRemove, replicasOf, requestReconcile, volumeName, refreshServiceStatus } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
-import { dockerVolumeFor } from './volumes.ts';
+import { dockerVolumeFor, membersOf } from './volumes.ts';
 import { destinationById, type Destination } from './settings.ts';
 import { s3Delete, s3Get, s3Put } from './s3.ts';
 import { config } from './config.ts';
@@ -106,6 +106,8 @@ async function ensureHelper() {
 }
 
 function runningReplica(svc: Service) {
+  // Clusters: always the primary (consistent dumps; restores replay into it).
+  if (svc.cluster) return replicasOf(svc.id).find((r) => r.dockerState === 'running' && r.index === svc.cluster!.primary);
   return replicasOf(svc.id).find((r) => r.dockerState === 'running' && r.deploymentId === svc.activeDeploymentId) ?? replicasOf(svc.id).find((r) => r.dockerState === 'running');
 }
 
@@ -316,7 +318,7 @@ async function waitReady(svc: Service, method: BackupMethod, timeoutMs = 240_000
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const fresh = servicesTable.get(svc.id)!;
-    const rep = replicasOf(svc.id).find((r) => r.deploymentId === fresh.activeDeploymentId && r.state === 'healthy');
+    const rep = replicasOf(svc.id).find((r) => r.deploymentId === fresh.activeDeploymentId && r.state === 'healthy' && (!fresh.cluster || r.index === fresh.cluster.primary));
     if (rep) {
       if (method === 'volume') return rep;
       const r = await docker.exec(rep.containerId, ['/bin/sh', '-c', READY[method as Exclude<BackupMethod, 'volume'>]], 15_000).catch(() => ({ exitCode: 1 }));
@@ -375,7 +377,12 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
     bus.publish({ type: 'service.updated', service: fresh });
     await drainAndRemove(replicasOf(svc.id).map((r) => r.containerId), 2000);
     const vols = volumesOf(svc);
+    // Per-replica sets (clusters): every member is wiped — the primary re-initialises, standbys re-clone from it.
     const mounts = vols.flatMap((v) => {
+      if (v.perReplica && v.volumeId) {
+        const leader = volumesTable.get(v.volumeId);
+        return leader ? membersOf(leader).flatMap((m) => ['-v', `${m.dockerName}:/backup/${v.name}-${m.replicaIndex ?? 0}`]) : [];
+      }
       const src = dockerVolumeFor(svc.id, v);
       return src ? ['-v', `${src}:/backup/${v.name}`] : [];
     });
