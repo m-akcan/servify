@@ -6,6 +6,8 @@ import { ServiceGlyph, Icon } from '../components/Icon.tsx';
 import { serviceTone, serviceLabel, num, isBusy } from '../lib/format.ts';
 import { useTraffic, traffic, useDeployTail } from '../lib/store.ts';
 import { duration, describeCron } from '../lib/format.ts';
+import { VolumeTabs } from './VolumeNodes.tsx';
+import type { VolumeRecord } from '../lib/types.ts';
 
 type Props = {
   service: ServiceView;
@@ -20,6 +22,7 @@ type Props = {
   onStartConnect: (id: string, e: React.PointerEvent) => void;
   onFocusNode: (id: string) => void;
   connectTarget: boolean;
+  volumes?: VolumeRecord[];
   inMulti: boolean;
   getMulti: () => Set<string>;
   onToggleMulti: (id: string) => void;
@@ -101,7 +104,7 @@ function DeployTicker({ service, latest }: { service: ServiceView; latest: Deplo
   );
 }
 
-export const ServiceNode = memo(function ServiceNode({ service: s, replicas, latest, selected, getCamera, onSelect, onOpenMenu, onMoved, onDragState, onStartConnect, onFocusNode, connectTarget, inMulti, getMulti, onToggleMulti, index }: Props) {
+export const ServiceNode = memo(function ServiceNode({ service: s, replicas, latest, selected, getCamera, onSelect, onOpenMenu, onMoved, onDragState, onStartConnect, onFocusNode, connectTarget, inMulti, getMulti, onToggleMulti, index, volumes }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const deckRef = useRef<HTMLDivElement>(null);
   const group = useRef<SpringGroup<'x' | 'y' | 'lift' | 'appear'> | null>(null);
@@ -352,13 +355,8 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
             <span className="truncate">{host}</span>
           </div>
         )}
-        {s.volumes.length > 0 && (
-          <div className="node-volume">
-            <Icon name="database" size={12} />
-            <span className="truncate">{s.volumes.map((v) => v.mountPath).join(', ')}</span>
-          </div>
-        )}
       </div>
+      <VolumeTabs volumes={volumes ?? []} />
     </div>
   );
 });

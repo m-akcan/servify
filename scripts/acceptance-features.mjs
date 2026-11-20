@@ -214,6 +214,40 @@ async function main() {
   check('metrics answer for a 1-hour window', Array.isArray(m.points));
 
   // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ volumes (attach / detach)');
+  const writer = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'writer', protocol: 'none', startCommand: 'sleep infinity' })).service;
+  const reader = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'reader', protocol: 'none', startCommand: 'sleep infinity' })).service;
+  await running(P.id, 'reader');
+  const made = await api('POST', `/projects/${P.id}/volumes`, { name: 'shared-files', serviceId: writer.id, mountPath: '/data' });
+  const volId = made.volume.id;
+  await running(P.id, 'writer');
+  const attachDep = made.deployment?.id;
+  await waitFor(async () => {
+    const s = await svcOf(P.id, 'writer');
+    return s.status === 'running' && (!attachDep || s.activeDeploymentId === attachDep);
+  }, 120_000, 'writer redeployed with the volume');
+  const writerOk = (await exec(writer.id, 'echo moved-with-the-volume > /data/hello && cat /data/hello')).exitCode === 0;
+  check('a new volume attaches and is writable', !!writerOk);
+  let refused = false;
+  try {
+    await api('DELETE', `/volumes/${volId}`);
+  } catch {
+    refused = true;
+  }
+  check('an attached volume cannot be deleted', refused);
+  await api('POST', `/volumes/${volId}/detach`);
+  check('detached volume is listed without a service', (await api('GET', `/projects/${P.id}/volumes`)).find((v) => v.id === volId)?.serviceId === null);
+  await api('POST', `/volumes/${volId}/attach`, { serviceId: reader.id, mountPath: '/mnt/files' });
+  const moved = await waitFor(async () => {
+    const r = await exec(reader.id, 'cat /mnt/files/hello');
+    return r.exitCode === 0 && r.output.trim() === 'moved-with-the-volume';
+  }, 120_000, 'data on the other service');
+  check('the data follows the volume to another service', !!moved);
+  check('the old service no longer mounts it', (await exec(writer.id, 'test -e /data/hello && echo still || echo gone')).output.trim() === 'gone');
+  await api('DELETE', `/services/${reader.id}?keepVolumes=1`);
+  check('deleting a service can keep its volume', (await api('GET', `/projects/${P.id}/volumes`)).find((v) => v.id === volId)?.serviceId === null);
+
+  // ─────────────────────────────────────────────────────────────
   console.log('\n▸ docker compose import');
   const yaml = `name: compose-${Date.now().toString(36)}
 services:

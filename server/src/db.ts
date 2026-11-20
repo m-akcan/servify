@@ -24,6 +24,8 @@ CREATE INDEX IF NOT EXISTS backups_service ON backups(service_id, created_at);
 CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, service_id TEXT NOT NULL, deployment_id TEXT NOT NULL, cid TEXT NOT NULL, replica INTEGER NOT NULL, ts INTEGER NOT NULL, stream TEXT NOT NULL, text TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS logs_service_ts ON logs(service_id, ts);
 CREATE INDEX IF NOT EXISTS logs_cid_ts ON logs(cid, ts);
+CREATE TABLE IF NOT EXISTS volumes (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS volumes_project ON volumes(project_id);
 CREATE TABLE IF NOT EXISTS metrics (service_id TEXT NOT NULL, t INTEGER NOT NULL, rps REAL, p50 REAL, p95 REAL, errors REAL, cpu REAL, mem REAL, replicas INTEGER, PRIMARY KEY (service_id, t));
 `);
 
@@ -111,7 +113,7 @@ const deploymentCodec: Codec<any> = {
   },
 };
 
-import type { Project, Service, Deployment, ActivityEntry, JobRun, CertRecord, BackupRecord } from './types.ts';
+import type { Project, Service, Deployment, ActivityEntry, JobRun, CertRecord, BackupRecord, VolumeRecord } from './types.ts';
 
 export type TokenRecord = {
   id: string;
@@ -133,6 +135,7 @@ export const activityTable = table<ActivityEntry & { createdAt: number }>('activ
 export const runsTable = table<JobRun>('runs', { service_id: (r) => r.serviceId });
 export const certsTable = table<CertRecord>('certs');
 export const backupsTable = table<BackupRecord>('backups', { service_id: (b) => b.serviceId });
+export const volumesTable = table<VolumeRecord>('volumes', { project_id: (v) => v.projectId });
 
 /**
  * Boot migration: seal rows written before encryption existed, then compact the file so the old

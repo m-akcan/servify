@@ -1,6 +1,7 @@
 import { api } from './api.ts';
 import { toast, toastError, confirmDialog, type MenuItem } from '../components/ui.tsx';
 import type { Deployment, ServiceView } from './types.ts';
+import { openVolumeDialog } from './volumes.tsx';
 import { navigate, projectPath } from './router.ts';
 import { store } from './store.ts';
 
@@ -49,18 +50,25 @@ export async function scale(s: ServiceView, replicas: number) {
 }
 
 export async function remove(s: ServiceView) {
-  const ok = await confirmDialog({
-    title: `Delete ${s.name}?`,
-    body: s.volumes.length ? 'This removes all replicas, built images and the persistent volume data. This cannot be undone.' : 'This removes all replicas and built images. This cannot be undone.',
-    confirm: 'Delete service',
-    danger: true,
-    typeToConfirm: s.volumes.length ? s.name : undefined,
-  });
-  if (!ok) return;
+  const keepVolumes = s.volumes.length > 0;
+  if (s.volumes.length) {
+    // Volumes outlive services: keep them as detached volumes unless asked otherwise.
+    const keep = await confirmDialog({
+      title: `Delete ${s.name}?`,
+      body: `Its ${s.volumes.length === 1 ? 'volume' : `${s.volumes.length} volumes`} (${s.volumes.map((v) => v.name).join(', ')}) will stay on the canvas as detached volumes with the data intact. Replicas and built images are removed.`,
+      confirm: 'Delete, keep the data',
+      danger: true,
+      typeToConfirm: s.name,
+    });
+    if (!keep) return;
+  } else {
+    const ok = await confirmDialog({ title: `Delete ${s.name}?`, body: 'This removes all replicas and built images. This cannot be undone.', confirm: 'Delete service', danger: true });
+    if (!ok) return;
+  }
   try {
     const cur = store.get().current;
     if (cur) navigate(projectPath(cur.project.slug), { replace: true });
-    await api.del(`/services/${s.id}`);
+    await api.del(`/services/${s.id}${keepVolumes ? '?keepVolumes=1' : ''}`);
     toast({ title: `${s.name} deleted`, tone: 'idle' });
   } catch (e) {
     toastError(e);
@@ -123,6 +131,7 @@ export function serviceMenu(s: ServiceView, opts: { open: (tab?: string) => void
   }
   if (deployed) items.push(s.stopped ? { label: 'Start', icon: 'play', onSelect: () => void start(s) } : { label: 'Stop', icon: 'stop', onSelect: () => void stop(s) });
   items.push({ label: 'Duplicate', icon: 'copy', onSelect: () => void duplicate(s) });
+  items.push({ label: 'Attach volume…', icon: 'database', onSelect: () => openVolumeDialog({ kind: 'attach', serviceId: s.id }) });
   items.push({ type: 'sep' });
   items.push({ label: 'Delete service', icon: 'trash', danger: true, kbd: '⌫', onSelect: () => void remove(s) });
   return items;

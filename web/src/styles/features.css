@@ -500,3 +500,159 @@
   background: var(--bg-3);
   color: var(--text-3);
 }
+
+/* ───────────── volumes ───────────── */
+.vol-tabs {
+  position: absolute;
+  top: calc(100% - 1px);
+  left: 14px;
+  right: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.vol-tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px;
+  margin: 0 6px;
+  border: 1px solid var(--line-2);
+  border-top: 0;
+  border-radius: 0 0 var(--r-md) var(--r-md);
+  background: linear-gradient(180deg, var(--bg-3), var(--bg-2));
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  cursor: pointer;
+  box-shadow: 0 6px 14px -8px rgba(0, 0, 0, 0.45);
+  transition: color var(--t-fast), border-color var(--t-fast), transform var(--t-base) var(--ease-spring);
+}
+.vol-tab + .vol-tab {
+  margin-top: -1px;
+  border-radius: 0 0 var(--r-md) var(--r-md);
+}
+.vol-tab:hover {
+  color: var(--text);
+  border-color: var(--line-3);
+  transform: translateY(1px);
+}
+.vol-tab svg {
+  color: var(--build);
+  flex: none;
+}
+.vol-tab-name {
+  flex: 1;
+  text-align: left;
+}
+.vol-tab-size {
+  color: var(--text-3);
+}
+.node[data-lod='far'] .vol-tab-name,
+.canvas[data-lod='far'] .vol-tab-name {
+  display: none;
+}
+.vol-node {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 180px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 8px 9px 10px;
+  border-radius: var(--r-lg);
+  border: 1px dashed var(--line-3);
+  background: color-mix(in srgb, var(--bg-2) 92%, transparent);
+  box-shadow: var(--highlight), 0 8px 22px -10px rgba(0, 0, 0, 0.5);
+  cursor: grab;
+  user-select: none;
+  transition: box-shadow var(--t-base), border-color var(--t-base);
+  animation: vol-in 0.5s var(--ease-spring);
+}
+.vol-node:hover {
+  border-color: var(--build);
+}
+.vol-node.dragging {
+  cursor: grabbing;
+  border-style: solid;
+  border-color: var(--build);
+  box-shadow: var(--highlight), 0 0 0 3px var(--build-soft), 0 20px 40px -12px rgba(0, 0, 0, 0.6);
+  z-index: 10;
+}
+@keyframes vol-in {
+  from {
+    opacity: 0;
+    scale: 0.92;
+  }
+}
+.vol-node-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 9px;
+  background: var(--build-soft);
+  color: var(--build);
+}
+.vol-node-name {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.vol-node-meta {
+  margin-top: 1px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+.vol-node-more {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+}
+.vol-node-more:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.node.connect-target .node-card {
+  border-color: var(--build);
+  box-shadow: var(--highlight), 0 0 0 4px var(--build-soft), 0 12px 40px -8px rgba(0, 0, 0, 0.55);
+}
+.vol-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 210px;
+  overflow: auto;
+}
+.vol-choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 0 11px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-2);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  text-align: left;
+  transition: border-color var(--t-fast), background var(--t-fast), color var(--t-fast);
+}
+.vol-choice:hover {
+  border-color: var(--line-3);
+  color: var(--text);
+}
+.vol-choice.on {
+  border-color: var(--signal-line);
+  background: var(--signal-soft);
+  color: var(--text);
+}
+.vol-choice .faint {
+  font-size: 11px;
+}

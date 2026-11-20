@@ -9,7 +9,7 @@ import { bus, recordActivity, type Actor } from './events.ts';
 import { id, slugify, secret, HttpError, assert } from './util.ts';
 import { getTemplate, templates } from './templates.ts';
 import { queueDeployment, readDeploymentLog, isDeploying } from './deployer.ts';
-import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, volumeName, deployedSchedule } from './engine.ts';
+import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, deployedSchedule } from './engine.ts';
 import { docker, demuxLines } from './docker.ts';
 import { referencedServices, publicUrl, resolveEnv, hostUrl } from './vars.ts';
 import { certsTable } from './db.ts';
@@ -17,6 +17,7 @@ import { isLocalHost } from './certs.ts';
 import { getSettings, destinationById } from './settings.ts';
 import { backupMethod, backupService, listBackups, isRestoring } from './backups.ts';
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
+import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
@@ -124,6 +125,7 @@ export function projectSnapshot(projectId: string, view: View = { revealSecrets:
     deployments: deps.map((d) => serializeDeployment(d, view)),
     replicas,
     edges,
+    volumes: listVolumes(project.id),
     proxyPort: config.proxyPort,
   };
 }
@@ -164,6 +166,7 @@ export async function deleteProject(actor: Actor, projectId: string) {
   // A base project takes its environments (and previews) with it.
   if (!p.parentId) for (const env of projectsTable.all().filter((x) => x.parentId === p.id)) await deleteProject(actor, env.id);
   for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true });
+  await deleteProjectVolumes(p.id);
   projectsTable.delete(p.id);
   bus.publish({ type: 'project.deleted', projectId: p.id });
   recordActivity(actor, 'project.deleted', p.parentId ? `Deleted environment ${p.envName ?? p.slug} of ${p.name}` : `Deleted project ${p.name}`);
@@ -399,6 +402,7 @@ export async function createService(actor: Actor, projectId: string, raw: Create
   };
   if (protocol === 'tcp') svc.publicTcpPort = await allocateTcpPort();
   servicesTable.insert(svc);
+  syncServiceVolumes(svc);
   bus.publish({ type: 'service.updated', service: svc });
   recordActivity(actor, 'service.created', `Created ${svc.name} from ${describeSource(source)}`, project.id, svc.id);
   let deployment: Deployment | null = null;
@@ -446,7 +450,10 @@ export const updateServiceInput = z.object({
   publicHttp: z.boolean().optional(),
   domains: z.array(z.string()).optional(),
   publicTcpPort: z.number().int().min(0).max(65535).nullable().optional().describe('Host port for the TCP proxy; 0 = pick a free one; null = off'),
-  volumes: z.array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/') })).optional(),
+  volumes: z
+    .array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/'), volumeId: z.string().optional() }))
+    .optional()
+    .describe('Mounts. New entries (no volumeId) create a fresh volume. To remove one, use detach_volume.'),
   startCommand: z.string().nullable().optional(),
   cmd: z.array(z.string()).nullable().optional().describe('Override only the image CMD (argv array). Ignored when startCommand is set.'),
   entrypoint: z.array(z.string()).nullable().optional().describe('Override only the image ENTRYPOINT (argv array).'),
@@ -505,7 +512,14 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (patch.protocol === 'tcp' && !svc.publicTcpPort && patch.publicTcpPort === undefined) svc.publicTcpPort = await allocateTcpPort();
     if (patch.protocol === 'http' && patch.publicHttp === undefined) svc.publicHttp = true;
   }
-  if (patch.volumes !== undefined) set('volumes', patch.volumes, 'volumes');
+  if (patch.volumes !== undefined) {
+    // Removing a mount here would leave its data mounted until the next deploy; detaching is explicit.
+    const keep = new Set(patch.volumes.map((v) => v.volumeId).filter(Boolean));
+    const dropped = svc.volumes.filter((v) => v.volumeId && !keep.has(v.volumeId));
+    if (dropped.length) throw new HttpError(400, `detach ${dropped.map((d) => d.name).join(', ')} instead (detach_volume / the volume's menu) — its data is kept`);
+    for (const v of patch.volumes) if (!v.volumeId && svc.volumes.some((x) => x.mountPath === v.mountPath)) throw new HttpError(409, `${v.mountPath} is already in use`);
+    set('volumes', patch.volumes.map((v) => ({ ...v, name: v.volumeId ? svc.volumes.find((x) => x.volumeId === v.volumeId)?.name ?? v.name : v.name })), 'volumes');
+  }
   if (patch.replicas !== undefined) {
     const tpl = svc.templateId ? getTemplate(svc.templateId) : null;
     const deployedVolumes = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.config.volumes.length ?? 0 : 0;
@@ -572,6 +586,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (!changes.length && !moved) return serializeService(svc);
   svc.updatedAt = Date.now();
   servicesTable.put(svc);
+  if (changes.includes('volumes')) syncServiceVolumes(svc);
   bus.publish({ type: 'service.updated', service: svc });
   if (changes.length && !opts.quiet) {
     recordActivity(actor, 'service.updated', `Updated ${svc.name}: ${changes.join(', ')}`, svc.projectId, svc.id);
@@ -662,7 +677,7 @@ export async function deleteService(actor: Actor, serviceId: string, opts: { qui
   // Remove any stragglers by label, then volumes and built images.
   const left = await docker.listContainers([`servify.service=${svc.id}`]); // service ids are globally unique
   await Promise.all(left.map((c) => docker.removeContainer(c.Id, true)));
-  if (!opts.keepVolumes) for (const v of svc.volumes) await docker.removeVolume(volumeName(svc.id, v.name));
+  await releaseServiceVolumes(svc, !!opts.keepVolumes);
   for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) {
     if (d.image?.startsWith('servify/')) await docker.removeImage(d.image);
     deploymentsTable.delete(d.id);
@@ -867,7 +882,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: src.volumes, healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: src.volumes.map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -902,6 +917,7 @@ export function exportProject(projectId: string, opts: { secrets?: boolean } = {
     services: svcs.map((s) => {
       const out: any = {};
       for (const k of SPEC_KEYS) out[k] = structuredClone((s as any)[k]);
+      out.volumes = (out.volumes ?? []).map(({ volumeId, ...v }: any) => v);
       if (!opts.secrets) {
         for (const k of s.secretKeys) if (k in out.env && !/\$\{\{/.test(out.env[k])) out.env[k] = '';
         if (out.source?.type === 'git') delete out.source.token;
@@ -943,7 +959,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       autoscale: { ...svc.autoscale, ...(raw.autoscale ?? {}) },
       publicHttp: def(raw.publicHttp, svc.publicHttp),
       domains: [],
-      volumes: def(raw.volumes, svc.volumes),
+      volumes: def(raw.volumes, svc.volumes).map(({ volumeId, ...v }: any) => v),
       env,
       secretKeys: [...new Set([...svc.secretKeys, ...(raw.secretKeys ?? [])])],
       startCommand: raw.startCommand === undefined ? svc.startCommand : raw.startCommand,
@@ -957,7 +973,15 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       entrypoint: raw.entrypoint ?? null,
     } satisfies Partial<Service>);
     if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
+    // Keep the template's fresh volume where the spec mounts the same path; drop the ones it doesn't use.
+    const prevMounts = servicesTable.get(svc.id)!.volumes;
+    svc.volumes = svc.volumes.map((v) => {
+      const p = prevMounts.find((x) => x.mountPath === v.mountPath);
+      return p ? { ...v, name: p.name, volumeId: p.volumeId } : v;
+    });
+    await releaseServiceVolumes({ ...svc, volumes: prevMounts.filter((m) => !svc.volumes.some((x) => x.volumeId === m.volumeId)) }, false);
     servicesTable.put(svc);
+    syncServiceVolumes(svc);
     bus.publish({ type: 'service.updated', service: svc });
     created.push(svc);
   }

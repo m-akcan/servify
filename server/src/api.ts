@@ -34,6 +34,7 @@ import { restoreBackup, deleteBackup, openBackupStream } from './backups.ts';
 import { backupsTable } from './db.ts';
 import { s3Test } from './s3.ts';
 import { keySource, keyPath } from './crypto.ts';
+import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume } from './volumes.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 
 type Env = { Variables: { principal: Principal } };
@@ -191,6 +192,18 @@ api.post('/projects/import-compose', async (c) => {
   if (!body.yaml?.trim()) throw new HttpError(400, 'paste the contents of your docker-compose.yml');
   if (body.dryRun) return c.json(ops.planComposeImport(body));
   return c.json(await ops.importCompose(actor(c), body), 201);
+});
+api.get('/projects/:id/volumes', (c) => c.json(listVolumes(ops.getProjectOrThrow(c.req.param('id')).id)));
+api.post('/projects/:id/volumes', async (c) => c.json(await createVolume(actor(c), ops.getProjectOrThrow(c.req.param('id')).id, await jsonBody(c)), 201));
+api.patch('/volumes/:id', async (c) => c.json(updateVolume(actor(c), c.req.param('id'), await jsonBody(c))));
+api.post('/volumes/:id/attach', async (c) => {
+  const { serviceId, mountPath } = await jsonBody<{ serviceId: string; mountPath: string }>(c);
+  return c.json(await attachVolume(actor(c), c.req.param('id'), serviceId, mountPath));
+});
+api.post('/volumes/:id/detach', async (c) => c.json(await detachVolume(actor(c), c.req.param('id'))));
+api.delete('/volumes/:id', async (c) => {
+  await deleteVolume(actor(c), c.req.param('id'));
+  return c.json({ ok: true });
 });
 api.get('/projects/:id/environments', (c) => c.json(environmentsOf(c.req.param('id'))));
 api.post('/projects/:id/environments', async (c) => {

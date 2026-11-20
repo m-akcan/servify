@@ -14,6 +14,7 @@ import { config } from './config.ts';
 import { sleep, id as newId } from './util.ts';
 import { kv } from './db.ts';
 import { notify } from './notify.ts';
+import { mountsFor } from './volumes.ts';
 
 /** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
 export const INSTANCE_ID = (() => {
@@ -233,8 +234,10 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   env.SERVIFY_REPLICA_INDEX = String(index);
   env.SERVIFY_DEPLOYMENT_ID = dep.id;
 
-  for (const v of dep.config.volumes) {
-    await docker.createVolume(volumeName(svc.id, v.name), { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.service]: svc.id });
+  // Only volumes currently attached to this service are mounted (volumes can move between services).
+  const mounts = mountsFor(svc.id, dep.config.volumes);
+  for (const m of mounts) {
+    await docker.createVolume(m.Source, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
   }
 
   const exposed = port && dep.config.protocol !== 'none' ? { [`${port}/tcp`]: {} } : undefined;
@@ -255,7 +258,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
       RestartPolicy: { Name: 'unless-stopped' },
       PortBindings:
         exposed && !config.inContainer ? { [`${port}/tcp`]: [{ HostIp: '127.0.0.1', HostPort: '' }] } : undefined,
-      Mounts: dep.config.volumes.map((v) => ({ Type: 'volume', Source: volumeName(svc.id, v.name), Target: v.mountPath })),
+      Mounts: mounts,
       NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
       Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
       LogConfig: { Type: 'json-file', Config: { 'max-size': '10m', 'max-file': '3' } },

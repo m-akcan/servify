@@ -14,6 +14,7 @@ import { replicasOf } from './engine.ts';
 import { restoreBackup } from './backups.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 import { listCertificates } from './certs.ts';
+import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume } from './volumes.ts';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
 
@@ -439,6 +440,58 @@ export function buildMcpServer(principal: Principal): McpServer {
     wrap(({ project, enabled }: { project: string; enabled: boolean }) => {
       guard();
       return { previews: setPreviews(actor, project, enabled).previews };
+    }),
+  );
+
+  server.registerTool(
+    'list_volumes',
+    { description: 'Volumes of a project: name, size, which service they are attached to (or detached) and where they are mounted.', inputSchema: { project: projRef } },
+    wrap(({ project }: { project: string }) =>
+      listVolumes(ops.getProjectOrThrow(project).id).map((v) => ({
+        id: v.id,
+        name: v.name,
+        attachedTo: v.serviceId ? servicesTable.get(v.serviceId)?.name ?? v.serviceId : null,
+        mountPath: v.mountPath,
+        sizeBytes: v.sizeBytes,
+      })),
+    ),
+  );
+
+  server.registerTool(
+    'create_volume',
+    { description: 'Create a persistent volume in a project, optionally attaching it to a service right away (the service redeploys).', inputSchema: { project: projRef, name: z.string(), service: svcRef.optional(), mount_path: z.string().optional().describe('e.g. /data') } },
+    wrap(async ({ project, name, service, mount_path }: { project: string; name: string; service?: string; mount_path?: string }) => {
+      guard();
+      const p = ops.getProjectOrThrow(project);
+      return createVolume(actor, p.id, { name, serviceId: service ? ops.getServiceOrThrow(service).id : undefined, mountPath: mount_path });
+    }),
+  );
+
+  server.registerTool(
+    'attach_volume',
+    { description: 'Attach a detached volume to a service at a mount path. The service redeploys with the data; services with a volume run 1 replica.', inputSchema: { volume: z.string().describe('Volume id or "project/volume"'), service: svcRef, mount_path: z.string() } },
+    wrap(async ({ volume, service, mount_path }: { volume: string; service: string; mount_path: string }) => {
+      guard();
+      return attachVolume(actor, volume, ops.getServiceOrThrow(service).id, mount_path);
+    }),
+  );
+
+  server.registerTool(
+    'detach_volume',
+    { description: 'Detach a volume from its service. The data is kept; the service redeploys without it (a database would start empty).', inputSchema: { volume: z.string() }, annotations: { destructiveHint: true } },
+    wrap(async ({ volume }: { volume: string }) => {
+      guard();
+      return detachVolume(actor, volume);
+    }),
+  );
+
+  server.registerTool(
+    'delete_volume',
+    { description: 'Permanently delete a detached volume and all its data.', inputSchema: { volume: z.string() }, annotations: { destructiveHint: true } },
+    wrap(async ({ volume }: { volume: string }) => {
+      guard();
+      await deleteVolume(actor, volume);
+      return { ok: true };
     }),
   );
 

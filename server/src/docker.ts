@@ -243,6 +243,14 @@ export const docker = {
     });
   },
   inspectContainer: (id: string) => call<any>('GET', `/containers/${id}/json`),
+  /** Containers (running or not) that mount a given volume. */
+  containersUsingVolume: (volume: string, all = false): Promise<ContainerSummary[]> =>
+    call('GET', '/containers/json', { query: { all, filters: filtersParam({ volume: [volume] }) } }),
+  /** Disk usage per volume (can be slow on big volumes — poll sparingly). */
+  volumeUsage: async (): Promise<Map<string, number>> => {
+    const r = await call<any>('GET', '/system/df', { query: { type: 'volume' }, timeout: 120_000 });
+    return new Map(((r?.Volumes ?? []) as any[]).map((v) => [v.Name as string, Number(v.UsageData?.Size ?? -1)]));
+  },
   async createContainer(name: string, spec: unknown): Promise<string> {
     const r = await call<{ Id: string }>('POST', '/containers/create', { query: { name }, body: spec });
     return r.Id;

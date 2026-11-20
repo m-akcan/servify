@@ -128,7 +128,8 @@ export function queueDeployment(
     trigger,
     actor: actor.name,
     config: base
-      ? structuredClone(base.config)
+      ? // Rollbacks/restarts reuse the old image and settings, but always mount today's volumes.
+        { ...structuredClone(base.config), volumes: structuredClone(svc.volumes) }
       : {
           env: { ...svc.env },
           port: svc.port,

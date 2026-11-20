@@ -1,6 +1,6 @@
 import { useSyncExternalStore, useRef, useEffect, useState } from 'react';
 import { api, sse } from './api.ts';
-import type { ActivityEntry, Deployment, ProjectListItem, Replica, ServerEvent, ServiceView, SystemInfo, Template, Project } from './types.ts';
+import type { ActivityEntry, Deployment, ProjectListItem, Replica, ServerEvent, ServiceView, SystemInfo, Template, Project, VolumeRecord } from './types.ts';
 
 // ───────────────────────────── tiny store primitive ─────────────────────────────
 
@@ -28,6 +28,7 @@ export type ProjectState = {
   deployments: Record<string, Deployment>;
   replicas: Record<string, Replica[]>;
   edges: { from: string; to: string }[];
+  volumes: Record<string, VolumeRecord>;
   proxyPort: number;
 };
 
@@ -163,6 +164,7 @@ export async function loadProject(idOrSlug: string) {
         deployments,
         replicas: snap.replicas,
         edges: snap.edges,
+        volumes: Object.fromEntries((snap.volumes ?? []).map((v: VolumeRecord) => [v.id, v])),
         proxyPort: snap.proxyPort,
       },
       loadingProject: false,
@@ -292,6 +294,18 @@ function applyEvent(ev: ServerEvent) {
       const services = { ...cur.services };
       delete services[ev.serviceId];
       store.set({ current: { ...cur, services, order: cur.order.filter((x) => x !== ev.serviceId), edges: computeEdges(services) } });
+      return;
+    }
+    case 'volume.updated': {
+      if (!cur || cur.project.id !== ev.volume.projectId) return;
+      store.set({ current: { ...cur, volumes: { ...cur.volumes, [ev.volume.id]: ev.volume } } });
+      return;
+    }
+    case 'volume.deleted': {
+      if (!cur || cur.project.id !== ev.projectId) return;
+      const volumes = { ...cur.volumes };
+      delete volumes[ev.volumeId];
+      store.set({ current: { ...cur, volumes } });
       return;
     }
     case 'deployment.updated': {

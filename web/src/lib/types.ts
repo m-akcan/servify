@@ -12,13 +12,14 @@ export type {
   BackupRecord,
   PublicCert,
   PreviewInfo,
+  VolumeRecord,
   DeploymentStatus,
   ApiToken,
   LbStrategy,
   Protocol,
 } from '../../../server/src/types.ts';
 
-import type { Service, Project, Deployment, Replica } from '../../../server/src/types.ts';
+import type { Service, Project, Deployment, Replica, VolumeRecord } from '../../../server/src/types.ts';
 
 export type DomainInfo = { domain: string; url: string; tls: 'issued' | 'pending' | 'failed' | 'off' | 'local'; expiresAt: number | null; error: string | null };
 
@@ -47,6 +48,7 @@ export type Snapshot = {
   deployments: Deployment[];
   replicas: Record<string, Replica[]>;
   edges: { from: string; to: string }[];
+  volumes: VolumeRecord[];
   proxyPort: number;
 };
 

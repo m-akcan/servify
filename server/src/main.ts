@@ -49,6 +49,7 @@ async function main() {
 
   try {
     const sealed = migrateSealing();
+    (await import('./volumes.ts')).migrateVolumes();
     if (sealed) console.log(`  [secrets] encrypted ${sealed} stored record(s) at rest`);
     if (keySource === 'created') console.log(`  [secrets] created master key ${keyPath} — back it up; secrets can't be recovered without it`);
   } catch (e) {
@@ -124,6 +125,7 @@ async function main() {
   startBackups();
   startLogCollector();
   startEnvironments();
+  (await import('./volumes.ts')).startVolumes();
   setInterval(() => sessionsTable.prune(), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {

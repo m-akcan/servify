@@ -10,6 +10,7 @@ import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from '.
 const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
 import { parseCron, cronMatches } from './cron.ts';
 import { notify } from './notify.ts';
+import { mountsFor } from './volumes.ts';
 
 const running = new Set<string>();
 const SCHEDULER: Actor = { type: 'system', name: 'scheduler' };
@@ -57,7 +58,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
       Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
       Labels: { 'servify.job': 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id, [LABEL.service]: svc.id, 'servify.run': run.id },
       HostConfig: {
-        Mounts: dep.config.volumes.map((v) => ({ Type: 'volume', Source: volumeName(svc.id, v.name), Target: v.mountPath })),
+        Mounts: mountsFor(svc.id, dep.config.volumes),
         NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
         Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
         Init: true,

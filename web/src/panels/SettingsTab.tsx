@@ -3,6 +3,7 @@ import type { ServiceView, Protocol } from '../lib/types.ts';
 import { api } from '../lib/api.ts';
 import { Button, Segmented, Switch, Field, Stepper, toastError, toast, Tooltip, CopyButton } from '../components/ui.tsx';
 import { navigate } from '../lib/router.ts';
+import { openVolumeDialog, detachVolume, bytes } from '../lib/volumes.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { remove, stop, start } from '../lib/actions.ts';
 import { useStore } from '../lib/store.ts';
@@ -92,6 +93,43 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
 }
 const id = (s: ServiceView) => s.id;
 
+function ServiceVolumes({ service: s }: { service: ServiceView }) {
+  const vols = useStore((st) => st.current?.volumes);
+  const attached = s.volumes.map((m) => ({ m, v: m.volumeId ? vols?.[m.volumeId] : undefined }));
+  return (
+    <>
+      {attached.map(({ m, v }) => (
+        <div key={m.volumeId ?? m.name} className="setting-row volume-row">
+          <Icon name="database" size={14} />
+          <span className="mono">{m.name}</span>
+          <Icon name="arrowRight" size={12} className="faint" />
+          <span className="mono grow truncate">{m.mountPath}</span>
+          {v && <span className="faint mono" style={{ fontSize: 11 }}>{bytes(v.sizeBytes)}</span>}
+          {s.activeDeploymentId && !s.stopped && (
+            <a className="btn btn-ghost btn-sm" href={`/api/services/${s.id}/volumes/${encodeURIComponent(m.name)}/download`} download>
+              <Icon name="download" size={14} />
+              Download
+            </a>
+          )}
+          {v && (
+            <Button size="sm" variant="ghost" icon="link" onClick={() => void detachVolume(v)}>
+              Detach
+            </Button>
+          )}
+        </div>
+      ))}
+      <div className="row">
+        <Button icon="plus" onClick={() => openVolumeDialog({ kind: 'attach', serviceId: s.id })}>
+          Attach volume
+        </Button>
+        <span className="faint" style={{ fontSize: 12 }}>
+          A new empty one, or a detached volume from this project.
+        </span>
+      </div>
+    </>
+  );
+}
+
 function tlsLabel(info?: ServiceView['domainInfo'][number]) {
   if (!info) return 'HTTP';
   if (info.tls === 'issued') return `HTTPS · certificate valid until ${info.expiresAt ? new Date(info.expiresAt).toLocaleDateString() : '?'}`;
@@ -123,7 +161,6 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
   const proxyPort = useStore((st) => st.current?.proxyPort ?? 8080);
   const project = useStore((st) => st.current?.project);
   const [domainDraft, setDomainDraft] = useState('');
-  const [vol, setVol] = useState({ name: '', mountPath: '' });
   const id = s.id;
   const src = s.source;
 
@@ -377,38 +414,8 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         </div>
       </Section>
 
-      <Section title="Volumes" icon="database" desc="Persistent storage survives deploys. Services with volumes run as a single replica.">
-        {s.volumes.map((v) => (
-          <div key={v.name} className="setting-row volume-row">
-            <Icon name="database" size={14} />
-            <span className="mono">{v.name}</span>
-            <Icon name="arrowRight" size={12} className="faint" />
-            <span className="mono grow">{v.mountPath}</span>
-            {s.activeDeploymentId && !s.stopped && (
-              <a className="btn btn-ghost btn-sm" href={`/api/services/${s.id}/volumes/${encodeURIComponent(v.name)}/download`} download>
-                <Icon name="download" size={14} />
-                Download
-              </a>
-            )}
-            <Button size="sm" variant="ghost" icon="trash" onClick={() => void patch(id, { volumes: s.volumes.filter((x) => x.name !== v.name) })}>
-              Detach
-            </Button>
-          </div>
-        ))}
-        <form
-          className="row"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!vol.name || !vol.mountPath.startsWith('/')) return;
-            void patch(id, { volumes: [...s.volumes, vol], ...(s.replicas > 1 ? { replicas: 1 } : {}) }).then((ok) => ok && setVol({ name: '', mountPath: '' }));
-          }}
-        >
-          <input className="input mono" placeholder="name" value={vol.name} onChange={(e) => setVol({ ...vol, name: e.target.value.replace(/[^a-zA-Z0-9_.-]/g, '') })} style={{ width: 130 }} />
-          <input className="input mono" placeholder="/data" value={vol.mountPath} onChange={(e) => setVol({ ...vol, mountPath: e.target.value })} />
-          <Button type="submit" icon="plus" disabled={!vol.name || !vol.mountPath.startsWith('/')}>
-            Attach
-          </Button>
-        </form>
+      <Section title="Volumes" icon="database" desc="Persistent storage that survives deploys and can move between services. A service with a volume runs as one replica.">
+        <ServiceVolumes service={s} />
       </Section>
 
       <Section title="Danger zone" icon="alert">

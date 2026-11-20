@@ -6,6 +6,7 @@ import { Canvas, type CanvasHandle } from '../canvas/Canvas.tsx';
 import { ServicePanel } from '../panels/ServicePanel.tsx';
 import { NewServiceModal } from './NewService.tsx';
 import { Button, openMenu, toastError, Tooltip, Kbd, Empty } from '../components/ui.tsx';
+import { VolumeDialogHost, openVolumeDialog } from '../lib/volumes.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { serviceMenu, deploy, remove, connectServices } from '../lib/actions.ts';
 import { ActivityFeed } from '../panels/ActivityFeed.tsx';
@@ -122,6 +123,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
   const onCanvasMenu = useCallback((world: Pt, x: number, y: number) => {
     openMenu(x, y, [
       { label: 'New service here', icon: 'plus', kbd: 'N', onSelect: () => setCreating({ at: world }) },
+      { label: 'New volume here', icon: 'database', onSelect: () => openVolumeDialog({ kind: 'new', at: world }) },
       { label: 'Fit to screen', icon: 'fit', kbd: 'F', onSelect: () => canvasRef.current?.fit() },
       { label: 'Reset zoom', icon: 'search', kbd: '0', onSelect: () => canvasRef.current?.resetZoom() },
       { type: 'sep' },
@@ -376,6 +378,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         }}
       />
       <ProjectSettings open={settingsOpen} onClose={() => setSettingsOpen(false)} project={state.project} />
+      <VolumeDialogHost />
     </div>
   );
 }

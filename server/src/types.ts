@@ -18,9 +18,31 @@ export type ServiceStatus =
   | 'stopped'
   | 'failed';
 
+/** A mount of a volume into a service. */
 export interface Volume {
   name: string;
   mountPath: string;
+  /** The VolumeRecord this mount refers to (volumes are first-class and can move between services). */
+  volumeId?: string;
+}
+
+/** A persistent volume. Lives in a project; attached to at most one service at a time. */
+export interface VolumeRecord {
+  id: string;
+  projectId: string;
+  name: string;
+  /** Docker volume name — fixed for the volume's lifetime, independent of which service uses it. */
+  dockerName: string;
+  /** Attached service, or null when detached (data kept). */
+  serviceId: string | null;
+  /** Where it is (or was last) mounted. */
+  mountPath: string;
+  /** Canvas position while detached. */
+  x: number;
+  y: number;
+  sizeBytes: number | null;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface Healthcheck {
@@ -307,4 +329,6 @@ export type ServerEvent =
   | { type: 'backup.updated'; backup: BackupRecord }
   | { type: 'cert.updated'; cert: PublicCert }
   | { type: 'settings.updated' }
+  | { type: 'volume.updated'; volume: VolumeRecord }
+  | { type: 'volume.deleted'; volumeId: string; projectId: string }
   | { type: 'hello'; version: string };

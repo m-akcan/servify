@@ -33,8 +33,9 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Environments & PR previews.** Copy a project into `staging` (own URLs, fresh data, optional branch), and get a `pr-<n>` environment for every same-repo pull request, deleted when it closes.
 - **Docker Compose import.** Paste a `docker-compose.yml`; services, variables (`.env` interpolation), volumes, replicas and limits carry over, compose hostnames keep working, and unsafe settings are refused with a warning.
 - **History.** Runtime logs and metrics are kept for 7 days in SQLite — they survive redeploys and restarts, and can be searched, filtered by deployment and charted up to a week back.
+- **Volumes you can move.** Volumes are first-class: create them, attach them to a service, detach them (the data stays, as a card on the canvas), drag them onto another service, rename and delete them. Sizes are shown live.
 - **Secrets encrypted at rest** (AES-256-GCM) with a master key you control.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 37 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 42 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -100,7 +101,7 @@ claude mcp add --transport http servify http://localhost:7700/mcp --header "Auth
 { "mcpServers": { "servify": { "command": "node", "args": ["/path/to/servify/server/bin/servify.mjs", "mcp"], "env": { "SERVIFY_URL": "http://localhost:7700", "SERVIFY_TOKEN": "svf_…" } } } }
 ```
 
-Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `import_compose`, `load_test`, `run_job`, `list_runs`, `backup_service`, `list_backups`, `restore_backup`, `list_environments`, `create_environment`, `set_previews`, `list_certificates`.
+Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `import_compose`, `load_test`, `run_job`, `list_runs`, `backup_service`, `list_backups`, `restore_backup`, `list_environments`, `create_environment`, `set_previews`, `list_certificates`, `list_volumes`, `create_volume`, `attach_volume`, `detach_volume`, `delete_volume`.
 
 Example — an agent can create a full stack in one call with `import_project`:
 
@@ -130,7 +131,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
   -d '{"replicas":5}' http://localhost:7700/api/services/<service>/scale
 ```
 
-Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/import-compose`, `/api/projects/:id/environments`, `/api/projects/:id/previews`, `/api/services/:id/backups`, `/api/backups/:id/{restore,download}`, `/api/certs`, `/api/settings` (owner only for writes), `/api/hooks/git`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest,run}`, `/api/services/:id/runs`, `/api/services/:id/volumes/:name/download`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
+Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/import-compose`, `/api/projects/:id/environments`, `/api/projects/:id/previews`, `/api/services/:id/backups`, `/api/backups/:id/{restore,download}`, `/api/projects/:id/volumes`, `/api/volumes/:id/{attach,detach}`, `/api/certs`, `/api/settings` (owner only for writes), `/api/hooks/git`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest,run}`, `/api/services/:id/runs`, `/api/services/:id/volumes/:name/download`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
 
 ## HTTPS and custom domains
 
@@ -153,6 +154,10 @@ Settings → Git webhooks shows the payload URL (`/_servify/hooks/git` on the ro
 ## Notifications
 
 Settings → Notifications: add Slack, Discord, Telegram, ntfy, email or webhook channels and pick events (deploy failed/succeeded, service down/recovered, cron job failed, backup failed/succeeded, certificate failed, preview ready). "Down" alerts are de-duplicated (one per service per 10 minutes, and "recovered" only answers a "down" that was sent). Webhook payloads are signed: `X-Servify-Signature: sha256=<HMAC of the body>`.
+
+## Volumes
+
+A volume belongs to a project and is attached to at most one service. It shows as a tab under its service on the canvas (name and size). From its menu you can **detach** it — the service restarts without it and the volume stays on the canvas as a detached card, data intact — and then drag it onto any service in the project to **attach** it at a mount path. "Attach volume…" on a service (or "New volume here" on the canvas) creates a fresh one. Deleting a service keeps its volumes as detached volumes unless you ask otherwise; deleting a volume is the only thing that removes its data. Attach and detach redeploy the service immediately, so a volume is never mounted by two services at once, and a rollback never mounts a volume that has moved away. A service with a volume runs as a single replica.
 
 ## Backups
 

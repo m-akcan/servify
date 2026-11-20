@@ -20,6 +20,7 @@ import { docker, dockerHostEnv, normalizeImageRef } from './docker.ts';
 import { busy, drainAndRemove, replicasOf, requestReconcile, volumeName, refreshServiceStatus } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
+import { dockerVolumeFor } from './volumes.ts';
 import { destinationById, type Destination } from './settings.ts';
 import { s3Delete, s3Get, s3Put } from './s3.ts';
 import { config } from './config.ts';
@@ -40,8 +41,8 @@ function deployedImage(svc: Service): string {
 }
 
 function volumesOf(svc: Service) {
-  const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
-  return dep?.config.volumes.length ? dep.config.volumes : svc.volumes;
+  // The service's current attachments (volumes are first-class and can move between services).
+  return svc.volumes;
 }
 
 export function backupMethod(svc: Service): BackupMethod | null {
@@ -211,7 +212,10 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
         const r = runningReplica(svc);
         if (r) await docker.exec(r.containerId, ['/bin/sh', '-c', 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning SAVE >/dev/null 2>&1 || true'], 30_000).catch(() => {});
       }
-      const mounts = vols.flatMap((v) => ['-v', `${volumeName(svc.id, v.name)}:/backup/${v.name}:ro`]);
+      const mounts = vols.flatMap((v) => {
+        const src = dockerVolumeFor(svc.id, v);
+        return src ? ['-v', `${src}:/backup/${v.name}:ro`] : [];
+      });
       const out = createWriteStream(tmp);
       const r = await cli(['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'czf', '-', '-C', '/backup', '.'], { stdout: out });
       await new Promise<void>((res) => out.end(res));
@@ -370,7 +374,10 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
     bus.publish({ type: 'service.updated', service: fresh });
     await drainAndRemove(replicasOf(svc.id).map((r) => r.containerId), 2000);
     const vols = volumesOf(svc);
-    const mounts = vols.flatMap((v) => ['-v', `${volumeName(svc.id, v.name)}:/backup/${v.name}`]);
+    const mounts = vols.flatMap((v) => {
+      const src = dockerVolumeFor(svc.id, v);
+      return src ? ['-v', `${src}:/backup/${v.name}`] : [];
+    });
     const wipe = await cli(['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
     if (wipe.code !== 0) throw new Error(`could not clear the volumes: ${wipe.stderr.slice(-300)}`);
     if (b.method === 'volume') {

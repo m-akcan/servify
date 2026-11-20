@@ -57,3 +57,10 @@
 - [x] Scheduled backups verified firing (`* * * * *`), added to the feature suite.
 - [x] Container mode rebuilt and booted on spare ports: deploy, backup (docker CLI in the image), HTTP + HTTPS routing, log history. Compose publishes 8443.
 - [x] pnpm 12's minimumReleaseAge rejected two day-old transitive packages (`@peculiar/asn1-pkcs8`, `@peculiar/asn1-x509` 3.1.0) → pinned to 3.0.0 via `overrides` in pnpm-workspace.yaml.
+
+## Round 3 — first-class volumes
+- [x] `volumes.ts`: VolumeRecord (own Docker volume name), create / attach / detach / rename / move / delete, live sizes (`/system/df`), free-spot placement. Existing volumes migrate at boot keeping their Docker volume (verified: data intact).
+- [x] Mounts resolve through records: a replica only mounts volumes attached to its own service (rollback after a move verified not to mount it); rollbacks/restarts always use the service's current volumes.
+- [x] Detach marks the record first, takes the service over, drains, then redeploys; attach checks the volume isn't mounted anywhere and queues a redeploy.
+- [x] Service delete keeps volumes as detached by default in the UI; project delete removes its detached volumes.
+- [x] UI: volume tabs under service cards, detached volume cards (drag onto a service to attach), Attach / New / Rename / Detach / Delete dialogs, settings section. MCP: 42 tools.
