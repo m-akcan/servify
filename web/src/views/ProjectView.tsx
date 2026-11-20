@@ -238,9 +238,25 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
             </div>
             <h2 className="h2">Deploy your first service</h2>
             <p className="muted">From a GitHub repo, a Docker image, a folder on this machine, or a one-click template.</p>
-            <Button variant="primary" size="lg" icon="plus" onClick={() => setCreating({ at: null })}>
-              New service
-            </Button>
+            <div className="row" style={{ gap: 8 }}>
+              <Button variant="primary" size="lg" icon="plus" onClick={() => setCreating({ at: null })}>
+                New service
+              </Button>
+              <Button
+                size="lg"
+                icon="sparkle"
+                onClick={async () => {
+                  try {
+                    await api.post(`/projects/${state.project.id}/demo`);
+                    setTimeout(() => canvasRef.current?.fit(), 600);
+                  } catch (e) {
+                    toastError(e, 'Could not load demo');
+                  }
+                }}
+              >
+                Load demo stack
+              </Button>
+            </div>
             <div className="faint" style={{ fontSize: 12, marginTop: 4 }}>
               or double-click anywhere on the canvas · <Kbd>N</Kbd>
             </div>

@@ -160,7 +160,7 @@ export const templates: Template[] = [
     description: 'Self-hosted uptime monitoring.',
     icon: 'pulse',
     category: 'tool',
-    image: 'louislam/uptime-kuma:1',
+    image: 'louislam/uptime-kuma:2',
     protocol: 'http',
     port: 3001,
     volumes: [{ name: 'data', mountPath: '/app/data' }],

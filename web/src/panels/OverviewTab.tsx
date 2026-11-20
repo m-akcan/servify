@@ -30,6 +30,56 @@ function Stat({ label, value, format, unit, icon }: { label: string; value: numb
 
 const stateTone: Record<Replica['state'], any> = { healthy: 'ok', starting: 'warn', unhealthy: 'err', draining: 'idle', exited: 'err' };
 
+function LoadTester({ serviceId }: { serviceId: string }) {
+  const [until, setUntil] = useState<number | null>(null);
+  const [rps, setRps] = useState(40);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!until) return;
+    const i = setInterval(() => {
+      if (Date.now() > until) setUntil(null);
+      tick((n) => n + 1);
+    }, 500);
+    return () => clearInterval(i);
+  }, [until]);
+  const start = async () => {
+    try {
+      const r = await api.post<{ until: number }>(`/services/${serviceId}/loadtest`, { rps, seconds: 30 });
+      setUntil(r.until);
+    } catch (e) {
+      toastError(e);
+    }
+  };
+  const stop = async () => {
+    await api.del(`/services/${serviceId}/loadtest`).catch(() => {});
+    setUntil(null);
+  };
+  const left = until ? Math.max(0, Math.ceil((until - Date.now()) / 1000)) : 0;
+  return (
+    <div className={`loadtest ${until ? 'on' : ''}`}>
+      <Icon name="zap" size={14} />
+      <div className="grow">
+        <div style={{ fontSize: 12, fontWeight: 550 }}>{until ? `Sending ${rps} req/s · ${left}s left` : 'Test traffic'}</div>
+        <div className="faint" style={{ fontSize: 11 }}>Watch requests spread across replicas on the canvas.</div>
+      </div>
+      {!until && (
+        <Segmented
+          value={String(rps) as '10' | '40' | '150'}
+          onChange={(v) => setRps(Number(v))}
+          options={[
+            { value: '10', label: '10/s' },
+            { value: '40', label: '40/s' },
+            { value: '150', label: '150/s' },
+          ]}
+        />
+      )}
+      <button className={`btn btn-sm ${until ? 'btn-secondary' : 'btn-primary'}`} onClick={until ? stop : start}>
+        {until ? 'Stop' : 'Start'}
+      </button>
+    </div>
+  );
+}
+
 export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab: (t: PanelTab) => void }) {
   const current = useStore((st) => st.current);
   const replicas = (current?.replicas[s.id] ?? []).filter((r) => r.deploymentId === s.activeDeploymentId || r.state === 'starting');
@@ -93,6 +143,7 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
           </div>
           <Stepper value={s.replicas} min={0} max={stateful ? 1 : 32} onChange={(v) => void scale(s, v)} disabled={stateful && s.replicas >= 1 && false} />
         </div>
+        {s.protocol === 'http' && s.activeDeploymentId && !s.stopped && <LoadTester serviceId={s.id} />}
         {s.protocol !== 'none' && !stateful && (
           <div className="row" style={{ gap: 10 }}>
             <span className="label">Strategy</span>

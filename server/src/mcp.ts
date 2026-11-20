@@ -295,6 +295,15 @@ export function buildMcpServer(principal: Principal): McpServer {
   );
 
   server.registerTool(
+    'load_test',
+    { description: 'Send synthetic HTTP traffic to a service through the load balancer (to verify scaling, balancing or autoscaling).', inputSchema: { service: svcRef, rps: z.number().min(1).max(500).optional(), seconds: z.number().int().min(1).max(300).optional() } },
+    wrap(({ service, rps, seconds }: { service: string; rps?: number; seconds?: number }) => {
+      guard();
+      return ops.loadTest(actor, service, rps ?? 30, seconds ?? 30);
+    }),
+  );
+
+  server.registerTool(
     'get_activity',
     { description: 'Recent activity (who did what — users, agents, system).', inputSchema: { project: projRef.optional(), limit: z.number().int().min(1).max(200).optional() } },
     wrap(({ project, limit }: { project?: string; limit?: number }) =>

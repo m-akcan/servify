@@ -10,13 +10,14 @@ import { LogsTab } from './LogsTab.tsx';
 import { VariablesTab } from './VariablesTab.tsx';
 import { MetricsTab } from './MetricsTab.tsx';
 import { SettingsTab } from './SettingsTab.tsx';
+import { ConsoleTab } from './ConsoleTab.tsx';
 
-export type PanelTab = 'overview' | 'deployments' | 'logs' | 'variables' | 'metrics' | 'settings';
+export type PanelTab = 'overview' | 'deployments' | 'logs' | 'console' | 'variables' | 'metrics' | 'settings';
 
 export function ServicePanel({ service: s, tab, onClose, onTab }: { service: ServiceView; tab?: string; onClose: () => void; onTab: (t: PanelTab) => void }) {
   const current = useStore((st) => st.current);
   const deps = deploymentsFor(current, s.id);
-  const active: PanelTab = (['overview', 'deployments', 'logs', 'variables', 'metrics', 'settings'] as const).includes(tab as PanelTab) ? (tab as PanelTab) : 'overview';
+  const active: PanelTab = (['overview', 'deployments', 'logs', 'console', 'variables', 'metrics', 'settings'] as const).includes(tab as PanelTab) ? (tab as PanelTab) : 'overview';
   const latest = deps[0];
   const busy = isBusy(s.status) || (latest && isBusy(latest.status));
 
@@ -84,6 +85,7 @@ export function ServicePanel({ service: s, tab, onClose, onTab }: { service: Ser
           { value: 'overview', label: 'Overview' },
           { value: 'deployments', label: 'Deployments', count: deps.length || null },
           { value: 'logs', label: 'Logs' },
+          { value: 'console', label: 'Console' },
           { value: 'variables', label: 'Variables', count: Object.keys(s.env).length || null },
           { value: 'metrics', label: 'Metrics' },
           { value: 'settings', label: 'Settings' },
@@ -93,6 +95,7 @@ export function ServicePanel({ service: s, tab, onClose, onTab }: { service: Ser
         {active === 'overview' && <OverviewTab service={s} onTab={onTab} />}
         {active === 'deployments' && <DeploymentsTab service={s} />}
         {active === 'logs' && <LogsTab service={s} />}
+        {active === 'console' && <ConsoleTab service={s} />}
         {active === 'variables' && <VariablesTab service={s} />}
         {active === 'metrics' && <MetricsTab service={s} />}
         {active === 'settings' && <SettingsTab service={s} />}

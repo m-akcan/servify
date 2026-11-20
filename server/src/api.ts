@@ -138,6 +138,7 @@ api.delete('/projects/:id', async (c) => {
   await ops.deleteProject(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
+api.post('/projects/:id/demo', async (c) => c.json(await ops.seedDemo(actor(c), c.req.param('id'))));
 api.get('/projects/:id/activity', (c) => {
   const p = ops.getProjectOrThrow(c.req.param('id'));
   return c.json(ops.listActivity({ projectId: p.id, limit: Number(c.req.query('limit') ?? 100) }));
@@ -186,6 +187,12 @@ api.post('/services/:id/exec', async (c) => {
   const { command, replica } = await c.req.json<{ command: string; replica?: number }>();
   return c.json(await ops.execInService(actor(c), c.req.param('id'), command, replica));
 });
+
+api.post('/services/:id/loadtest', async (c) => {
+  const { rps, seconds } = await c.req.json<{ rps?: number; seconds?: number }>();
+  return c.json(ops.loadTest(actor(c), c.req.param('id'), rps ?? 30, seconds ?? 30));
+});
+api.delete('/services/:id/loadtest', (c) => c.json(ops.stopLoadTest(ops.getServiceOrThrow(c.req.param('id')).id)));
 
 api.get('/services/:id/logs/stream', (c) => {
   const svc = ops.getServiceOrThrow(c.req.param('id'));

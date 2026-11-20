@@ -9,6 +9,7 @@ import { AgentsView } from './views/Agents.tsx';
 import { CommandPalette } from './components/CommandPalette.tsx';
 import { Shell } from './views/Shell.tsx';
 import { EventToasts } from './components/EventToasts.tsx';
+import { Shortcuts } from './components/Shortcuts.tsx';
 
 export function App() {
   const auth = useStore((s) => s.auth);
@@ -44,6 +45,7 @@ export function App() {
       <ConfirmHost />
       <ToastHost />
       <EventToasts />
+      <Shortcuts />
     </>
   );
 }

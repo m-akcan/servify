@@ -121,9 +121,26 @@ export function Home() {
         {loaded && projects.length === 0 ? (
           <div className="home-empty rise-in" style={{ animationDelay: '120ms' }}>
             <Empty icon="sparkle" title="Nothing here yet" body="Create a project, then drop in services from GitHub, Docker images, a local folder or a template.">
-              <Button variant="primary" icon="plus" onClick={() => setOpen(true)} style={{ marginTop: 10 }}>
-                Create your first project
-              </Button>
+              <div className="row" style={{ marginTop: 10, gap: 8 }}>
+                <Button variant="primary" icon="plus" onClick={() => setOpen(true)}>
+                  Create your first project
+                </Button>
+                <Button
+                  icon="sparkle"
+                  onClick={async () => {
+                    try {
+                      const p = await api.post<Project>('/projects', { name: 'Demo' });
+                      await api.post(`/projects/${p.id}/demo`);
+                      await loadProjects();
+                      navigate(projectPath(p.slug));
+                    } catch (e) {
+                      toastError(e, 'Could not create the demo');
+                    }
+                  }}
+                >
+                  Try the demo
+                </Button>
+              </div>
             </Empty>
           </div>
         ) : (

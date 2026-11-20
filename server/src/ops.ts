@@ -687,3 +687,73 @@ export function serviceSummary(s: Service) {
     deploying: isDeploying(s.id),
   };
 }
+
+// ───────────────────────────── demo & load test ─────────────────────────────
+
+import { fileURLToPath } from 'node:url';
+import { dirname, join as pjoin } from 'node:path';
+import { existsSync } from 'node:fs';
+import httpMod from 'node:http';
+
+/** Populate a project with a small, realistic stack so new users see everything working. */
+export async function seedDemo(actor: Actor, projectId: string) {
+  const project = getProjectOrThrow(projectId);
+  const examples = pjoin(dirname(fileURLToPath(import.meta.url)), '../../examples/node-api');
+  const created: string[] = [];
+  const web = await createService(actor, project.id, { templateId: 'whoami', name: 'web', replicas: 3, x: 0, y: -40 });
+  created.push(web.service.id);
+  const redis = await createService(actor, project.id, { templateId: 'redis', x: 380, y: 200 });
+  created.push(redis.service.id);
+  if (existsSync(examples)) {
+    const api = await createService(actor, project.id, { path: examples, name: 'api', replicas: 2, x: 0, y: 200, env: { REDIS_URL: '${{ redis.REDIS_URL }}' } });
+    created.push(api.service.id);
+    await updateService(actor, api.service.id, { healthcheck: { path: '/healthz' } }, { quiet: true });
+  }
+  const pg = await createService(actor, project.id, { templateId: 'postgres', x: 380, y: -40 });
+  created.push(pg.service.id);
+  recordActivity(actor, 'project.demo', `Seeded demo stack in ${project.name}`, project.id);
+  return { services: created };
+}
+
+const loadTests = new Map<string, NodeJS.Timeout>();
+
+/** Fire synthetic requests at a service through the edge router (to watch LB / autoscaling). */
+export function loadTest(actor: Actor, serviceId: string, rps: number, seconds: number) {
+  const svc = getServiceOrThrow(serviceId);
+  const project = getProjectOrThrow(svc.projectId);
+  assert(svc.protocol === 'http', 400, 'load tests are for HTTP services');
+  rps = Math.max(1, Math.min(500, Math.round(rps)));
+  seconds = Math.max(1, Math.min(300, Math.round(seconds)));
+  const prev = loadTests.get(svc.id);
+  if (prev) clearInterval(prev);
+  const host = `${svc.slug}.${project.slug}.${config.baseDomain}`;
+  const agent = new httpMod.Agent({ keepAlive: true, maxSockets: 64 });
+  const end = Date.now() + seconds * 1000;
+  const perTick = rps / 20;
+  let carry = 0;
+  const timer = setInterval(() => {
+    if (Date.now() > end) {
+      clearInterval(timer);
+      loadTests.delete(svc.id);
+      agent.destroy();
+      return;
+    }
+    carry += perTick;
+    while (carry >= 1) {
+      carry -= 1;
+      const req = httpMod.get({ host: '127.0.0.1', port: config.proxyPort, path: '/', headers: { host, 'user-agent': 'servify-loadtest' }, agent }, (res) => res.resume());
+      req.on('error', () => {});
+      req.setTimeout(5000, () => req.destroy());
+    }
+  }, 50);
+  loadTests.set(svc.id, timer);
+  recordActivity(actor, 'service.loadtest', `Load test on ${svc.name}: ${rps} req/s for ${seconds}s`, svc.projectId, svc.id);
+  return { rps, seconds, until: end };
+}
+
+export function stopLoadTest(serviceId: string) {
+  const t = loadTests.get(serviceId);
+  if (t) clearInterval(t);
+  loadTests.delete(serviceId);
+  return { stopped: !!t };
+}
