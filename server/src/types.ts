@@ -66,9 +66,16 @@ export interface Service {
   env: Record<string, string>;
   secretKeys: string[];
   startCommand: string | null;
+  /** Docker-style overrides (e.g. from Compose): replace only CMD / only ENTRYPOINT. Ignored when startCommand is set. */
+  cmd?: string[] | null;
+  entrypoint?: string[] | null;
   buildCommand: string | null;
   resources: { cpus: number | null; memoryMb: number | null };
   autoDeploy: boolean;
+  /** Scheduled backups of this service's data. */
+  backup?: BackupConfig | null;
+  /** Extra hostnames on the project network (e.g. the original Docker Compose service name). */
+  aliases?: string[];
   x: number;
   y: number;
   status: ServiceStatus;
@@ -95,6 +102,8 @@ export interface DeploymentConfig {
   port: number | null;
   protocol: Protocol;
   startCommand: string | null;
+  cmd?: string[] | null;
+  entrypoint?: string[] | null;
   volumes: Volume[];
   resources: { cpus: number | null; memoryMb: number | null };
   source: Source;
@@ -126,9 +135,79 @@ export interface Project {
   name: string;
   slug: string;
   color: string;
+  /** Set on environments: the base ("production") project this one belongs to. */
+  parentId?: string | null;
+  /** Environment name; the base project is "production". */
+  envName?: string | null;
+  /** Set on pull-request preview environments. */
+  preview?: PreviewInfo | null;
+  /** Base projects: open a preview environment for each same-repo pull request. */
+  previews?: { enabled: boolean } | null;
   createdAt: number;
   updatedAt: number;
 }
+
+export interface PreviewInfo {
+  provider: 'github' | 'gitlab' | 'gitea';
+  /** Normalized clone URL of the base repository. */
+  repo: string;
+  number: number;
+  branch: string;
+  title?: string;
+  url?: string;
+}
+
+export interface BackupConfig {
+  enabled: boolean;
+  /** Cron expression. */
+  schedule: string;
+  /** How many successful backups to keep per destination. */
+  retention: number;
+  destinationId: string;
+}
+
+export type BackupMethod = 'pg_dumpall' | 'mysqldump' | 'mongodump' | 'volume';
+
+export interface BackupRecord {
+  id: string;
+  serviceId: string;
+  projectId: string;
+  serviceName: string;
+  status: 'running' | 'succeeded' | 'failed';
+  method: BackupMethod;
+  trigger: 'schedule' | 'manual' | 'agent' | 'pre-restore';
+  actor: string;
+  destinationId: string;
+  destinationName: string;
+  /** Object key / file name at the destination. */
+  key: string | null;
+  sizeBytes: number | null;
+  startedAt: number;
+  finishedAt: number | null;
+  error: string | null;
+  restoredAt?: number | null;
+  createdAt: number;
+}
+
+export interface CertRecord {
+  /** = host */
+  id: string;
+  host: string;
+  status: 'pending' | 'issued' | 'failed';
+  issuer: 'acme' | 'internal';
+  expiresAt: number | null;
+  issuedAt: number | null;
+  lastAttemptAt: number | null;
+  nextAttemptAt: number | null;
+  attempts: number;
+  error: string | null;
+  /** PEM chain (public). The private key is stored sealed in `keySealed`. */
+  certPem?: string | null;
+  keySealed?: string | null;
+  createdAt: number;
+}
+
+export type PublicCert = Omit<CertRecord, 'certPem' | 'keySealed'>;
 
 export type ReplicaState = 'starting' | 'healthy' | 'unhealthy' | 'draining' | 'exited';
 
@@ -225,4 +304,7 @@ export type ServerEvent =
   | { type: 'traffic'; tick: number; services: Record<string, { rps: number; errors: number; p95: number; replicas: Record<string, number> }> }
   | { type: 'activity'; entry: ActivityEntry }
   | { type: 'job.run'; run: JobRun }
+  | { type: 'backup.updated'; backup: BackupRecord }
+  | { type: 'cert.updated'; cert: PublicCert }
+  | { type: 'settings.updated' }
   | { type: 'hello'; version: string };

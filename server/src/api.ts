@@ -26,6 +26,15 @@ import type { ServerEvent } from './types.ts';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { replicasOf } from './engine.ts';
+import * as settings from './settings.ts';
+import { testChannel, recentDeliveries } from './notify.ts';
+import { recentHookDeliveries, deployHookToken } from './hooks.ts';
+import { listCertificates, retryCertificate, localCaPem } from './certs.ts';
+import { restoreBackup, deleteBackup, openBackupStream } from './backups.ts';
+import { backupsTable } from './db.ts';
+import { s3Test } from './s3.ts';
+import { keySource, keyPath } from './crypto.ts';
+import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 
 type Env = { Variables: { principal: Principal } };
 
@@ -148,9 +157,10 @@ api.get('/system', async (c) => {
   return c.json({
     version: config.version,
     docker: dockerInfo,
-    proxy: { host: config.proxyHost, port: config.proxyPort, baseDomain: config.baseDomain },
+    proxy: { host: config.proxyHost, port: config.proxyPort, httpsPort: config.httpsPort, baseDomain: config.baseDomain },
     api: { host: config.host, port: config.port },
     dataDir: config.dataDir,
+    masterKey: { source: keySource, path: keySource === 'env' ? null : keyPath },
     binPath: fileURLToPath(new URL('../bin/servify.mjs', import.meta.url)),
     authMode: config.authMode,
     actor: actor(c),
@@ -175,6 +185,21 @@ api.get('/projects/:id/export', (c) => {
 api.post('/projects/import', async (c) => {
   const body = await jsonBody<{ spec: ops.ProjectSpec; deploy?: boolean; name?: string }>(c);
   return c.json(await ops.importProject(actor(c), body.spec, { deploy: body.deploy, name: body.name }), 201);
+});
+api.post('/projects/import-compose', async (c) => {
+  const body = await jsonBody<{ yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean; dryRun?: boolean }>(c);
+  if (!body.yaml?.trim()) throw new HttpError(400, 'paste the contents of your docker-compose.yml');
+  if (body.dryRun) return c.json(ops.planComposeImport(body));
+  return c.json(await ops.importCompose(actor(c), body), 201);
+});
+api.get('/projects/:id/environments', (c) => c.json(environmentsOf(c.req.param('id'))));
+api.post('/projects/:id/environments', async (c) => {
+  const body = await jsonBody<{ name: string; branch?: string; deploy?: boolean }>(c);
+  return c.json(await createEnvironment(actor(c), c.req.param('id'), body), 201);
+});
+api.patch('/projects/:id/previews', async (c) => {
+  const { enabled } = await jsonBody<{ enabled: boolean }>(c);
+  return c.json(setPreviews(actor(c), c.req.param('id'), !!enabled));
 });
 api.post('/projects/:id/demo', async (c) => c.json(await ops.seedDemo(actor(c), c.req.param('id'))));
 api.get('/projects/:id/activity', (c) => {
@@ -216,10 +241,21 @@ api.get('/services/:id/variables/resolved', (c) => {
   return c.json(ops.previewVariables(c.req.param('id')));
 });
 api.get('/services/:id/deployments', (c) => c.json(ops.listDeployments(c.req.param('id'), Number(c.req.query('limit') ?? 30), view(c))));
-api.get('/services/:id/metrics', (c) => c.json(ops.serviceMetrics(c.req.param('id'), Number(c.req.query('seconds') ?? 300))));
-api.get('/services/:id/logs', async (c) =>
-  c.json(await ops.serviceLogs(c.req.param('id'), { tail: Number(c.req.query('tail') ?? 300), search: c.req.query('search') })),
+api.get('/services/:id/metrics', (c) =>
+  c.json(ops.serviceMetrics(c.req.param('id'), Math.max(10, Math.min(7 * 86400, Number(c.req.query('seconds') ?? 300))))),
 );
+api.get('/services/:id/logs', async (c) => {
+  const num = (k: string) => (c.req.query(k) ? Number(c.req.query(k)) : undefined);
+  return c.json(
+    await ops.serviceLogs(c.req.param('id'), {
+      tail: num('tail') ?? 300,
+      since: num('since'),
+      until: num('until'),
+      search: c.req.query('search') || undefined,
+      deploymentId: c.req.query('deployment') || undefined,
+    }),
+  );
+});
 api.get('/services/:id/volumes/:name/download', async (c) => {
   if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot download volume data');
   const svc = ops.getServiceOrThrow(c.req.param('id'));
@@ -234,6 +270,25 @@ api.get('/services/:id/volumes/:name/download', async (c) => {
       'content-type': 'application/x-tar',
       'content-disposition': `attachment; filename="${svc.slug}-${vol.name}-${stamp}.tar"`,
     },
+  });
+});
+api.get('/services/:id/backups', (c) => c.json(ops.serviceBackups(c.req.param('id'), Number(c.req.query('limit') ?? 50))));
+api.post('/services/:id/backups', async (c) => {
+  const body = await jsonBody<{ destinationId?: string }>(c);
+  return c.json(await ops.backupNow(actor(c), c.req.param('id'), body.destinationId), 201);
+});
+api.post('/backups/:id/restore', (c) => c.json(restoreBackup(actor(c), c.req.param('id')), 202));
+api.delete('/backups/:id', async (c) => {
+  await deleteBackup(actor(c), c.req.param('id'));
+  return c.json({ ok: true });
+});
+api.get('/backups/:id/download', async (c) => {
+  if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot download backups');
+  const b = backupsTable.get(c.req.param('id'));
+  if (!b || b.status !== 'succeeded' || !b.key) throw new HttpError(404, 'backup not found');
+  const stream = await openBackupStream(b);
+  return new Response(Readable.toWeb(stream) as ReadableStream, {
+    headers: { 'content-type': 'application/gzip', 'content-disposition': `attachment; filename="${b.key.split('/').pop()}"` },
   });
 });
 api.post('/services/:id/run', async (c) => {
@@ -337,6 +392,85 @@ api.get('/events', (c) => {
 
 api.get('/activity', (c) => c.json(ops.listActivity({ limit: Number(c.req.query('limit') ?? 100) })));
 api.get('/templates', (c) => c.json(ops.listTemplates()));
+
+// ───────────────────────────── instance settings ─────────────────────────────
+
+const isOwner = (c: Context<Env>) => c.get('principal').actor.type === 'user';
+function ownerOnly(c: Context<Env>) {
+  if (!isOwner(c)) throw new HttpError(403, 'only the owner can change instance settings');
+}
+
+api.get('/settings', (c) => c.json(settings.publicSettings(isOwner(c))));
+api.patch('/settings/general', async (c) => {
+  ownerOnly(c);
+  settings.updateGeneral(actor(c), await jsonBody(c));
+  return c.json(settings.publicSettings(true));
+});
+api.patch('/settings/https', async (c) => {
+  ownerOnly(c);
+  settings.updateHttps(actor(c), await jsonBody(c));
+  return c.json(settings.publicSettings(true));
+});
+api.post('/settings/notifications/channels', async (c) => {
+  ownerOnly(c);
+  return c.json(settings.upsertChannel(actor(c), await jsonBody(c)), 201);
+});
+api.delete('/settings/notifications/channels/:id', (c) => {
+  ownerOnly(c);
+  settings.deleteChannel(actor(c), c.req.param('id'));
+  return c.json({ ok: true });
+});
+api.post('/settings/notifications/channels/:id/test', async (c) => {
+  ownerOnly(c);
+  return c.json(await testChannel(c.req.param('id')));
+});
+api.get('/settings/notifications/deliveries', (c) => c.json(recentDeliveries(c.req.query('channel') || undefined)));
+api.post('/settings/backups/destinations', async (c) => {
+  ownerOnly(c);
+  return c.json(settings.upsertDestination(actor(c), await jsonBody(c)), 201);
+});
+api.post('/settings/backups/destinations/:id/test', async (c) => {
+  ownerOnly(c);
+  const d = settings.destinationById(c.req.param('id'));
+  if (!d) throw new HttpError(404, 'destination not found');
+  try {
+    if (d.type === 's3') await s3Test(d);
+    else {
+      const { mkdirSync, writeFileSync, unlinkSync } = await import('node:fs');
+      mkdirSync(d.path!, { recursive: true });
+      const p = `${d.path}/.servify-write-test`;
+      writeFileSync(p, 'ok');
+      unlinkSync(p);
+    }
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ ok: false, error: (e as Error).message });
+  }
+});
+api.delete('/settings/backups/destinations/:id', (c) => {
+  ownerOnly(c);
+  settings.deleteDestination(actor(c), c.req.param('id'));
+  return c.json({ ok: true });
+});
+api.get('/settings/webhooks/deliveries', (c) => c.json(recentHookDeliveries()));
+api.get('/services/:id/deploy-hook', (c) => {
+  if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot view deploy hooks');
+  const svc = ops.getServiceOrThrow(c.req.param('id'));
+  return c.json({ path: `/_servify/hooks/deploy/${svc.id}/${deployHookToken(svc.id)}` });
+});
+api.get('/certs', (c) => c.json(listCertificates()));
+api.post('/certs/:host/retry', async (c) => {
+  ownerOnly(c);
+  await retryCertificate(c.req.param('host').toLowerCase());
+  return c.json({ ok: true }, 202);
+});
+api.get('/certs/local-ca.pem', async (c) =>
+  c.body(await localCaPem(), 200, { 'content-type': 'application/x-pem-file', 'content-disposition': 'attachment; filename="servify-local-ca.pem"' }),
+);
+api.post('/settings/webhooks/rotate', (c) => {
+  ownerOnly(c);
+  return c.json({ secret: settings.rotateWebhookSecret(actor(c)) });
+});
 
 // ───────────────────────────── tokens ─────────────────────────────
 

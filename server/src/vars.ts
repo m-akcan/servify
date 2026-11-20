@@ -7,6 +7,7 @@
  */
 import type { Service, Project } from './types.ts';
 import { config } from './config.ts';
+import { hasPublicCert } from './certs.ts';
 
 const REF = /\$\{\{\s*([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_]+))?\s*\}\}/g;
 
@@ -14,9 +15,14 @@ export function publicDomain(svc: Service, project: Project): string {
   return `${svc.slug}.${project.slug}.${config.baseDomain}`;
 }
 
+/** URL for a host on the router: https when a trusted certificate is in place. */
+export function hostUrl(host: string): string {
+  if (hasPublicCert(host)) return `https://${host}${config.httpsPort === 443 ? '' : `:${config.httpsPort}`}`;
+  return `http://${host}${config.proxyPort === 80 ? '' : `:${config.proxyPort}`}`;
+}
+
 export function publicUrl(svc: Service, project: Project): string {
-  const port = config.proxyPort === 80 ? '' : `:${config.proxyPort}`;
-  return `http://${publicDomain(svc, project)}${port}`;
+  return hostUrl(publicDomain(svc, project));
 }
 
 export function builtins(svc: Service, project: Project, port: number | null): Record<string, string> {

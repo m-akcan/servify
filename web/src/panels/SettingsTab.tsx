@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { ServiceView, Protocol } from '../lib/types.ts';
 import { api } from '../lib/api.ts';
-import { Button, Segmented, Switch, Field, Stepper, toastError, toast } from '../components/ui.tsx';
+import { Button, Segmented, Switch, Field, Stepper, toastError, toast, Tooltip, CopyButton } from '../components/ui.tsx';
+import { navigate } from '../lib/router.ts';
 import { Icon } from '../components/Icon.tsx';
 import { remove, stop, start } from '../lib/actions.ts';
 import { useStore } from '../lib/store.ts';
@@ -91,6 +92,33 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
 }
 const id = (s: ServiceView) => s.id;
 
+function tlsLabel(info?: ServiceView['domainInfo'][number]) {
+  if (!info) return 'HTTP';
+  if (info.tls === 'issued') return `HTTPS · certificate valid until ${info.expiresAt ? new Date(info.expiresAt).toLocaleDateString() : '?'}`;
+  if (info.tls === 'pending') return 'HTTPS · requesting a certificate…';
+  if (info.tls === 'failed') return `HTTPS · certificate failed: ${info.error ?? 'unknown error'}`;
+  if (info.tls === 'local') return 'Local name — served with the Servify local CA on the HTTPS port';
+  return 'HTTP only — turn on HTTPS in Settings';
+}
+
+function DeployHook({ serviceId }: { serviceId: string }) {
+  const [path, setPath] = useState<string | null>(null);
+  const system = useStore((st) => st.system);
+  useEffect(() => {
+    api.get<{ path: string }>(`/services/${serviceId}/deploy-hook`).then((r) => setPath(r.path)).catch(() => setPath(null));
+  }, [serviceId]);
+  if (!path) return null;
+  const url = `http://<your-host>:${system?.proxy.port ?? 8080}${path}`;
+  return (
+    <Field label="Deploy hook" hint="POST to this URL from CI to deploy. Served by the router, so it works wherever your apps are reachable.">
+      <div className="row" style={{ gap: 6 }}>
+        <input className="input mono" readOnly value={url} onFocus={(e) => e.currentTarget.select()} />
+        <CopyButton text={url.replace('<your-host>', 'localhost')} label="Copy" />
+      </div>
+    </Field>
+  );
+}
+
 export function SettingsTab({ service: s }: { service: ServiceView }) {
   const proxyPort = useStore((st) => st.current?.proxyPort ?? 8080);
   const project = useStore((st) => st.current?.project);
@@ -149,12 +177,15 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             <div className="setting-row">
               <div className="grow">
                 <div className="title">Auto-deploy on push</div>
-                <div className="desc">Polls the branch every minute and deploys new commits.</div>
+                <div className="desc">
+                  Instant with a git webhook (<button className="link" onClick={() => navigate('/settings/webhooks')}>set one up</button>); otherwise checked every minute.
+                </div>
               </div>
               <Switch checked={s.autoDeploy} onChange={(v) => void patch(id, { autoDeploy: v })} />
             </div>
           </>
         )}
+        <DeployHook serviceId={s.id} />
         {src.type === 'local' && (
           <div className="ns-grid">
             <Field label="Path">
@@ -173,6 +204,21 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         <Field label="Start command" hint="Runs via /bin/sh -c, replacing the image's default command">
           <CommitInput mono value={s.startCommand ?? ''} placeholder="image default" onCommit={(v) => void patch(id, { startCommand: v || null })} />
         </Field>
+        {(s.cmd?.length || s.entrypoint?.length) && (
+          <div className="setting-row">
+            <div className="grow" style={{ minWidth: 0 }}>
+              <div className="title">Container arguments</div>
+              <div className="desc mono truncate">
+                {s.entrypoint?.length ? `entrypoint ${JSON.stringify(s.entrypoint)} · ` : ''}
+                {s.cmd?.length ? `command ${JSON.stringify(s.cmd)}` : 'image command'}
+              </div>
+              <div className="desc">{s.startCommand ? 'Ignored while a start command is set.' : 'Overrides only what is listed, like Docker Compose (from an import).'}</div>
+            </div>
+            <Button size="sm" variant="ghost" onClick={() => void patch(id, { cmd: null, entrypoint: null })}>
+              Clear
+            </Button>
+          </div>
+        )}
       </Section>
 
       <Section title="Schedule" icon="clock" desc="Run this service as a cron job: a one-off container on a schedule instead of always-on replicas.">
@@ -205,16 +251,31 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
               </div>
               <Switch checked={s.publicHttp} onChange={(v) => void patch(id, { publicHttp: v })} />
             </div>
-            <Field label="Custom domains" hint="Point DNS (or /etc/hosts) at this machine; Servify routes by Host header.">
+            <Field
+              label="Custom domains"
+              hint={
+                <>
+                  Point the domain's DNS at this machine. With HTTPS on (<button className="link" onClick={() => navigate('/settings/https')}>Settings → HTTPS</button>) Servify gets a certificate automatically.
+                </>
+              }
+            >
               <div className="domain-list">
-                {s.domains.map((d) => (
-                  <span key={d} className="chip mono">
-                    {d}
+                {s.domains.map((d) => {
+                  const info = s.domainInfo?.find((x) => x.domain === d);
+                  return (
+                  <span key={d} className="chip mono domain-chip" data-tls={info?.tls ?? 'off'}>
+                    <Tooltip label={tlsLabel(info)}>
+                      <span className="tls-dot" />
+                    </Tooltip>
+                    <a href={info?.url ?? `http://${d}`} target="_blank" rel="noreferrer">
+                      {d}
+                    </a>
                     <button onClick={() => void patch(id, { domains: s.domains.filter((x) => x !== d) })} aria-label={`Remove ${d}`}>
                       <Icon name="x" size={12} />
                     </button>
                   </span>
-                ))}
+                  );
+                })}
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();

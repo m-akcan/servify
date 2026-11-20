@@ -39,3 +39,21 @@
 - Edge layer subscribed after nodes registered → sync on subscribe.
 - SSE through Vite proxy can go silently stale on server restart → client watchdog (staleMs).
 - Never `lsof -ti tcp:PORT | xargs kill` — also kills clients (Vite). Use `-sTCP:LISTEN`.
+
+## Round 2 — platform features (worktree `features-v2`)
+- [x] Secrets at rest: AES-256-GCM via `crypto.ts`; services/deployments sealed by a db codec (env, git token, resolvedEnv); settings sealed in kv; boot migration + VACUUM; wrong key stops boot. Verified: canary gone from db + WAL, key file 0600.
+- [x] Settings store (`settings.ts`), owner-only writes, credentials write-only (masked on read).
+- [x] Notifications (`notify.ts`): Slack, Discord, Telegram, ntfy, SMTP, signed webhook; deploy/crash/recover/job/backup/cert/preview events; flap-safe crash alerts. Verified against local HTTP + SMTP stand-ins (not real Slack/Discord).
+- [x] Git webhooks (`hooks.ts`): GitHub/Gitea HMAC, GitLab token, constant-time, 2 MB cap; on the router (`/_servify/hooks/git`, any host) and `/api/hooks/git`; per-service deploy hooks. Verified with signed payloads + local bare repo (not GitHub delivering to a public URL).
+- [x] HTTPS (`certs.ts` + proxy): ACME HTTP-01 via acme-client with self-check + exponential backoff, renewals, SNI, HTTP→HTTPS redirect (challenge + hook paths exempt), local CA for *.localhost. Verified end-to-end against Pebble (Let's Encrypt's test CA) with real HTTP-01 validation — not against real Let's Encrypt / ports 80+443.
+- [x] Backups (`backups.ts`, `s3.ts`): pg_dumpall / mysqldump / mongodump / volume tar.gz; local, folder, S3 (SigV4, own client); restore = safety backup → wipe → re-init → replay; retention only deletes recorded keys. Round-tripped Postgres, MySQL (to MinIO), MongoDB, Redis volume — not AWS S3 itself.
+- [x] History: `logstore.ts` (one follower per replica, batched SQLite writes, resume via `since`, 7d / 200k lines) and 10s metric buckets (7d). Verified across redeploy + restart with no gaps.
+- [x] Compose import (`compose.ts`): interpolation, env_file inside base folder only, aliases for compose names, refuses bind mounts/privileged/host net/docker.sock with warnings. Verified hostname reachability + evil service unprivileged.
+- [x] Environments + PR previews (`envs.ts`): linked projects, branch override, cascade delete, same-repo PRs only, close deletes only its own preview.
+- [x] Health probes: TCP probe must stay open 300 ms (docker-proxy accepted connections for still-initialising databases).
+- [x] Brand logos for services (simple-icons, CC0) generated into `web/src/components/brandIcons.ts`; language icon after first build.
+- [x] MCP: 37 tools. Original acceptance suite: 29/29. New `scripts/acceptance-features.mjs`: 27/27.
+- [x] Review fixes: MCP `import_compose` dry run requires a write token (it reads files under base_path); environments/previews keep private-repo git tokens; Compose `command`/`entrypoint` map to Docker-style `cmd`/`entrypoint` overrides (image entrypoint kept — verified minio `server /data`, mysql flag-only command) and never adopt templates (plain redis stays password-less); port-less compose services import as workers; restore start/end and certificate changes push `service.updated` (UI banner clears — verified through the UI); unknown ACME challenge paths are routed to the app, just never redirected.
+- [x] Scheduled backups verified firing (`* * * * *`), added to the feature suite.
+- [x] Container mode rebuilt and booted on spare ports: deploy, backup (docker CLI in the image), HTTP + HTTPS routing, log history. Compose publishes 8443.
+- [x] pnpm 12's minimumReleaseAge rejected two day-old transitive packages (`@peculiar/asn1-pkcs8`, `@peculiar/asn1-x509` 3.1.0) → pinned to 3.0.0 via `overrides` in pnpm-workspace.yaml.

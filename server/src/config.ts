@@ -23,6 +23,8 @@ export const config = {
   /** Public HTTP load balancer / router. */
   proxyHost: process.env.SERVIFY_PROXY_HOST ?? '127.0.0.1',
   proxyPort: envInt('SERVIFY_PROXY_PORT', 8080),
+  /** HTTPS router (ACME certificates for real domains, the local CA for everything else). */
+  httpsPort: envInt('SERVIFY_HTTPS_PORT', 8443),
   /** Base domain for generated service URLs: <service>.<project>.<baseDomain> */
   baseDomain: process.env.SERVIFY_BASE_DOMAIN ?? 'localhost',
   /** Range used when auto-assigning public TCP ports for databases etc. */

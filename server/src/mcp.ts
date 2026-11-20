@@ -11,6 +11,9 @@ import { config } from './config.ts';
 import type { Principal } from './auth.ts';
 import { sleep } from './util.ts';
 import { replicasOf } from './engine.ts';
+import { restoreBackup } from './backups.ts';
+import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
+import { listCertificates } from './certs.ts';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
 
@@ -33,7 +36,10 @@ const INSTRUCTIONS = `Servify is a local-first PaaS running on this machine. It 
 - Scale with scale_service; replicas sit behind the load balancer (strategy configurable). Services with volumes are single-replica.
 - Variables can reference other services: \${{ postgres.DATABASE_URL }}. Variable/config changes take effect on the next deploy.
 - Deploys are async: call wait_for_deployment after create_service/deploy_service to get the outcome and build log tail.
-- Services can be referred to by id, slug, or "project/service".`;
+- Services can be referred to by id, slug, or "project/service".
+- Projects can have environments (staging, pr-12 previews…): full copies with their own URLs and data. Use list_environments / create_environment.
+- Databases and volumes can be backed up (backup_service) and restored (restore_backup). Logs and metrics are kept for 7 days.
+- import_compose turns a docker-compose.yml into a project (use dry_run first to see the mapping and warnings).`;
 
 export function buildMcpServer(principal: Principal): McpServer {
   const server = new McpServer({ name: 'servify', version: config.version }, { instructions: INSTRUCTIONS });
@@ -263,16 +269,25 @@ export function buildMcpServer(principal: Principal): McpServer {
 
   server.registerTool(
     'get_service_logs',
-    { description: 'Recent runtime logs across all replicas (prefixed with replica index).', inputSchema: { service: svcRef, tail: z.number().int().min(1).max(2000).optional(), search: z.string().optional() } },
-    wrap(async ({ service, tail, search }: { service: string; tail?: number; search?: string }) => {
-      const lines = await ops.serviceLogs(service, { tail: tail ?? 100, search });
+    {
+      description: 'Runtime logs across all replicas, kept for 7 days (prefixed with replica index). Survive redeploys and restarts.',
+      inputSchema: {
+        service: svcRef,
+        tail: z.number().int().min(1).max(2000).optional(),
+        search: z.string().optional(),
+        since_minutes: z.number().min(1).max(10080).optional().describe('Only lines from the last N minutes'),
+        deployment_id: z.string().optional().describe('Only lines from one deployment (e.g. the previous one)'),
+      },
+    },
+    wrap(async ({ service, tail, search, since_minutes, deployment_id }: { service: string; tail?: number; search?: string; since_minutes?: number; deployment_id?: string }) => {
+      const lines = await ops.serviceLogs(service, { tail: tail ?? 100, search, since: since_minutes ? Date.now() - since_minutes * 60_000 : undefined, deploymentId: deployment_id });
       return lines.map((l) => `[#${l.replica}] ${new Date(l.ts).toISOString()} ${l.text}`).join('\n') || '(no logs)';
     }),
   );
 
   server.registerTool(
     'get_metrics',
-    { description: 'Current and recent metrics: requests/s, p95 latency, errors, CPU, memory, per-replica state.', inputSchema: { service: svcRef, seconds: z.number().int().min(10).max(900).optional() } },
+    { description: 'Current and recent metrics: requests/s, p95 latency, errors, CPU, memory, per-replica state.', inputSchema: { service: svcRef, seconds: z.number().int().min(10).max(604800).optional().describe('Window; up to 7 days (longer windows are averaged)') } },
     wrap(({ service, seconds }: { service: string; seconds?: number }) => {
       const m = ops.serviceMetrics(service, seconds ?? 60);
       const pts = m.points;
@@ -348,6 +363,89 @@ export function buildMcpServer(principal: Principal): McpServer {
         summary: a.summary,
       })),
     ),
+  );
+
+  server.registerTool(
+    'backup_service',
+    { description: 'Back up a service now: databases (Postgres/MySQL/MongoDB) are dumped, other volumes archived. Returns the backup record.', inputSchema: { service: svcRef, destination: z.string().optional().describe('"local" (default) or a destination id from settings') } },
+    wrap(async ({ service, destination }: { service: string; destination?: string }) => {
+      guard();
+      return ops.backupNow(actor, service, destination);
+    }),
+  );
+
+  server.registerTool(
+    'list_backups',
+    { description: 'Backups of a service, newest first (id, status, size, destination, when).', inputSchema: { service: svcRef } },
+    wrap(({ service }: { service: string }) => ops.serviceBackups(service, 30)),
+  );
+
+  server.registerTool(
+    'restore_backup',
+    {
+      description: "Replace a service's data with a backup. Takes a safety backup first, then rebuilds the data; the service restarts. Runs in the background — poll list_backups / get_activity.",
+      inputSchema: { backup_id: z.string() },
+      annotations: { destructiveHint: true },
+    },
+    wrap(({ backup_id }: { backup_id: string }) => {
+      guard();
+      return restoreBackup(actor, backup_id);
+    }),
+  );
+
+  server.registerTool(
+    'import_compose',
+    {
+      description: 'Create a project from a docker-compose.yml. Use dry_run first: it returns the mapped services and warnings (bind mounts, privileged… are never honoured).',
+      inputSchema: {
+        yaml: z.string().describe('Contents of docker-compose.yml'),
+        env: z.string().optional().describe('Contents of the .env file used for ${VAR} interpolation'),
+        base_path: z.string().optional().describe('Absolute folder of the compose file (needed for build: contexts and env_file)'),
+        name: z.string().optional(),
+        dry_run: z.boolean().optional(),
+        deploy: z.boolean().optional().describe('Deploy right away (default true)'),
+      },
+    },
+    wrap(async ({ yaml, env, base_path, name, dry_run, deploy }: { yaml: string; env?: string; base_path?: string; name?: string; dry_run?: boolean; deploy?: boolean }) => {
+      // Even a dry run reads files under base_path (env_file, .env): write tokens only.
+      guard();
+      if (dry_run) return ops.planComposeImport({ yaml, env, basePath: base_path, name });
+      return ops.importCompose(actor, { yaml, env, basePath: base_path, name, deploy });
+    }),
+  );
+
+  server.registerTool(
+    'list_environments',
+    { description: 'Environments of a project: production plus copies like staging and pull-request previews, with their slugs (use the slug as the project for other tools).', inputSchema: { project: projRef } },
+    wrap(({ project }: { project: string }) => environmentsOf(project)),
+  );
+
+  server.registerTool(
+    'create_environment',
+    {
+      description: 'Copy a project into a new environment (fresh volumes, no custom domains) with its own URLs. Optionally build git services from another branch.',
+      inputSchema: { project: projRef, name: z.string().describe('e.g. staging'), branch: z.string().optional(), deploy: z.boolean().optional() },
+    },
+    wrap(async ({ project, name, branch, deploy }: { project: string; name: string; branch?: string; deploy?: boolean }) => {
+      guard();
+      const env = await createEnvironment(actor, project, { name, branch, deploy });
+      return { id: env.id, slug: env.slug, environment: env.envName };
+    }),
+  );
+
+  server.registerTool(
+    'set_previews',
+    { description: 'Turn pull-request preview environments on or off for a project (needs the git webhook configured on the repository).', inputSchema: { project: projRef, enabled: z.boolean() } },
+    wrap(({ project, enabled }: { project: string; enabled: boolean }) => {
+      guard();
+      return { previews: setPreviews(actor, project, enabled).previews };
+    }),
+  );
+
+  server.registerTool(
+    'list_certificates',
+    { description: 'TLS certificates for custom domains: status (issued / pending / failed), expiry and last error.', inputSchema: {} },
+    wrap(() => listCertificates()),
   );
 
   return server;

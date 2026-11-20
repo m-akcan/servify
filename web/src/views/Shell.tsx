@@ -8,6 +8,7 @@ import { getThemePref, setThemePref } from '../lib/theme.ts';
 import { api } from '../lib/api.ts';
 import { checkAuth } from '../lib/store.ts';
 import { useEffect, useState } from 'react';
+import { EnvironmentCrumb } from '../components/Environments.tsx';
 
 export function Logo({ size = 22 }: { size?: number }) {
   return (
@@ -42,14 +43,15 @@ export function Shell({ children }: { children: ReactNode }) {
   const connected = useStore((s) => s.connected);
   const authMode = useStore((s) => s.auth.authMode);
   const current = route.name === 'project' ? projects.find((p) => p.slug === route.project || p.id === route.project) : null;
+  const base = current?.parentId ? projects.find((p) => p.id === current.parentId) ?? current : current;
   const [theme, setTheme] = useState(getThemePref());
 
   const switchProject = (el: HTMLElement) =>
     openMenuAt(el, [
       { type: 'label', label: 'Projects' },
-      ...projects.map((p) => ({
+      ...projects.filter((p) => !p.parentId).map((p) => ({
         label: p.name,
-        icon: (current?.id === p.id ? 'check' : 'dot') as any,
+        icon: (base?.id === p.id ? 'check' : 'dot') as any,
         onSelect: () => navigate(projectPath(p.slug)),
       })),
       { type: 'sep' as const },
@@ -70,12 +72,16 @@ export function Shell({ children }: { children: ReactNode }) {
           <span className="brand-name">servify</span>
         </button>
         <span className="crumb-sep">/</span>
-        {current ? (
-          <button className="crumb" onClick={(e) => switchProject(e.currentTarget)}>
-            <span className="crumb-dot" style={{ background: current.color }} />
-            {current.name}
-            <Icon name="chevronDown" size={14} />
-          </button>
+        {current && base ? (
+          <>
+            <button className="crumb" onClick={(e) => switchProject(e.currentTarget)}>
+              <span className="crumb-dot" style={{ background: base.color }} />
+              {base.name}
+              <Icon name="chevronDown" size={14} />
+            </button>
+            <span className="crumb-sep">/</span>
+            <EnvironmentCrumb current={current} />
+          </>
         ) : (
           <button className={`crumb ${route.name === 'home' ? 'active' : ''}`} onClick={() => navigate('/')}>
             {route.name === 'agents' ? 'Agents & API' : route.name === 'settings' ? 'Settings' : 'Projects'}
@@ -96,6 +102,11 @@ export function Shell({ children }: { children: ReactNode }) {
             <button className={`btn btn-ghost btn-sm ${route.name === 'agents' ? 'active' : ''}`} onClick={() => navigate('/agents')}>
               <Icon name="bot" size={15} />
               Agents
+            </button>
+          </Tooltip>
+          <Tooltip label="Settings — HTTPS, notifications, backups, webhooks" side="bottom">
+            <button className={`btn btn-ghost btn-sm btn-icon ${route.name === 'settings' ? 'active' : ''}`} onClick={() => navigate('/settings')} aria-label="Settings">
+              <Icon name="gear" size={15} />
             </button>
           </Tooltip>
           <Tooltip label={theme === 'dark' ? 'Light theme' : 'Dark theme'} side="bottom">

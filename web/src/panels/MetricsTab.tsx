@@ -18,7 +18,7 @@ function downsample(points: ServiceMetricsPoint[], max = 180): ServiceMetricsPoi
 }
 
 export function MetricsTab({ service: s }: { service: ServiceView }) {
-  const [range, setRange] = useState<'60' | '300' | '900'>('300');
+  const [range, setRange] = useState<'300' | '900' | '3600' | '21600' | '86400' | '604800'>('900');
   const [points, setPoints] = useState<ServiceMetricsPoint[]>([]);
   useEffect(() => {
     let alive = true;
@@ -28,7 +28,7 @@ export function MetricsTab({ service: s }: { service: ServiceView }) {
         .then((m) => alive && setPoints(downsample(m.points)))
         .catch(() => {});
     void load();
-    const i = setInterval(load, 2000);
+    const i = setInterval(load, Number(range) <= 900 ? 2000 : 15000);
     return () => {
       alive = false;
       clearInterval(i);
@@ -43,15 +43,18 @@ export function MetricsTab({ service: s }: { service: ServiceView }) {
     <div className="tab-pad col" style={{ gap: 16 }}>
       <div className="row">
         <div className="grow faint" style={{ fontSize: 12 }}>
-          In-memory metrics, sampled every second. Nothing leaves this machine.
+          {Number(range) <= 900 ? 'Sampled every second.' : 'Averaged from 10-second samples.'} Kept for 7 days on this machine.
         </div>
         <Segmented
           value={range}
           onChange={setRange}
           options={[
-            { value: '60', label: '1m' },
             { value: '300', label: '5m' },
             { value: '900', label: '15m' },
+            { value: '3600', label: '1h' },
+            { value: '21600', label: '6h' },
+            { value: '86400', label: '24h' },
+            { value: '604800', label: '7d' },
           ]}
         />
       </div>

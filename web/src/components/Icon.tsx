@@ -1,6 +1,14 @@
 /** Hand-drawn icon set on a 24px grid, 1.6 stroke. */
 const P: Record<string, string> = {
   plus: 'M12 5v14M5 12h14',
+  gear: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
+  bell: 'M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0',
+  archive: 'M3 4h18v4H3zM5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4',
+  mail: 'M3 6h18v12H3zM3 7l9 6 9-6',
+  webhook: 'M18 17h-6c-1.1 0-2 .9-2.5 1.9A4 4 0 1 1 3 16M6.6 17l3.1-5.8c.5-1-.1-2.2-.5-3.1a4 4 0 1 1 6.9-4M12 6l3.1 5.7c.5 1 1.7 1.3 2.9 1.3a4 4 0 0 1 0 8',
+  branch: 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9',
+  send: 'M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z',
+  certificate: 'M12 2l7 3v6c0 5-3 8.5-7 11-4-2.5-7-6-7-11V5l7-3zM9 12l2 2 4-4',
   minus: 'M5 12h14',
   x: 'M6 6l12 12M18 6L6 18',
   check: 'M5 12.5l4.5 4.5L19 7',
@@ -99,7 +107,24 @@ export function Icon({ name, size = 16, stroke = 1.6, className, style }: { name
   );
 }
 
-/** Branded monogram tiles for services — consistent, no third-party logos. */
+import { BRAND_ICONS } from './brandIcons.ts';
+
+/** A brand logo (simple-icons) drawn in its brand colour — or in the text colour for near-black marks. */
+export function BrandMark({ icon, size = 16, className = '', inherit = false }: { icon: string; size?: number; className?: string; inherit?: boolean }) {
+  const b = BRAND_ICONS[icon];
+  if (!b) return null;
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" className={`brand-mark ${className}`} aria-label={b.title} role="img" style={inherit ? undefined : { color: b.neutral ? 'var(--text)' : b.hex }}>
+      <path d={b.path} fill="currentColor" />
+    </svg>
+  );
+}
+
+export function hasBrand(icon: string) {
+  return icon in BRAND_ICONS;
+}
+
+/** Fallback monogram tiles for services without a known logo. */
 const GLYPHS: Record<string, { mono: string; hue: string }> = {
   postgres: { mono: 'Pg', hue: '#7aa7ff' },
   redis: { mono: 'Rd', hue: '#ff7a6b' },
@@ -122,6 +147,14 @@ export function ServiceGlyph({ icon, name, size = 34 }: { icon: string; name: st
   const g = GLYPHS[icon];
   const fontSize = Math.round(size * 0.36);
   const style: React.CSSProperties = { width: size, height: size, borderRadius: Math.round(size * 0.3), fontSize };
+  const brand = BRAND_ICONS[icon];
+  if (brand) {
+    return (
+      <div className="glyph glyph-brand" title={brand.title} style={{ ...style, ['--hue' as any]: brand.neutral ? 'var(--text-2)' : brand.hex }}>
+        <BrandMark icon={icon} size={Math.round(size * 0.52)} inherit />
+      </div>
+    );
+  }
   if (g) {
     return (
       <div className="glyph" style={{ ...style, ['--hue' as any]: g.hue }}>

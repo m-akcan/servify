@@ -127,6 +127,15 @@ export async function loadSystem() {
   store.set({ system });
 }
 
+let refreshTimer: number | null = null;
+function refreshProjectsSoon() {
+  if (refreshTimer !== null) clearTimeout(refreshTimer);
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = null;
+    void loadProjects();
+  }, 300);
+}
+
 export async function loadProjects() {
   const projects = await api.get<ProjectListItem[]>('/projects');
   store.set({ projects, projectsLoaded: true });
@@ -245,13 +254,15 @@ function applyEvent(ev: ServerEvent) {
       store.set({
         projects: exists
           ? s.projects.map((p) => (p.id === ev.project.id ? { ...p, ...ev.project } : p))
-          : [...s.projects, { ...ev.project, serviceCount: 0, running: 0, services: [] }],
+          : [...s.projects, { ...ev.project, serviceCount: 0, environments: 0, running: 0, services: [] }],
         current: cur && cur.project.id === ev.project.id ? { ...cur, project: ev.project } : cur,
       });
+      if (ev.project.parentId) refreshProjectsSoon(); // environment counts on the base project
       return;
     }
     case 'project.deleted': {
       store.set({ projects: s.projects.filter((p) => p.id !== ev.projectId) });
+      refreshProjectsSoon();
       return;
     }
     case 'service.updated': {

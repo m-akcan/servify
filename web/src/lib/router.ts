@@ -4,13 +4,13 @@ export type Route =
   | { name: 'home' }
   | { name: 'project'; project: string; service?: string; tab?: string }
   | { name: 'agents' }
-  | { name: 'settings' };
+  | { name: 'settings'; section?: string };
 
 function parse(path: string): Route {
   const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
   if (parts[0] === 'p' && parts[1]) return { name: 'project', project: parts[1], service: parts[2], tab: parts[3] };
   if (parts[0] === 'agents') return { name: 'agents' };
-  if (parts[0] === 'settings') return { name: 'settings' };
+  if (parts[0] === 'settings') return { name: 'settings', section: parts[1] };
   return { name: 'home' };
 }
 

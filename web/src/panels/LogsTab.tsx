@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ServiceView, LogLine } from '../lib/types.ts';
-import { sse } from '../lib/api.ts';
+import { sse, api } from '../lib/api.ts';
 import { LogView, type ViewLine } from '../components/LogView.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { Tooltip } from '../components/ui.tsx';
-import { useStore } from '../lib/store.ts';
+import { useStore, deploymentsFor } from '../lib/store.ts';
+import { timeAgo } from '../lib/format.ts';
+import { toastError } from '../components/ui.tsx';
 
 const HUES = [78, 160, 30, 220, 330, 270, 190, 0];
 
@@ -20,6 +22,43 @@ export function LogsTab({ service: s }: { service: ServiceView }) {
   const buffer = useRef<(LogLine & { key: number })[]>([]);
   const k = useRef(0);
   const replicas = useStore((st) => st.current?.replicas[s.id] ?? []);
+  const current = useStore((st) => st.current);
+  const deps = deploymentsFor(current, s.id).filter((d) => d.startedAt);
+  /** null = live stream; otherwise a frozen view loaded from history. */
+  const [history, setHistory] = useState<{ label: string } | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const liveLines = useRef<(LogLine & { key: number })[]>([]);
+
+  const loadHistory = async (params: Record<string, string>, label: string) => {
+    try {
+      const qs = new URLSearchParams({ tail: '2000', ...params }).toString();
+      const arr = await api.get<LogLine[]>(`/services/${s.id}/logs?${qs}`);
+      if (!history) liveLines.current = lines;
+      setHistory({ label });
+      setPaused(true);
+      setLines(arr.map((l) => ({ ...l, key: k.current++ })));
+    } catch (e) {
+      toastError(e, 'Could not load logs');
+    }
+  };
+  const backToLive = () => {
+    setHistory(null);
+    setLines(liveLines.current);
+    setPaused(false);
+  };
+  const loadOlder = async () => {
+    const oldest = lines[0]?.ts;
+    setLoadingOlder(true);
+    try {
+      const arr = await api.get<LogLine[]>(`/services/${s.id}/logs?tail=500${oldest ? `&until=${oldest - 1}` : ''}`);
+      if (!arr.length) return toastError(new Error('That is everything kept for this service (7 days).'), 'No earlier logs');
+      setLines((prev) => [...arr.map((l) => ({ ...l, key: k.current++ })), ...prev]);
+    } catch (e) {
+      toastError(e, 'Could not load logs');
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   useEffect(() => {
     setLines([]);
@@ -87,6 +126,30 @@ export function LogsTab({ service: s }: { service: ServiceView }) {
           </div>
         )}
         <div className="spacer" />
+        {deps.length > 0 && (
+          <select
+            className="select logs-dep-select"
+            value=""
+            onChange={(e) => {
+              const d = deps.find((x) => x.id === e.target.value);
+              if (d) void loadHistory({ deployment: d.id }, `deployment ${d.id.slice(-6)} · ${timeAgo(d.createdAt)}`);
+            }}
+            aria-label="Show logs of a deployment"
+          >
+            <option value="">Deployment…</option>
+            {deps.slice(0, 20).map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.id === s.activeDeploymentId ? '● ' : ''}
+                {d.id.slice(-6)} · {d.status} · {timeAgo(d.createdAt)}
+              </option>
+            ))}
+          </select>
+        )}
+        <Tooltip label="Load earlier lines">
+          <button className="btn btn-ghost btn-sm btn-icon" onClick={() => void loadOlder()} aria-label="Load earlier" disabled={loadingOlder}>
+            <Icon name="history" size={14} />
+          </button>
+        </Tooltip>
         <Tooltip label={showTs ? 'Hide timestamps' : 'Show timestamps'}>
           <button className={`btn btn-ghost btn-sm btn-icon ${showTs ? 'active' : ''}`} onClick={() => setShowTs(!showTs)} aria-label="Timestamps">
             <Icon name="clock" size={14} />
@@ -118,8 +181,37 @@ export function LogsTab({ service: s }: { service: ServiceView }) {
             <Icon name="trash" size={14} />
           </button>
         </Tooltip>
-        <span className={`live-pill ${connected && !paused ? 'on' : ''}`}>{paused ? 'PAUSED' : connected ? 'LIVE' : '…'}</span>
+        {history ? (
+          <button className="live-pill history" onClick={backToLive}>
+            BACK TO LIVE
+          </button>
+        ) : (
+          <span className={`live-pill ${connected && !paused ? 'on' : ''}`}>{paused ? 'PAUSED' : connected ? 'LIVE' : '…'}</span>
+        )}
       </div>
+      {(history || (query.length > 1 && !history)) && (
+        <div className="logs-history-bar">
+          {history ? (
+            <>
+              <Icon name="history" size={13} />
+              <span className="grow">
+                Showing <b>{history.label}</b> from the log history
+              </span>
+              <button className="link" onClick={backToLive}>
+                Back to live
+              </button>
+            </>
+          ) : (
+            <>
+              <Icon name="search" size={13} />
+              <span className="grow">Filtering what's loaded.</span>
+              <button className="link" onClick={() => void loadHistory({ search: query }, `“${query}” across 7 days`)}>
+                Search the last 7 days
+              </button>
+            </>
+          )}
+        </div>
+      )}
       <LogView lines={view} showTs={showTs} highlight={query} live={!paused} emptyText={s.activeDeploymentId ? 'No output yet. Logs from all replicas stream here.' : 'Deploy the service to see runtime logs.'} className="runtime-log" />
     </div>
   );

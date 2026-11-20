@@ -12,9 +12,15 @@ import { startEngine } from './engine.ts';
 import { startProxy } from './proxy.ts';
 import { startMetrics } from './metrics.ts';
 import { startBackgroundJobs } from './jobs.ts';
-import { sessionsTable } from './db.ts';
+import { sessionsTable, migrateSealing } from './db.ts';
+import { SealError, keySource, keyPath } from './crypto.ts';
 import { recoverInterrupted } from './deployer.ts';
 import { startScheduler } from './cronjobs.ts';
+import { handleGitWebhook, handleDeployHook, MAX_HOOK_BODY } from './hooks.ts';
+import { startCertificates } from './certs.ts';
+import { startBackups } from './backups.ts';
+import { startLogCollector, flushLogs } from './logstore.ts';
+import { startEnvironments } from './envs.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -41,9 +47,32 @@ async function main() {
     process.exit(1);
   }
 
+  try {
+    const sealed = migrateSealing();
+    if (sealed) console.log(`  [secrets] encrypted ${sealed} stored record(s) at rest`);
+    if (keySource === 'created') console.log(`  [secrets] created master key ${keyPath} — back it up; secrets can't be recovered without it`);
+  } catch (e) {
+    if (e instanceof SealError) {
+      console.error(`\n  ✗ ${e.message}\n`);
+      process.exit(1);
+    }
+    throw e;
+  }
+
   const app = new Hono();
   // Unauthenticated liveness probe (no data exposed).
   app.get('/api/health', async (c) => c.json({ ok: true, docker: await docker.ping(), version: config.version }));
+  // Git webhooks authenticate by signature, so they sit in front of the host check and session auth.
+  app.post('/api/hooks/git', async (c) => {
+    if (Number(c.req.header('content-length') ?? 0) > MAX_HOOK_BODY) return c.json({ error: 'payload too large' }, 413);
+    const raw = Buffer.from(await c.req.arrayBuffer());
+    const r = await handleGitWebhook(Object.fromEntries(c.req.raw.headers), raw);
+    return c.json(r.body, r.status as any);
+  });
+  app.post('/api/hooks/deploy/:id/:token', (c) => {
+    const r = handleDeployHook(c.req.param('id'), c.req.param('token'));
+    return c.json(r.body, r.status as any);
+  });
   app.route('/api', api);
 
   app.all('/mcp', async (c) => {
@@ -85,11 +114,16 @@ async function main() {
   });
 
   recoverInterrupted();
+  (await import('./ops.ts')).upgradeIcons();
   const proxyPort = await startProxy();
   await startEngine();
   startMetrics();
   startBackgroundJobs();
   startScheduler();
+  startCertificates();
+  startBackups();
+  startLogCollector();
+  startEnvironments();
   setInterval(() => sessionsTable.prune(), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
@@ -100,6 +134,7 @@ async function main() {
   ╰───────────────────────────────────────────────╯
   dashboard   ${dash}
   apps        http://<service>.<project>.${config.baseDomain}:${proxyPort}
+  https       https://<service>.<project>.${config.baseDomain}:${config.httpsPort}
   mcp         ${dash}/mcp
   docker      ${dockerInfo.version} (${dockerInfo.os})
   data        ${config.dataDir}
@@ -109,4 +144,12 @@ async function main() {
 }
 
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    try {
+      flushLogs();
+    } catch {}
+    process.exit(0);
+  });
+}
 main();

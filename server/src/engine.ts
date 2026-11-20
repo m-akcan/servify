@@ -13,6 +13,7 @@ import { bus, SYSTEM, recordActivity } from './events.ts';
 import { config } from './config.ts';
 import { sleep, id as newId } from './util.ts';
 import { kv } from './db.ts';
+import { notify } from './notify.ts';
 
 /** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
 export const INSTANCE_ID = (() => {
@@ -157,11 +158,43 @@ export function refreshServiceStatus(serviceId: string) {
     else next = reps.length ? 'crashed' : 'deploying';
   }
   if (next !== svc.status) {
+    const prev = svc.status;
     svc.status = next;
     servicesTable.put(svc);
     bus.publish({ type: 'service.updated', service: svc });
+    const project = projectsTable.get(svc.projectId);
+    if (next === 'crashed' && (prev === 'running' || prev === 'degraded')) {
+      // At most one "down" per service per 10 minutes, and "recovered" only answers a "down" that was sent,
+      // so a flapping service produces two messages, not a stream.
+      const last = lastCrashNotice.get(svc.id) ?? 0;
+      if (Date.now() - last > 10 * 60_000) {
+        lastCrashNotice.set(svc.id, Date.now());
+        crashedAt.set(svc.id, Date.now());
+        notify({
+          event: 'service.crashed',
+          level: 'error',
+          title: `${svc.name} is down`,
+          message: `${project?.name ?? ''}: no replica of ${svc.name} is healthy. Servify keeps restarting it; check the logs.`,
+          projectId: svc.projectId,
+          serviceId: svc.id,
+        });
+      }
+    } else if (next === 'running' && crashedAt.has(svc.id)) {
+      const mins = Math.max(1, Math.round((Date.now() - crashedAt.get(svc.id)!) / 60_000));
+      crashedAt.delete(svc.id);
+      notify({
+        event: 'service.recovered',
+        level: 'success',
+        title: `${svc.name} recovered`,
+        message: `${project?.name ?? ''}: ${svc.name} is healthy again after ~${mins} min.`,
+        projectId: svc.projectId,
+        serviceId: svc.id,
+      });
+    }
   }
 }
+const lastCrashNotice = new Map<string, number>();
+const crashedAt = new Map<string, number>();
 
 /** The schedule that is actually deployed (editing the setting only takes effect on deploy). */
 export function deployedSchedule(svc: Service, dep?: Deployment | null): string | null {
@@ -229,12 +262,15 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
       Init: true,
     },
     NetworkingConfig: {
-      EndpointsConfig: { [network]: { Aliases: [svc.slug, `${svc.slug}-${index}`] } },
+      EndpointsConfig: { [network]: { Aliases: [...new Set([svc.slug, `${svc.slug}-${index}`, ...(svc.aliases ?? [])])] } },
     },
   };
   if (dep.config.startCommand) {
     spec.Entrypoint = ['/bin/sh', '-c'];
     spec.Cmd = [dep.config.startCommand];
+  } else {
+    if (dep.config.entrypoint?.length) spec.Entrypoint = dep.config.entrypoint;
+    if (dep.config.cmd?.length) spec.Cmd = dep.config.cmd;
   }
   const name = containerName(project, svc, dep, index);
   // A stale container with the same name (e.g. from a crash mid-create) must go first.
@@ -323,15 +359,30 @@ async function adopt(cid: string): Promise<Runtime | null> {
 
 // ───────────────────────────── health probing ─────────────────────────────
 
+/**
+ * TCP health: the connection must open *and stay open* for a moment. Docker's port forwarder accepts
+ * connections even while nothing listens inside the container, then closes them immediately — a bare
+ * "connected" check would mark a still-initialising database healthy.
+ */
 function tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = net.connect({ host, port });
+    let settled = false;
+    let hold: NodeJS.Timeout | null = null;
     const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (hold) clearTimeout(hold);
       sock.destroy();
       resolve(ok);
     };
     sock.setTimeout(timeoutMs, () => done(false));
-    sock.once('connect', () => done(true));
+    sock.once('connect', () => {
+      hold = setTimeout(() => done(true), 300);
+    });
+    sock.on('data', () => {}); // greetings (MySQL, SMTP…) are fine
+    sock.once('end', () => done(false));
+    sock.once('close', () => done(false));
     sock.once('error', () => done(false));
   });
 }

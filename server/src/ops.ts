@@ -11,7 +11,13 @@ import { getTemplate, templates } from './templates.ts';
 import { queueDeployment, readDeploymentLog, isDeploying } from './deployer.ts';
 import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, volumeName, deployedSchedule } from './engine.ts';
 import { docker, demuxLines } from './docker.ts';
-import { referencedServices, publicUrl, resolveEnv } from './vars.ts';
+import { referencedServices, publicUrl, resolveEnv, hostUrl } from './vars.ts';
+import { certsTable } from './db.ts';
+import { isLocalHost } from './certs.ts';
+import { getSettings, destinationById } from './settings.ts';
+import { backupMethod, backupService, listBackups, isRestoring } from './backups.ts';
+import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
+import { planCompose, planToSpec } from './compose.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
@@ -33,10 +39,23 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.url = project && s.protocol === 'http' && s.publicHttp ? publicUrl(s, project) : null;
   out.tcpAddress = s.publicTcpPort ? `${config.proxyHost === '0.0.0.0' ? 'localhost' : config.proxyHost}:${s.publicTcpPort}` : null;
   out.pendingChanges = pendingChanges(s);
+  const httpsOn = getSettings().https.enabled;
+  out.domainInfo = s.domains.map((d) => {
+    const c = certsTable.get(d);
+    return {
+      domain: d,
+      url: hostUrl(d),
+      tls: isLocalHost(d) ? 'local' : !httpsOn ? 'off' : c?.status ?? 'pending',
+      expiresAt: c?.expiresAt ?? null,
+      error: c?.status === 'issued' ? null : c?.error ?? null,
+    };
+  });
   const live = deployedSchedule(s);
   out.deployedSchedule = live;
   out.nextRunAt = live && !s.stopped ? nextRun(live)?.getTime() ?? null : null;
   out.jobRunning = isJobRunning(s.id);
+  out.backupMethod = backupMethod(s);
+  out.restoring = isRestoring(s.id);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
 
@@ -59,6 +78,7 @@ export function pendingChanges(s: Service): string[] {
   if (JSON.stringify(c.env) !== JSON.stringify(s.env)) out.push('variables');
   if ((c.port ?? null) !== (s.port ?? null) && s.port !== null) out.push('port');
   if ((c.startCommand ?? null) !== (s.startCommand ?? null)) out.push('start command');
+  if (JSON.stringify(c.cmd ?? null) !== JSON.stringify(s.cmd ?? null) || JSON.stringify(c.entrypoint ?? null) !== JSON.stringify(s.entrypoint ?? null)) out.push('command');
   if (JSON.stringify(c.volumes) !== JSON.stringify(s.volumes)) out.push('volumes');
   if (JSON.stringify(c.resources) !== JSON.stringify(s.resources)) out.push('resources');
   if (c.protocol !== s.protocol) out.push('networking');
@@ -71,10 +91,12 @@ export function pendingChanges(s: Service): string[] {
 // ───────────────────────────── projects ─────────────────────────────
 
 export function listProjects() {
-  return projectsTable.all('ORDER BY created_at ASC').map((p) => {
+  const all = projectsTable.all('ORDER BY created_at ASC');
+  return all.map((p) => {
     const svcs = servicesTable.all('WHERE project_id = ?', p.id);
     return {
       ...p,
+      environments: p.parentId ? 0 : all.filter((x) => x.parentId === p.id).length,
       serviceCount: svcs.length,
       running: svcs.filter((s) => s.status === 'running').length,
       services: svcs.map((s) => ({ id: s.id, name: s.name, icon: s.icon, status: s.status })),
@@ -139,10 +161,12 @@ export function updateProject(actor: Actor, projectId: string, patch: { name?: s
 
 export async function deleteProject(actor: Actor, projectId: string) {
   const p = getProjectOrThrow(projectId);
+  // A base project takes its environments (and previews) with it.
+  if (!p.parentId) for (const env of projectsTable.all().filter((x) => x.parentId === p.id)) await deleteProject(actor, env.id);
   for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true });
   projectsTable.delete(p.id);
   bus.publish({ type: 'project.deleted', projectId: p.id });
-  recordActivity(actor, 'project.deleted', `Deleted project ${p.name}`);
+  recordActivity(actor, 'project.deleted', p.parentId ? `Deleted environment ${p.envName ?? p.slug} of ${p.name}` : `Deleted project ${p.name}`);
   setTimeout(() => docker.removeNetwork(networkName(p.id)), 15_000);
 }
 
@@ -194,13 +218,77 @@ function inferName(input: CreateServiceInput): string {
   return 'service';
 }
 
+/** Icon key for a Docker image (matched against the brand logo set in the dashboard). */
+export function iconForImage(image: string): string | null {
+  const img = image.toLowerCase().split('@')[0];
+  const rules: [RegExp, string][] = [
+    [/postgres|postgis|timescale|pgvector|supabase\/postgres/, 'postgres'],
+    [/mariadb/, 'mariadb'],
+    [/mysql|percona/, 'mysql'],
+    [/mongo/, 'mongo'],
+    [/redis|valkey|keydb|dragonfly/, 'redis'],
+    [/minio/, 'bucket'],
+    [/n8n/, 'flow'],
+    [/uptime-kuma/, 'pulse'],
+    [/ollama/, 'spark'],
+    [/traefik/, 'wave'],
+    [/nginx/, 'nginx'],
+    [/caddy/, 'caddy'],
+    [/adminer/, 'table'],
+    [/grafana/, 'grafana'],
+    [/prometheus/, 'prometheus'],
+    [/rabbitmq/, 'rabbitmq'],
+    [/elasticsearch|opensearch/, 'elasticsearch'],
+    [/kafka|redpanda/, 'kafka'],
+    [/meilisearch/, 'meilisearch'],
+    [/clickhouse/, 'clickhouse'],
+    [/keycloak/, 'keycloak'],
+    [/gitea|forgejo/, 'gitea'],
+    [/gitlab/, 'gitlab'],
+    [/oven\/bun|(^|\/)bun(:|$)/, 'bun'],
+    [/deno/, 'deno'],
+    [/(^|\/)node(:|$)/, 'node'],
+    [/(^|\/)python(:|$)/, 'python'],
+    [/golang|(^|\/)go(:|$)/, 'go'],
+    [/(^|\/)rust(:|$)/, 'rust'],
+    [/(^|\/)ruby(:|$)/, 'ruby'],
+    [/(^|\/)php(:|$)/, 'php'],
+    [/(^|\/)alpine(:|$)/, 'alpine'],
+    [/(^|\/)ubuntu(:|$)/, 'ubuntu'],
+    [/(^|\/)debian(:|$)/, 'debian'],
+  ];
+  for (const [re, key] of rules) if (re.test(img)) return key;
+  return null;
+}
+
+/** Icon key for a zero-config build ("node (pnpm, next.js)", "python", …). */
+export function iconForStack(stack: string | null | undefined): string | null {
+  const s = (stack ?? '').toLowerCase();
+  if (s.includes('next.js')) return 'next';
+  if (s.startsWith('node')) return 'node';
+  if (s.startsWith('static site')) return 'vite';
+  if (s.startsWith('static')) return 'static';
+  for (const k of ['python', 'go', 'rust', 'deno', 'php', 'ruby']) if (s.startsWith(k)) return k;
+  return null;
+}
+
+/** Boot: give services created before the logo set existed a recognisable icon. */
+export function upgradeIcons() {
+  for (const svc of servicesTable.all()) {
+    if (svc.icon !== 'box') continue;
+    const next = svc.source.type === 'image' ? iconForImage(svc.source.image) : null;
+    if (next) {
+      svc.icon = next;
+      servicesTable.put(svc);
+    }
+  }
+}
+
 function iconFor(input: CreateServiceInput): string {
   if (input.templateId) return getTemplate(input.templateId)?.icon ?? 'box';
   if (input.repo) return 'git';
   if (input.path) return 'folder';
-  const img = (input.image ?? '').toLowerCase();
-  for (const k of ['postgres', 'redis', 'mysql', 'mongo', 'nginx', 'node', 'python', 'caddy', 'traefik']) if (img.includes(k)) return k === 'traefik' ? 'wave' : k;
-  return 'box';
+  return iconForImage(input.image ?? '') ?? 'box';
 }
 
 /** First free grid slot spiralling out from (ox, oy). */
@@ -360,10 +448,22 @@ export const updateServiceInput = z.object({
   publicTcpPort: z.number().int().min(0).max(65535).nullable().optional().describe('Host port for the TCP proxy; 0 = pick a free one; null = off'),
   volumes: z.array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/') })).optional(),
   startCommand: z.string().nullable().optional(),
+  cmd: z.array(z.string()).nullable().optional().describe('Override only the image CMD (argv array). Ignored when startCommand is set.'),
+  entrypoint: z.array(z.string()).nullable().optional().describe('Override only the image ENTRYPOINT (argv array).'),
   buildCommand: z.string().nullable().optional(),
   resources: z.object({ cpus: z.number().positive().max(64).nullable().optional(), memoryMb: z.number().int().min(16).nullable().optional() }).optional(),
   autoDeploy: z.boolean().optional(),
   secretKeys: z.array(z.string()).optional(),
+  backup: z
+    .object({
+      enabled: z.boolean().optional(),
+      schedule: z.string().optional().describe('Cron expression, e.g. "0 3 * * *" for 03:00 daily'),
+      retention: z.number().int().min(1).max(365).optional().describe('How many backups to keep'),
+      destinationId: z.string().optional().describe('"local" or a destination id from settings'),
+    })
+    .nullable()
+    .optional()
+    .describe('Scheduled backups of the service data (databases are dumped, other volumes archived)'),
   schedule: z.string().nullable().optional().describe('Cron expression (e.g. "*/15 * * * *", "@daily"). Turns the service into a scheduled job; null to clear.'),
   x: z.number().optional(),
   y: z.number().optional(),
@@ -441,10 +541,22 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     set('publicTcpPort', patch.publicTcpPort, 'TCP proxy');
   }
   if (patch.startCommand !== undefined) set('startCommand', patch.startCommand?.trim() || null, 'start command');
+  if (patch.cmd !== undefined) set('cmd', patch.cmd?.length ? patch.cmd : null, 'command');
+  if (patch.entrypoint !== undefined) set('entrypoint', patch.entrypoint?.length ? patch.entrypoint : null, 'entrypoint');
   if (patch.buildCommand !== undefined) set('buildCommand', patch.buildCommand?.trim() || null, 'build command');
   if (patch.resources) set('resources', { ...svc.resources, ...patch.resources } as Service['resources'], 'resources');
   if (patch.autoDeploy !== undefined) set('autoDeploy', patch.autoDeploy, 'auto-deploy');
   if (patch.secretKeys !== undefined) set('secretKeys', patch.secretKeys, 'secrets');
+  if (patch.backup !== undefined) {
+    if (patch.backup === null) set('backup', null, 'backups');
+    else {
+      const b = { enabled: false, schedule: '0 3 * * *', retention: 7, destinationId: 'local', ...(svc.backup ?? {}), ...patch.backup };
+      const err = validateCron(b.schedule);
+      if (err) throw new HttpError(400, `invalid backup schedule: ${err}`);
+      if (!destinationById(b.destinationId)) throw new HttpError(400, `unknown backup destination: ${b.destinationId}`);
+      set('backup', b, 'backups');
+    }
+  }
   if (patch.schedule !== undefined) {
     const sched = patch.schedule?.trim() || null;
     if (sched) {
@@ -596,78 +708,20 @@ export function previewVariables(serviceId: string) {
 
 // ───────────────────────────── logs, exec, metrics ─────────────────────────────
 
-export type LogLine = { ts: number; replica: number; deploymentId: string; stream: 'stdout' | 'stderr'; text: string };
+export type { LogLine } from './logstore.ts';
 
-function parseTs(line: string): { ts: number; text: string } {
-  const sp = line.indexOf(' ');
-  const t = Date.parse(line.slice(0, sp));
-  if (sp > 0 && Number.isFinite(t)) return { ts: t, text: line.slice(sp + 1) };
-  return { ts: Date.now(), text: line };
-}
-
-export async function serviceLogs(serviceId: string, opts: { tail?: number; since?: number; search?: string } = {}): Promise<LogLine[]> {
+/** Runtime logs from the persistent store: survive redeploys, scaling and restarts. */
+export async function serviceLogs(
+  serviceId: string,
+  opts: { tail?: number; since?: number; until?: number; search?: string; deploymentId?: string } = {},
+): Promise<LogLine[]> {
   const svc = getServiceOrThrow(serviceId);
-  const reps = replicasOf(svc.id);
-  const tail = Math.min(opts.tail ?? 200, 5000);
-  const all: LogLine[] = [];
-  await Promise.all(
-    reps.map(async (r) => {
-      try {
-        const res = await docker.logs(r.containerId, { tail, since: opts.since ? Math.floor(opts.since / 1000) : undefined });
-        for await (const f of demuxLines(res)) {
-          const { ts, text } = parseTs(f.text);
-          all.push({ ts, replica: r.index, deploymentId: r.deploymentId, stream: f.stream, text });
-        }
-      } catch {}
-    }),
-  );
-  let out = all.sort((a, b) => a.ts - b.ts);
-  if (opts.search) {
-    const q = opts.search.toLowerCase();
-    out = out.filter((l) => l.text.toLowerCase().includes(q));
-  }
-  return out.slice(-tail);
+  return queryLogs(svc.id, opts);
 }
 
 /** Follow logs of every replica, including ones that appear later. Returns a stop function. */
 export function followServiceLogs(serviceId: string, onLine: (l: LogLine) => void): () => void {
-  const following = new Map<string, () => void>();
-  let stopped = false;
-  const attach = (r: Replica) => {
-    if (following.has(r.containerId) || stopped) return;
-    let res: any = null;
-    let dead = false;
-    following.set(r.containerId, () => {
-      dead = true;
-      res?.destroy();
-    });
-    (async () => {
-      try {
-        res = await docker.logs(r.containerId, { follow: true, tail: 0 });
-        if (dead) return res.destroy();
-        for await (const f of demuxLines(res)) {
-          const { ts, text } = parseTs(f.text);
-          onLine({ ts, replica: r.index, deploymentId: r.deploymentId, stream: f.stream, text });
-        }
-      } catch {}
-      following.delete(r.containerId);
-    })();
-  };
-  const sync = () => {
-    const reps = replicasOf(serviceId);
-    const ids = new Set(reps.map((r) => r.containerId));
-    for (const r of reps) if (r.dockerState === 'running') attach(r);
-    for (const [cid, stop] of following) if (!ids.has(cid)) stop();
-  };
-  sync();
-  const unsub = bus.subscribe((ev) => {
-    if (ev.type === 'replicas' && ev.serviceId === serviceId) sync();
-  });
-  return () => {
-    stopped = true;
-    unsub();
-    for (const stop of following.values()) stop();
-  };
+  return subscribeLogs(serviceId, onLine);
 }
 
 export async function execInService(actor: Actor, serviceId: string, command: string, replica?: number) {
@@ -813,7 +867,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: src.volumes, healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: src.volumes, healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -835,7 +889,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -870,7 +924,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
     const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y };
     if (tpl) input.templateId = tpl.id;
     else if (src.type === 'image') input.image = src.image;
-    else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile });
+    else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile, token: src.token });
     else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
     if (raw.protocol) input.protocol = raw.protocol;
     if (raw.port) input.port = raw.port;
@@ -897,6 +951,10 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),
       schedule: raw.schedule ?? null,
+      backup: raw.backup ?? null,
+      aliases: (raw.aliases ?? []).filter((a) => /^[a-z0-9]([a-z0-9_.-]*[a-z0-9])?$/.test(a)),
+      cmd: raw.cmd ?? null,
+      entrypoint: raw.entrypoint ?? null,
     } satisfies Partial<Service>);
     if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
     servicesTable.put(svc);
@@ -906,6 +964,36 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   if (opts.deploy !== false) for (const s of created) deployService(actor, s.id);
   recordActivity(actor, 'project.imported', `Imported ${created.length} services into ${project.name}`, project.id);
   return { project, services: created.map((s) => s.id) };
+}
+
+export async function backupNow(actor: Actor, serviceId: string, destinationId?: string) {
+  const svc = getServiceOrThrow(serviceId);
+  if (!backupMethod(svc)) throw new HttpError(400, `${svc.name} has no data to back up (no volumes and not a known database)`);
+  return backupService(svc, actor.type === 'agent' ? 'agent' : 'manual', actor, destinationId);
+}
+
+export function serviceBackups(serviceId: string, limit = 50) {
+  return listBackups(getServiceOrThrow(serviceId).id, limit);
+}
+
+export function planComposeImport(input: { yaml: string; env?: string; basePath?: string; name?: string }) {
+  return planCompose(input);
+}
+
+export async function importCompose(actor: Actor, input: { yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean }) {
+  const plan = planCompose(input);
+  const r = await importProject(actor, planToSpec(plan), { deploy: false, name: plan.name });
+  // Keep the published host port for TCP services when it's free (e.g. 5432:5432).
+  for (const sid of r.services) {
+    const svc = servicesTable.get(sid)!;
+    const cs = plan.services.find((x) => x.slug === svc.slug);
+    if (svc.protocol === 'tcp' && cs?.publishedPort && cs.publishedPort >= 1024 && !tcpPortInUse(cs.publishedPort, svc.id) && (await portFree(cs.publishedPort))) {
+      await updateService(actor, svc.id, { publicTcpPort: cs.publishedPort }, { quiet: true }).catch(() => {});
+    }
+  }
+  if (input.deploy !== false) for (const sid of r.services) deployService(actor, sid);
+  recordActivity(actor, 'project.compose', `Imported ${r.services.length} services from docker-compose${plan.warnings.length ? ` (${plan.warnings.length} warnings)` : ''}`, r.project.id);
+  return { ...r, warnings: plan.warnings };
 }
 
 export async function runServiceJob(actor: Actor, serviceId: string) {

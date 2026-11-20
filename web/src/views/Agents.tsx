@@ -18,6 +18,9 @@ const TOOLS = [
   ['exec_command', 'Run a command inside a replica'],
   ['rollback_service', 'Redeploy any previous version'],
   ['update_service', 'Ports, domains, health checks, autoscaling…'],
+  ['backup_service', 'Dump a database or archive volumes; restore_backup to roll data back'],
+  ['import_compose', 'Turn a docker-compose.yml into a project'],
+  ['create_environment', 'Staging copies and pull-request previews'],
   ['get_activity', 'Audit trail of who did what'],
 ];
 

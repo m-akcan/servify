@@ -14,5 +14,5 @@ ENV SERVIFY_DATA_DIR=/data \
     SERVIFY_PROXY_HOST=0.0.0.0 \
     SERVIFY_IN_CONTAINER=1
 VOLUME /data
-EXPOSE 7700 8080
+EXPOSE 7700 8080 8443
 CMD ["node", "--disable-warning=ExperimentalWarning", "server/bin/servify.mjs", "start"]

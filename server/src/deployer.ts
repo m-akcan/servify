@@ -27,6 +27,8 @@ import {
 } from './engine.ts';
 import { buildSource } from './builder.ts';
 import { nextRun } from './cron.ts';
+import { notify } from './notify.ts';
+import { iconForStack } from './ops.ts';
 
 const lock = new KeyedLock();
 
@@ -132,6 +134,8 @@ export function queueDeployment(
           port: svc.port,
           protocol: svc.protocol,
           startCommand: svc.startCommand,
+          cmd: svc.cmd ?? null,
+          entrypoint: svc.entrypoint ?? null,
           volumes: structuredClone(svc.volumes),
           resources: { ...svc.resources },
           source: structuredClone(svc.source),
@@ -202,6 +206,10 @@ async function runDeployment(depId: string, actor: Actor) {
         dep.commitMessage = result.commitMessage;
         dep.builder = result.builder;
         if (result.commitSha) dep.sourceLabel = `${sourceLabel(svc)} · ${result.commitSha.slice(0, 7)}`;
+        // Swap the generic git/folder icon for the detected language once we know it.
+        const fresh = servicesTable.get(svc.id);
+        const langIcon = iconForStack(result.builder.replace(/ · buildkit$/, ''));
+        if (fresh && langIcon && (fresh.icon === 'git' || fresh.icon === 'folder')) setServiceStatus(svc.id, fresh.status, { icon: langIcon });
       }
     } else {
       log(`▸ Reusing image ${dep.image}`);
@@ -307,6 +315,15 @@ async function runDeployment(depId: string, actor: Actor) {
     setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, detectedPort: dep.port });
     log(`✓ Traffic switched to ${dep.id.slice(-6)}`);
     recordActivity(actor, 'deployment.active', `${svc.name} is live (${dep.sourceLabel})`, svc.projectId, svc.id);
+    notify({
+      event: 'deploy.succeeded',
+      level: 'success',
+      title: `${svc.name} deployed`,
+      message: `${project.name}: ${dep.sourceLabel} is live on ${want} replica${want > 1 ? 's' : ''} (${Math.round((Date.now() - (dep.startedAt ?? dep.createdAt)) / 1000)}s, by ${actor.name}).`,
+      projectId: svc.projectId,
+      serviceId: svc.id,
+      deploymentId: dep.id,
+    });
 
     if (!recreate && oldContainers.length) {
       log(`▸ Draining ${oldContainers.length} old replica(s)`);
@@ -326,6 +343,16 @@ async function runDeployment(depId: string, actor: Actor) {
       setServiceStatus(s.id, s.activeDeploymentId ? 'running' : 'failed');
     }
     recordActivity(actor, 'deployment.failed', `Deploy of ${svc?.name ?? 'service'} failed: ${msg.slice(0, 140)}`, dep.projectId, dep.serviceId);
+    const tail = readDeploymentLog(dep.id).slice(-8).map((l) => l.slice(l.indexOf(' ') + 1)).join('\n');
+    notify({
+      event: 'deploy.failed',
+      level: 'error',
+      title: `Deploy of ${svc?.name ?? 'a service'} failed`,
+      message: `${projectsTable.get(dep.projectId)?.name ?? ''}: ${msg.slice(0, 300)}${s?.activeDeploymentId ? '\nThe previous version is still serving traffic.' : ''}\n\n${tail}`.trim(),
+      projectId: dep.projectId,
+      serviceId: dep.serviceId,
+      deploymentId: dep.id,
+    });
   } finally {
     inflight.delete(dep.id);
     if (!inflight.size) busy.delete(dep.serviceId);

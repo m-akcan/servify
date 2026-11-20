@@ -5,6 +5,7 @@
  *  L4: per-service TCP listeners (databases, raw TCP) balanced across replicas.
  */
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { config } from './config.ts';
@@ -13,6 +14,8 @@ import { upstreamsFor, noteConn, anyReplicaStarting } from './engine.ts';
 import { bus } from './events.ts';
 import type { Service } from './types.ts';
 import { publicDomain } from './vars.ts';
+import { challengeResponse, hasPublicCert, sniCallback, defaultContextOptions } from './certs.ts';
+import { getSettings } from './settings.ts';
 
 type Upstream = ReturnType<typeof upstreamsFor>[number];
 
@@ -112,13 +115,13 @@ const agent = new http.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs:
 
 const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'proxy-authorization', 'proxy-authenticate']);
 
-function forwardHeaders(req: http.IncomingMessage, svc: Service) {
+function forwardHeaders(req: http.IncomingMessage, svc: Service, proto: 'http' | 'https' = 'http') {
   const h: http.OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) h[k] = v;
   const ip = req.socket.remoteAddress ?? '';
   h['x-forwarded-for'] = req.headers['x-forwarded-for'] ? `${req.headers['x-forwarded-for']}, ${ip}` : ip;
   h['x-forwarded-host'] = req.headers.host ?? '';
-  h['x-forwarded-proto'] = 'http';
+  h['x-forwarded-proto'] = proto;
   h['x-servify-service'] = svc.slug;
   return h;
 }
@@ -150,7 +153,62 @@ function escapeHtml(s: string) {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 }
 
-function handle(req: http.IncomingMessage, res: http.ServerResponse) {
+/** `/_servify/hooks/…` on any host: git webhooks and deploy hooks (signature-authenticated). */
+function handleHook(req: http.IncomingMessage, res: http.ServerResponse) {
+  const reply = (status: number, body: unknown) => {
+    if (res.headersSent) return;
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+  if (req.method !== 'POST') return reply(405, { error: 'POST only' });
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let tooBig = false;
+  req.on('data', (c: Buffer) => {
+    size += c.length;
+    if (size > 2 * 1024 * 1024) {
+      tooBig = true;
+      reply(413, { error: 'payload too large' });
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+  req.on('end', async () => {
+    if (tooBig) return;
+    try {
+      const hooks = await import('./hooks.ts');
+      const path = (req.url ?? '').split('?')[0];
+      const m = path.match(/^\/_servify\/hooks\/deploy\/([^/]+)\/([^/]+)$/);
+      const r = m ? hooks.handleDeployHook(m[1], m[2]) : path === '/_servify/hooks/git' ? await hooks.handleGitWebhook(req.headers, Buffer.concat(chunks)) : { status: 404, body: { error: 'unknown hook' } };
+      reply(r.status, r.body);
+    } catch (e) {
+      reply(500, { error: (e as Error).message });
+    }
+  });
+}
+
+function hostOnly(h: string | undefined) {
+  return (h ?? '').toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '');
+}
+
+function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'http' | 'https' = 'http') {
+  if (req.url?.startsWith('/_servify/hooks/')) return handleHook(req, res);
+  const isChallenge = !!req.url?.startsWith('/.well-known/acme-challenge/');
+  if (isChallenge) {
+    const answer = challengeResponse(req.url!.slice('/.well-known/acme-challenge/'.length).split('?')[0]);
+    if (answer) {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      return res.end(answer);
+    }
+    // Unknown token: it may be the app's own (e.g. its own ACME client) — route it, just never redirect it.
+  }
+  // Hosts with a trusted certificate are served over HTTPS only.
+  if (proto === 'http' && !isChallenge && getSettings().https.enabled && getSettings().https.redirectHttp && hasPublicCert(hostOnly(req.headers.host))) {
+    const port = config.httpsPort === 443 ? '' : `:${config.httpsPort}`;
+    res.writeHead(308, { location: `https://${hostOnly(req.headers.host)}${port}${req.url ?? '/'}` });
+    return res.end();
+  }
   const svc = lookup(req.headers.host);
   const clientIp = req.socket.remoteAddress ?? '';
   if (!svc) return unavailable(res, null, req.headers.host ?? '');
@@ -174,7 +232,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     };
     let finished = false;
     const preq = http.request(
-      { host: up.host!, port: up.port!, method: req.method, path: req.url, headers: forwardHeaders(req, svc), agent },
+      { host: up.host!, port: up.port!, method: req.method, path: req.url, headers: forwardHeaders(req, svc, proto), agent },
       (pres) => {
         const headers = { ...pres.headers };
         for (const k of Object.keys(headers)) if (HOP.has(k)) delete headers[k];
@@ -220,7 +278,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   attempt(true);
 }
 
-function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer) {
+function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer, proto: 'http' | 'https' = 'http') {
   const svc = lookup(req.headers.host);
   if (!svc) return socket.destroy();
   const up = pickUpstream(svc, socket.remoteAddress ?? '');
@@ -232,7 +290,7 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
   const upstream = net.connect(up.port!, up.host!, () => {
     counted = true;
     noteConn(up.containerId, 1);
-    const headers = forwardHeaders(req, svc);
+    const headers = forwardHeaders(req, svc, proto);
     headers.connection = 'Upgrade';
     headers.upgrade = req.headers.upgrade;
     let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
@@ -316,7 +374,7 @@ function syncTcp() {
 
 export function tcpPortInUse(port: number, exceptServiceId?: string): boolean {
   for (const s of servicesTable.all()) if (s.publicTcpPort === port && s.id !== exceptServiceId) return true;
-  return port === config.port || port === config.proxyPort;
+  return port === config.port || port === config.proxyPort || port === config.httpsPort;
 }
 
 export async function portFree(port: number): Promise<boolean> {
@@ -335,9 +393,31 @@ export async function allocateTcpPort(): Promise<number> {
   throw new Error('no free TCP port available');
 }
 
+/** HTTPS listener: same routing, certificates picked per SNI name. Never fatal if the port is taken. */
+async function startHttps() {
+  const server = https.createServer({ ...(await defaultContextOptions()), SNICallback: sniCallback }, (req, res) => handle(req, res, 'https'));
+  server.on('upgrade', (req, socket, head) => handleUpgrade(req, socket as net.Socket, head, 'https'));
+  server.keepAliveTimeout = 65_000;
+  let port = config.httpsPort;
+  const tryListen = (attempts: number) => {
+    server.once('error', (e: NodeJS.ErrnoException) => {
+      if (e.code === 'EADDRINUSE' && attempts > 0) {
+        console.warn(`[proxy] https port ${port} in use, trying ${port + 1}`);
+        port++;
+        tryListen(attempts - 1);
+      } else console.error(`[proxy] HTTPS router disabled: ${e.message}`);
+    });
+    server.listen(port, config.proxyHost, () => {
+      config.httpsPort = port;
+    });
+  };
+  tryListen(10);
+}
+
 export function startProxy(): Promise<number> {
-  const server = http.createServer(handle);
-  server.on('upgrade', handleUpgrade);
+  void startHttps().catch((e) => console.error('[proxy] HTTPS router failed to start:', (e as Error).message));
+  const server = http.createServer((req, res) => handle(req, res, 'http'));
+  server.on('upgrade', (req, socket, head) => handleUpgrade(req, socket as net.Socket, head, 'http'));
   server.keepAliveTimeout = 65_000;
   setInterval(syncTcp, 1000);
   syncTcp();

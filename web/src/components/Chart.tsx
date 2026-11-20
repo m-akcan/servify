@@ -24,6 +24,8 @@ export function Chart({ times, series, height = 140, format = (v: number) => v.t
   const W = Math.max(100, width);
   const H = height;
   const n = times.length;
+  const longSpan = n > 1 && times[n - 1] - times[0] > 20 * 3600_000;
+  const label = (t: number) => (longSpan ? new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : clock(t));
   const max = niceMax(Math.max(0.0001, ...series.flatMap((s) => s.values)) * 1.08);
   const x = (i: number) => padL + (n <= 1 ? 0 : (i / (n - 1)) * (W - padL - padR));
   const y = (v: number) => padT + (1 - v / max) * (H - padT - padB);
@@ -78,7 +80,7 @@ export function Chart({ times, series, height = 140, format = (v: number) => v.t
           {n > 1 && (
             <>
               <text x={padL} y={H - 4} className="chart-axis">
-                {clock(times[0])}
+                {label(times[0])}
               </text>
               <text x={W - padR} y={H - 4} textAnchor="end" className="chart-axis">
                 now
@@ -104,7 +106,7 @@ export function Chart({ times, series, height = 140, format = (v: number) => v.t
       {hover !== null && n > 1 && (
         <div className="chart-tip" style={{ left: Math.min(W - 150, Math.max(0, x(hover) + 10)) }}>
           <div className="faint mono" style={{ fontSize: 10 }}>
-            {clock(times[hover])}
+            {label(times[hover])}
           </div>
           {series.map((s) => (
             <div key={s.key} className="row" style={{ gap: 6 }}>

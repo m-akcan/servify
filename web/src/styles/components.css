@@ -335,3 +335,22 @@
 :root[data-theme='light'] .badge[data-tone='signal'] {
   color: #4f6500;
 }
+
+/* brand logos (simple-icons) */
+.brand-mark {
+  display: block;
+  flex: none;
+}
+.glyph-brand {
+  /* Lift dark brand colours (MySQL blue, MariaDB…) so the mark reads on graphite. */
+  color: color-mix(in srgb, var(--hue) 72%, #fff);
+}
+.glyph-brand .brand-mark {
+  filter: drop-shadow(0 1px 0 color-mix(in srgb, var(--hue) 25%, transparent));
+}
+:root[data-theme='light'] .glyph-brand:not(.glyph-neutral) {
+  color: color-mix(in srgb, var(--hue) 82%, #000);
+}
+:root[data-theme='light'] .glyph-brand .brand-mark {
+  filter: none;
+}

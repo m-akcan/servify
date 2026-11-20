@@ -9,6 +9,7 @@ import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from '.
 /** A run that outlives this is killed (a long-lived server image armed as a job by mistake, a hang…). */
 const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
 import { parseCron, cronMatches } from './cron.ts';
+import { notify } from './notify.ts';
 
 const running = new Set<string>();
 const SCHEDULER: Actor = { type: 'system', name: 'scheduler' };
@@ -66,6 +67,9 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     if (dep.config.startCommand) {
       spec.Entrypoint = ['/bin/sh', '-c'];
       spec.Cmd = [dep.config.startCommand];
+    } else {
+      if (dep.config.entrypoint?.length) spec.Entrypoint = dep.config.entrypoint;
+      if (dep.config.cmd?.length) spec.Cmd = dep.config.cmd;
     }
     cid = await docker.createContainer(`svf-job-${svc.slug}-${run.id.slice(-6)}`, spec);
     await docker.startContainer(cid);
@@ -94,7 +98,17 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     if (latest) bus.publish({ type: 'service.updated', service: latest });
     if (cid) await docker.removeContainer(cid, true).catch(() => {});
   }
-  if (run.status === 'failed') recordActivity(actor, 'job.failed', `${svc.name} run failed (exit ${run.exitCode ?? '?'})`, svc.projectId, svc.id);
+  if (run.status === 'failed') {
+    recordActivity(actor, 'job.failed', `${svc.name} run failed (exit ${run.exitCode ?? '?'})`, svc.projectId, svc.id);
+    notify({
+      event: 'job.failed',
+      level: 'error',
+      title: `Cron job ${svc.name} failed`,
+      message: `${project.name}: exit code ${run.exitCode ?? '?'} (${trigger} run).\n\n${run.output.split('\n').slice(-10).join('\n')}`,
+      projectId: svc.projectId,
+      serviceId: svc.id,
+    });
+  }
   else if (trigger !== 'schedule') recordActivity(actor, 'job.run', `Ran ${svc.name} (exit 0)`, svc.projectId, svc.id);
   // Keep the run history bounded.
   const old = runsTable.all('WHERE service_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET 100', svc.id);
