@@ -373,6 +373,12 @@ body.resizing * {
   position: absolute;
   inset: 0;
   overflow: hidden;
+  animation: view-in 320ms var(--ease-out);
+}
+@keyframes view-in {
+  from {
+    opacity: 0;
+  }
 }
 .canvas-topleft {
   position: absolute;
