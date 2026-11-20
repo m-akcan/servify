@@ -82,6 +82,30 @@ export async function rollback(s: ServiceView, d: Deployment) {
   }
 }
 
+export async function duplicate(s: ServiceView) {
+  try {
+    await api.post(`/services/${s.id}/duplicate`);
+    toast({ title: `Duplicated ${s.name}`, tone: 'build' });
+  } catch (e) {
+    toastError(e, 'Could not duplicate');
+  }
+}
+
+/** Wire `from` to `to` by adding a variable reference on `from`. */
+export async function connectServices(from: ServiceView, to: ServiceView, key: string, value: string) {
+  try {
+    await api.put(`/services/${from.id}/variables`, { variables: { [key]: value } });
+    toast({
+      title: `Connected ${from.name} → ${to.name}`,
+      body: `${key} = ${value}${from.activeDeploymentId ? ' · deploy to apply' : ''}`,
+      tone: 'ok',
+      action: from.activeDeploymentId ? { label: 'Deploy', onClick: () => void deploy(from) } : undefined,
+    });
+  } catch (e) {
+    toastError(e, 'Could not connect');
+  }
+}
+
 export function serviceMenu(s: ServiceView, opts: { open: (tab?: string) => void }): MenuItem[] {
   const items: MenuItem[] = [
     { label: 'Open details', icon: 'sliders', kbd: '↵', onSelect: () => opts.open() },
@@ -98,6 +122,7 @@ export function serviceMenu(s: ServiceView, opts: { open: (tab?: string) => void
     if (s.replicas > 1) items.push({ label: 'Remove replica', icon: 'minus', onSelect: () => void scale(s, s.replicas - 1) });
   }
   if (deployed) items.push(s.stopped ? { label: 'Start', icon: 'play', onSelect: () => void start(s) } : { label: 'Stop', icon: 'stop', onSelect: () => void stop(s) });
+  items.push({ label: 'Duplicate', icon: 'copy', onSelect: () => void duplicate(s) });
   items.push({ type: 'sep' });
   items.push({ label: 'Delete service', icon: 'trash', danger: true, kbd: '⌫', onSelect: () => void remove(s) });
   return items;

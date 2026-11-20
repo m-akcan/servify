@@ -51,6 +51,8 @@ export interface Service {
   source: Source;
   protocol: Protocol;
   port: number | null;
+  /** Port detected from the image on the last successful deploy (used when `port` is auto). */
+  detectedPort?: number | null;
   replicas: number;
   strategy: LbStrategy;
   healthcheck: Healthcheck;

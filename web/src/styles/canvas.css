@@ -569,3 +569,65 @@
     transform: translateY(5px);
   }
 }
+
+/* ───────────── drag-to-connect ───────────── */
+.node-port {
+  position: absolute;
+  z-index: 3;
+  right: -9px;
+  top: 50%;
+  width: 18px;
+  height: 18px;
+  margin-top: -9px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--bg-2);
+  border: 1px solid var(--line-3);
+  color: var(--text-2);
+  cursor: crosshair;
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    opacity var(--t-fast),
+    transform 300ms var(--ease-spring),
+    background var(--t-fast),
+    color var(--t-fast);
+}
+.node:hover .node-port,
+.canvas.connecting .node-port {
+  opacity: 1;
+  transform: none;
+}
+.node-port:hover {
+  background: var(--signal);
+  color: var(--signal-ink);
+  border-color: transparent;
+  transform: scale(1.15);
+}
+.node.dragging .node-port {
+  opacity: 0;
+}
+.canvas.connecting,
+.canvas.connecting * {
+  cursor: crosshair !important;
+}
+.node.connect-target .node-card {
+  border-color: var(--signal);
+  box-shadow:
+    var(--highlight),
+    0 0 0 4px var(--signal-soft),
+    0 0 40px -6px var(--signal-line);
+}
+.edge-draft {
+  fill: none;
+  stroke: var(--text-3);
+  stroke-width: 1.6;
+  stroke-dasharray: 5 5;
+  vector-effect: non-scaling-stroke;
+  animation: dash-flow 0.8s linear infinite;
+}
+.edge-draft.locked {
+  stroke: var(--signal);
+  stroke-width: 2;
+}

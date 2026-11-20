@@ -1837,3 +1837,45 @@ a.panel-link:hover {
   padding: 5px 0;
   font-size: 13px;
 }
+
+/* ───────────── small screens ───────────── */
+@media (max-width: 760px) {
+  .panel-wrap {
+    width: 100% !important;
+  }
+  .panel-resize,
+  .minimap,
+  .pending-bar .faint {
+    display: none;
+  }
+  .stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .replica-row {
+    grid-template-columns: 26px 96px 1fr 56px;
+  }
+  .replica-row > :nth-child(n + 5) {
+    display: none;
+  }
+  .home-inner,
+  .page-inner {
+    padding: 28px 16px 60px;
+  }
+  .var-add,
+  .var-row {
+    grid-template-columns: 1fr;
+  }
+  .ns-grid,
+  .autoscale-grid,
+  .shortcut-grid {
+    grid-template-columns: 1fr;
+  }
+  .topbar .brand-name,
+  .topbar .btn-sm:not(.btn-icon) {
+    display: none;
+  }
+  .activity {
+    width: auto;
+    right: 14px;
+  }
+}

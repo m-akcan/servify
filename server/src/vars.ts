@@ -60,7 +60,7 @@ export function resolveEnv(
   const scopeFor = (s: Service, rawEnv: Record<string, string>, depth: number): Record<string, string> => {
     const key = s.id;
     if (cache.has(key)) return cache.get(key)!;
-    const base = { ...builtins(s, project, s.id === svc.id ? port : s.port), ...rawEnv };
+    const base = { ...builtins(s, project, s.id === svc.id ? port : s.port ?? s.detectedPort ?? null), ...rawEnv };
     const out: Record<string, string> = {};
     cache.set(key, out);
     const resolveValue = (val: string, d: number): string =>
@@ -80,7 +80,7 @@ export function resolveEnv(
         }
         const tScope = target.id === s.id ? out : scopeFor(target, target.env, depth + 1);
         if (b in tScope) return tScope[b];
-        const tBase = { ...builtins(target, project, target.port), ...target.env };
+        const tBase = { ...builtins(target, project, target.port ?? target.detectedPort ?? null), ...target.env };
         if (b in tBase) return resolveValue(tBase[b], d + 1);
         unresolved.push(`${a}.${b}`);
         return '';

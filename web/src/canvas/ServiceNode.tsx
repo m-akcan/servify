@@ -17,6 +17,9 @@ type Props = {
   onOpenMenu: (id: string, x: number, y: number) => void;
   onMoved: (id: string, x: number, y: number) => void;
   onDragState: (dragging: boolean) => void;
+  onStartConnect: (id: string, e: React.PointerEvent) => void;
+  onFocusNode: (id: string) => void;
+  connectTarget: boolean;
   index: number;
 };
 
@@ -95,7 +98,7 @@ function DeployTicker({ service, latest }: { service: ServiceView; latest: Deplo
   );
 }
 
-export const ServiceNode = memo(function ServiceNode({ service: s, replicas, latest, selected, getCamera, onSelect, onOpenMenu, onMoved, onDragState, index }: Props) {
+export const ServiceNode = memo(function ServiceNode({ service: s, replicas, latest, selected, getCamera, onSelect, onOpenMenu, onMoved, onDragState, onStartConnect, onFocusNode, connectTarget, index }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const deckRef = useRef<HTMLDivElement>(null);
   const group = useRef<SpringGroup<'x' | 'y' | 'lift' | 'appear'> | null>(null);
@@ -202,7 +205,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
   return (
     <div
       ref={ref}
-      className={`node ${selected ? 'selected' : ''} ${isDragging ? 'dragging' : ''} ${busy ? 'busy' : ''}`}
+      className={`node ${selected ? 'selected' : ''} ${isDragging ? 'dragging' : ''} ${busy ? 'busy' : ''} ${connectTarget ? 'connect-target' : ''}`}
       data-tone={tone}
       data-status={s.status}
       onPointerDown={onPointerDown}
@@ -211,9 +214,24 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
         e.stopPropagation();
         onOpenMenu(s.id, e.clientX, e.clientY);
       }}
-      onDoubleClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => {
+        e.stopPropagation();
+        onFocusNode(s.id);
+      }}
       data-node-id={s.id}
     >
+      <button
+        className="node-port"
+        aria-label={`Connect ${s.name} to another service`}
+        title="Drag onto another service to reference its variables"
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          onStartConnect(s.id, e);
+        }}
+      >
+        <Icon name="plus" size={10} stroke={2.4} />
+      </button>
       <div className="node-deck" ref={deckRef} aria-hidden>
         <span />
         <span />

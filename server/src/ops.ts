@@ -757,3 +757,34 @@ export function stopLoadTest(serviceId: string) {
   loadTests.delete(serviceId);
   return { stopped: !!t };
 }
+
+/** Copy a service's configuration into a new service next to it (volumes get fresh, empty storage). */
+export async function duplicateService(actor: Actor, serviceId: string) {
+  const src = getServiceOrThrow(serviceId);
+  const s = src.source;
+  const input: CreateServiceInput = {
+    name: `${src.name}-copy`,
+    port: src.port ?? undefined,
+    protocol: src.protocol,
+    replicas: src.replicas,
+    env: { ...src.env },
+    startCommand: src.startCommand ?? undefined,
+    buildCommand: src.buildCommand ?? undefined,
+    x: src.x + 40,
+    y: src.y + 220,
+    deploy: false,
+  };
+  if (s.type === 'image') input.image = s.image;
+  else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
+  else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
+  const r = await createService(actor, src.projectId, input);
+  await updateService(actor, r.service.id, { volumes: src.volumes, healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources }, { quiet: true });
+  const svc = servicesTable.get(r.service.id)!;
+  if (src.templateId) {
+    svc.templateId = src.templateId;
+    svc.icon = src.icon;
+    servicesTable.put(svc);
+  }
+  const deployment = deployService(actor, svc.id);
+  return { service: serializeService(servicesTable.get(svc.id)!), deployment };
+}

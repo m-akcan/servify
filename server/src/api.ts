@@ -153,6 +153,7 @@ api.delete('/services/:id', async (c) => {
   await ops.deleteService(actor(c), c.req.param('id'), { keepVolumes: c.req.query('keepVolumes') === '1' });
   return c.json({ ok: true });
 });
+api.post('/services/:id/duplicate', async (c) => c.json(await ops.duplicateService(actor(c), c.req.param('id')), 201));
 api.post('/services/:id/deploy', (c) => c.json(ops.deployService(actor(c), c.req.param('id'))));
 api.post('/services/:id/restart', (c) => c.json(ops.restartService(actor(c), c.req.param('id'))));
 api.post('/services/:id/stop', async (c) => c.json(await ops.stopService(actor(c), c.req.param('id'))));

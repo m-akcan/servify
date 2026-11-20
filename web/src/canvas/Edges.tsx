@@ -28,8 +28,14 @@ function useRegistryVersion() {
   return v;
 }
 
-export function EdgesLayer({ edges, highlight }: { edges: EdgeSpec[]; highlight: string | null }) {
+export function EdgesLayer({ edges, highlight, draft }: { edges: EdgeSpec[]; highlight: string | null; draft?: { from: string; x: number; y: number; over: string | null } | null }) {
   useRegistryVersion();
+  let draftPath: string | null = null;
+  if (draft) {
+    const a = registry.rects.get(draft.from);
+    const b = draft.over ? registry.rects.get(draft.over) : null;
+    if (a) draftPath = bezierPath(connect(a, b ?? { x: draft.x - 1, y: draft.y - 1, w: 2, h: 2 }));
+  }
   return (
     <svg className="edges" width="1" height="1" style={{ overflow: 'visible' }}>
       <defs>
@@ -37,6 +43,7 @@ export function EdgesLayer({ edges, highlight }: { edges: EdgeSpec[]; highlight:
           <path d="M1,1 L9,5 L1,9" fill="none" stroke="var(--line-3)" strokeWidth="1.6" strokeLinecap="round" />
         </marker>
       </defs>
+      {draftPath && <path d={draftPath} className={`edge-draft ${draft?.over ? 'locked' : ''}`} />}
       {edges.map((e) => {
         const a = registry.rects.get(e.from);
         const b = registry.rects.get(e.to);

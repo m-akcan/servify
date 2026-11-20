@@ -247,7 +247,7 @@ async function runDeployment(depId: string, actor: Actor) {
         saveDep(prev);
       }
     }
-    setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, stopped: false, port: svc.port });
+    setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, stopped: false, detectedPort: dep.port });
     log(`✓ Traffic switched to ${dep.id.slice(-6)}`);
     recordActivity(actor, 'deployment.active', `${svc.name} is live (${dep.sourceLabel})`, svc.projectId, svc.id);
 

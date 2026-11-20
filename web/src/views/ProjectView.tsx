@@ -7,7 +7,7 @@ import { ServicePanel } from '../panels/ServicePanel.tsx';
 import { NewServiceModal } from './NewService.tsx';
 import { Button, openMenu, toastError, Tooltip, Kbd, Empty } from '../components/ui.tsx';
 import { Icon } from '../components/Icon.tsx';
-import { serviceMenu, deploy, remove } from '../lib/actions.ts';
+import { serviceMenu, deploy, remove, connectServices } from '../lib/actions.ts';
 import { ActivityFeed } from '../panels/ActivityFeed.tsx';
 import { registerCommands } from '../components/CommandPalette.tsx';
 import { Spring, springs } from '../motion/spring.ts';
@@ -92,6 +92,29 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
     },
     [select],
   );
+
+  const onConnect = useCallback((fromId: string, toId: string, x: number, y: number) => {
+    const st = store.get().current;
+    const from = st?.services[fromId];
+    const to = st?.services[toId];
+    if (!from || !to) return;
+    const keys = Object.keys(to.env).filter((k) => !to.secretKeys.includes(k) || /URL$/.test(k));
+    const urlKeys = Object.keys(to.env).filter((k) => /URL$/.test(k));
+    const ordered = [...new Set([...urlKeys, ...keys])].slice(0, 8);
+    const prefix = to.slug.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+    const ref = (k: string) => `\${{ ${to.slug}.${k} }}`;
+    openMenu(x, y, [
+      { type: 'label', label: `Reference ${to.name} from ${from.name}` },
+      ...ordered.map((k) => ({
+        label: k,
+        icon: (/URL$/.test(k) ? 'link' : 'braces') as any,
+        onSelect: () => void connectServices(from, to, k in from.env ? `${prefix}_${k}` : k, ref(k)),
+      })),
+      ...(ordered.length ? [{ type: 'sep' as const }] : []),
+      { label: 'Private hostname', icon: 'shield', onSelect: () => void connectServices(from, to, `${prefix}_HOST`, ref('SERVIFY_PRIVATE_DOMAIN')) },
+      ...(to.protocol === 'http' ? [{ label: 'Internal URL', icon: 'globe' as const, onSelect: () => void connectServices(from, to, `${prefix}_URL`, `http://${ref('SERVIFY_PRIVATE_DOMAIN')}:${ref('PORT')}`) }] : []),
+    ]);
+  }, []);
 
   const onCanvasMenu = useCallback((world: Pt, x: number, y: number) => {
     openMenu(x, y, [
@@ -226,6 +249,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         onNodeMenu={onNodeMenu}
         onCanvasMenu={onCanvasMenu}
         onMoved={onMoved}
+        onConnect={onConnect}
       />
 
       {empty && (

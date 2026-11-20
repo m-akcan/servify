@@ -27,11 +27,12 @@ type Props = {
   onNodeMenu: (id: string, x: number, y: number) => void;
   onCanvasMenu: (world: Pt, x: number, y: number) => void;
   onMoved: (id: string, x: number, y: number) => void;
+  onConnect: (from: string, to: string, x: number, y: number) => void;
 };
 
 const camKey = (pid: string) => `servify.cam.${pid}`;
 
-export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, selectedId, panelWidth, onSelect, onCreateAt, onNodeMenu, onCanvasMenu, onMoved }, handle) {
+export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, selectedId, panelWidth, onSelect, onCreateAt, onNodeMenu, onCanvasMenu, onMoved, onConnect }, handle) {
   const rootRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -293,6 +294,44 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
     onCanvasMenu({ x: w.x - 128, y: w.y - 50 }, e.clientX, e.clientY);
   };
 
+  // Drag-to-connect: a draft edge follows the pointer from a node's port to a target node.
+  const [draft, setDraft] = useState<{ from: string; x: number; y: number; over: string | null } | null>(null);
+  const startConnect = useCallback((id: string, e: React.PointerEvent) => {
+    const root = rootRef.current!;
+    const r = root.getBoundingClientRect();
+    const toWorld = (cx: number, cy: number) => screenToWorld({ x: cx - r.left, y: cy - r.top }, cam.current!.values);
+    const hit = (p: Pt) => {
+      for (const [nid, rect] of registry.rects) {
+        if (nid === id || nid === INGRESS_ID) continue;
+        if (p.x >= rect.x && p.x <= rect.x + rect.w && p.y >= rect.y && p.y <= rect.y + rect.h) return nid;
+      }
+      return null;
+    };
+    const start = toWorld(e.clientX, e.clientY);
+    setDraft({ from: id, x: start.x, y: start.y, over: null });
+    const move = (ev: PointerEvent) => {
+      const p = toWorld(ev.clientX, ev.clientY);
+      setDraft({ from: id, x: p.x, y: p.y, over: hit(p) });
+    };
+    const up = (ev: PointerEvent) => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      const target = hit(toWorld(ev.clientX, ev.clientY));
+      setDraft(null);
+      if (target) onConnect(id, target, ev.clientX, ev.clientY);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }, [onConnect]);
+  const focusNode = useCallback((id: string) => {
+    const r = registry.rects.get(id);
+    if (!r) return;
+    const root = rootRef.current!;
+    const z = Math.max(1, cam.current!.targets.z);
+    cam.current!.set({ x: (root.clientWidth - 620) / 2 - (r.x + r.w / 2) * z, y: root.clientHeight / 2 - (r.y + r.h / 2) * z, z }, springs.camera);
+    onSelect(id);
+  }, [onSelect]);
+
   const services = useMemo(() => state.order.map((id) => state.services[id]).filter(Boolean), [state.order, state.services]);
 
   const edges: EdgeSpec[] = useMemo(() => {
@@ -316,7 +355,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
   return (
     <div
       ref={rootRef}
-      className={`canvas ${panning ? 'panning' : ''} ${draggingNode ? 'node-dragging' : ''}`}
+      className={`canvas ${panning ? 'panning' : ''} ${draggingNode ? 'node-dragging' : ''} ${draft ? 'connecting' : ''}`}
       onPointerDown={onPointerDown}
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
@@ -324,7 +363,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
       <div className="canvas-grid" ref={gridRef} />
       <div className="canvas-vignette" />
       <div className="world" ref={worldRef}>
-        <EdgesLayer edges={edges} highlight={selectedId} />
+        <EdgesLayer edges={edges} highlight={selectedId} draft={draft} />
         <IngressNode services={services} proxyPort={state.proxyPort} visible={hasIngress} />
         {services.map((s, i) => (
           <ServiceNode
@@ -339,6 +378,9 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
             onOpenMenu={onNodeMenu}
             onMoved={onMoved}
             onDragState={setDraggingNode}
+            onStartConnect={startConnect}
+            onFocusNode={focusNode}
+            connectTarget={draft?.over === s.id}
           />
         ))}
       </div>
