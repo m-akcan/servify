@@ -30,6 +30,10 @@
 - [x] Independent code review (9 findings) — all fixed: deployed-volume replica cap, reconcile/deploy races (converging set + fresh per-service reads), stop during deploy, proxy counter leaks + upstream timeout, SSE abort ordering, read-only resolved vars, WS counting, TCP listener retry, per-service try/catch.
 - [x] Cron jobs (scheduler + one-off runner + UI + MCP), volume download, export/import, multi-select, drag-to-connect, semantic zoom.
 
+- [x] Zero-config builders verified end-to-end: Node, Python/FastAPI, static, Go, Deno, PHP, Ruby/Rack, Vite SPA, Rust (Next.js detection untested).
+- [x] UI flows clicked: Load demo stack, Import modal, Duplicate service/project, cron Run now.
+- [x] Schedules staged until deploy (acceptance check), job max runtime, stdio MCP bridge smoke test.
+
 ## Fixed bugs worth remembering
 - Node ≥19 global http agent: 5s idle timeout aborted Docker pulls/events → dedicated agents in docker.ts.
 - Edge layer subscribed after nodes registered → sync on subscribe.
