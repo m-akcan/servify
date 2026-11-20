@@ -6,6 +6,10 @@ import { updateService, deployService } from './ops.ts';
 import { latestCommit } from './builder.ts';
 import { isDeploying } from './deployer.ts';
 import { docker } from './docker.ts';
+import { db } from './db.ts';
+import { readdirSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { config } from './config.ts';
 
 const AUTOSCALER: Actor = { type: 'system', name: 'autoscaler' };
 const GIT: Actor = { type: 'system', name: 'git-watcher' };
@@ -71,7 +75,24 @@ async function imageGc() {
   }
 }
 
+function housekeeping() {
+  // Keep the audit trail bounded.
+  db.prepare('DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY created_at DESC LIMIT 5000)').run();
+  // Drop build logs whose deployment no longer exists (deleted services/projects).
+  const known = new Set((db.prepare('SELECT id FROM deployments').all() as { id: string }[]).map((r) => r.id));
+  for (const f of readdirSync(config.logsDir)) {
+    const m = f.match(/^deploy-(dep_[a-z0-9]+)\.log$/);
+    if (m && !known.has(m[1])) {
+      try {
+        unlinkSync(join(config.logsDir, f));
+      } catch {}
+    }
+  }
+}
+
 export function startBackgroundJobs() {
+  setTimeout(() => housekeeping(), 30_000);
+  setInterval(() => housekeeping(), 60 * 60_000);
   setInterval(() => void autoscale().catch(() => {}), 10_000);
   setInterval(() => void gitWatch().catch(() => {}), 60_000);
   setInterval(() => void imageGc().catch(() => {}), 30 * 60_000);
