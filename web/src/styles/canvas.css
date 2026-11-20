@@ -673,3 +673,31 @@
   font-size: 10.5px;
   animation: rise-in 300ms var(--ease-out);
 }
+
+/* ───────────── semantic zoom ───────────── */
+.canvas[data-lod='far'] .node-source,
+.canvas[data-lod='far'] .node-host,
+.canvas[data-lod='far'] .node-volume,
+.canvas[data-lod='far'] .spark,
+.canvas[data-lod='far'] .node-more,
+.canvas[data-lod='far'] .ticker-line,
+.canvas[data-lod='far'] .node-pending,
+.canvas[data-lod='far'] .node-rps,
+.canvas[data-lod='far'] .node-error span {
+  display: none;
+}
+.canvas[data-lod='far'] .node-name {
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+.canvas[data-lod='far'] .node-status .badge {
+  transform: scale(1.5);
+  transform-origin: left center;
+}
+.canvas[data-lod='far'] .node-card {
+  gap: 14px;
+}
+.canvas[data-lod='far'] .edge-label,
+.canvas[data-lod='far'] .ingress-stats .faint {
+  display: none;
+}

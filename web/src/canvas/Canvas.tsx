@@ -76,6 +76,9 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
         s.setProperty('--minor-alpha', String(Math.max(0, Math.min(1, (v.z - 0.35) / 0.4))));
       }
       if (zoomLabel.current) zoomLabel.current.textContent = `${Math.round(v.z * 100)}%`;
+      // Semantic zoom: far out, nodes show only what's readable.
+      const lod = v.z < 0.55 ? 'far' : 'near';
+      if (rootRef.current && rootRef.current.dataset.lod !== lod) rootRef.current.dataset.lod = lod;
       for (const fn of camSubs.current) fn();
       window.clearTimeout(saveTimer);
       saveTimer = window.setTimeout(() => {
