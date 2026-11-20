@@ -36,19 +36,31 @@ export const api = {
 };
 
 /** Server-Sent Events with automatic reconnect and typed handlers. */
-export function sse(path: string, handlers: Record<string, (data: any) => void>, onOpen?: () => void): () => void {
+export function sse(path: string, handlers: Record<string, (data: any) => void>, onOpen?: () => void, opts: { staleMs?: number } = {}): () => void {
   let es: EventSource | null = null;
   let closed = false;
   let retry = 500;
+  let lastSeen = Date.now();
+  // Watchdog: a proxy can keep a dead stream "open" forever. The server pings every 15s.
+  const staleMs = opts.staleMs ?? 35_000;
+  const watchdog = setInterval(() => {
+    if (closed || !es || Date.now() - lastSeen < staleMs) return;
+    es.close();
+    lastSeen = Date.now();
+    connect();
+  }, 2000);
   const connect = () => {
     if (closed) return;
     es = new EventSource(`/api${path}`, { withCredentials: true });
     es.onopen = () => {
       retry = 500;
+      lastSeen = Date.now();
       onOpen?.();
     };
+    es.addEventListener('ping', () => (lastSeen = Date.now()));
     for (const [event, fn] of Object.entries(handlers)) {
       es.addEventListener(event, (e) => {
+        lastSeen = Date.now();
         const raw = (e as MessageEvent).data;
         if (!raw) return;
         try {
@@ -68,6 +80,7 @@ export function sse(path: string, handlers: Record<string, (data: any) => void>,
   connect();
   return () => {
     closed = true;
+    clearInterval(watchdog);
     es?.close();
   };
 }

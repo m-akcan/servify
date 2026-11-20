@@ -15,7 +15,7 @@ type Props = {
   getCamera: () => Camera;
   onSelect: (id: string) => void;
   onOpenMenu: (id: string, x: number, y: number) => void;
-  onMoved: (id: string, x: number, y: number) => void;
+  onMoved: (id: string, x: number, y: number, fromX: number, fromY: number) => void;
   onDragState: (dragging: boolean) => void;
   onStartConnect: (id: string, e: React.PointerEvent) => void;
   onFocusNode: (id: string) => void;
@@ -189,7 +189,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
       dragging.current = false;
       setDragging(false);
       onDragState(false);
-      onMoved(s.id, nx, ny);
+      if (nx !== origin.x || ny !== origin.y) onMoved(s.id, nx, ny, origin.x, origin.y);
     };
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', up);

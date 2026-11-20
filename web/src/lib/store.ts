@@ -213,6 +213,7 @@ export function connectEvents() {
       }
       first = false;
     },
+    { staleMs: 6000 }, // traffic ticks arrive every second, so silence means a dead stream
   );
 }
 

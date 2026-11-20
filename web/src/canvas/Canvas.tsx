@@ -26,7 +26,7 @@ type Props = {
   onCreateAt: (p: Pt, screen: Pt) => void;
   onNodeMenu: (id: string, x: number, y: number) => void;
   onCanvasMenu: (world: Pt, x: number, y: number) => void;
-  onMoved: (id: string, x: number, y: number) => void;
+  onMoved: (id: string, x: number, y: number, fromX: number, fromY: number) => void;
   onConnect: (from: string, to: string, x: number, y: number) => void;
 };
 

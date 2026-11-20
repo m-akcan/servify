@@ -76,7 +76,10 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
     [],
   );
 
-  const onMoved = useCallback(async (id: string, x: number, y: number) => {
+  const undoStack = useRef<{ id: string; x: number; y: number }[]>([]);
+  const onMoved = useCallback(async (id: string, x: number, y: number, fromX: number, fromY: number) => {
+    undoStack.current.push({ id, x: fromX, y: fromY });
+    if (undoStack.current.length > 50) undoStack.current.shift();
     try {
       await api.patch(`/services/${id}`, { x, y });
     } catch (e) {
@@ -131,6 +134,14 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
       if (t.closest('input, textarea, select, [contenteditable], .modal-root, .palette')) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        const last = undoStack.current.pop();
+        if (last) {
+          e.preventDefault();
+          void api.patch(`/services/${last.id}`, { x: last.x, y: last.y }).catch(() => {});
+        }
+        return;
+      }
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const st = store.get().current;
       if (!st) return;

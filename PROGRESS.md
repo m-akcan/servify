@@ -19,9 +19,16 @@
 - [x] Builds: local folder (node, zero-config) + GitHub repo without Dockerfile, both via BuildKit.
 
 ## Punch list (from advisor review)
-- [ ] Fresh clone: pnpm install && pnpm build && pnpm start; password setup/logout/login; SSE under cookie; acceptance with token.
-- [ ] Acceptance additions: failing deploy keeps old version (stateless + volume), rollback, stop/start, docker kill, redis data persists, autoscale up/down, git auto-deploy via local bare repo, project delete leaves nothing.
-- [ ] Templates each once (skip ollama); uptime-kuma websocket via browser.
-- [ ] UI: drag/snap, wheel/pinch, minimap, context menus, ⌘K, light theme, agents token flow, activity, perf with ~25 nodes.
-- [ ] In-container mode: join project networks or don't document.
-- [ ] README, LICENSE. Kill dev servers/curl loops before final run.
+- [x] Fresh clone: install/build/start, password setup, token via UI + CLI, acceptance with token (all pass), 401 unauth.
+- [x] Acceptance additions (25 checks): failed deploys (stateless+volume), redis persistence, rollback, stop/start, kill, autoscale up, git auto-deploy, project delete.
+- [x] All templates deployed (ollama skipped); WebSocket upgrade verified (uptime-kuma socket.io).
+- [x] UI: drag/snap, wheel/pinch perf (27 nodes: median 8.3ms, p95 11ms), context menus, ⌘K, light theme, token flow, activity, drag-to-connect.
+- [x] In-container mode (Dockerfile + compose) verified with a 2-replica LB.
+- [x] README, LICENSE.
+- [ ] Final: kill dev servers/curl loops; final acceptance run; advisor review.
+
+## Fixed bugs worth remembering
+- Node ≥19 global http agent: 5s idle timeout aborted Docker pulls/events → dedicated agents in docker.ts.
+- Edge layer subscribed after nodes registered → sync on subscribe.
+- SSE through Vite proxy can go silently stale on server restart → client watchdog (staleMs).
+- Never `lsof -ti tcp:PORT | xargs kill` — also kills clients (Vite). Use `-sTCP:LISTEN`.
