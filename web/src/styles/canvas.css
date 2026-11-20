@@ -1,0 +1,496 @@
+/* ───────────── canvas shell ───────────── */
+.canvas {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: var(--bg-canvas);
+  touch-action: none;
+  user-select: none;
+  cursor: default;
+  contain: strict;
+}
+.canvas.panning,
+.canvas.space-pan,
+.canvas.space-pan * {
+  cursor: grabbing !important;
+}
+.canvas.space-pan:not(.panning) {
+  cursor: grab !important;
+}
+.canvas-grid {
+  --minor-alpha: 1;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--grid-dot) calc(var(--minor-alpha) * 100%), transparent) 1px, transparent 1.4px),
+    radial-gradient(circle at 1px 1px, var(--grid-dot-major) 1.2px, transparent 1.7px);
+}
+.canvas-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 80% 70% at 50% 45%, transparent 55%, color-mix(in srgb, var(--bg) 70%, transparent) 100%);
+}
+.world {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+}
+.particles {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* ───────────── edges ───────────── */
+.edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+.edge-line {
+  fill: none;
+  stroke: var(--line-3);
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+  transition: stroke var(--t-base), opacity var(--t-base);
+}
+.edge-halo {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 8;
+}
+.edge-ref .edge-line {
+  stroke-dasharray: 4 5;
+  stroke: var(--line-3);
+}
+.edge-ref.active .edge-line {
+  animation: dash-flow 1.6s linear infinite;
+}
+.edge-ingress .edge-line {
+  stroke-width: 1.6;
+}
+.edge-ingress:not(.active) .edge-line {
+  stroke: var(--line-2);
+  stroke-dasharray: 2 5;
+}
+.edge.hl .edge-line {
+  stroke: var(--signal);
+  stroke-width: 2;
+  opacity: 0.9;
+}
+.edge-ref.hl .edge-line {
+  stroke: var(--text-2);
+}
+.edge-label rect {
+  fill: var(--bg-2);
+  stroke: var(--line-2);
+}
+.edge-label text {
+  fill: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+@keyframes dash-flow {
+  to {
+    stroke-dashoffset: -18;
+  }
+}
+
+/* ───────────── service node ───────────── */
+.node {
+  --lift: 0;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 256px;
+  transform-origin: 50% 50%;
+  cursor: grab;
+  opacity: 0;
+}
+.node.dragging {
+  cursor: grabbing;
+  z-index: 10;
+}
+.node.selected {
+  z-index: 5;
+}
+.node-card {
+  position: relative;
+  border-radius: var(--r-lg);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-2) 100%, transparent), var(--bg-1));
+  border: 1px solid var(--line-2);
+  box-shadow:
+    var(--highlight),
+    0 1px 2px rgba(0, 0, 0, 0.25),
+    0 calc(6px + var(--lift) * 18px) calc(16px + var(--lift) * 40px) calc(-6px - var(--lift) * 4px) rgba(0, 0, 0, calc(0.38 + var(--lift) * 0.25));
+  padding: 12px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition:
+    border-color var(--t-base) var(--ease-out),
+    box-shadow var(--t-base) var(--ease-out);
+}
+.node:hover .node-card {
+  border-color: var(--line-3);
+}
+.node.selected .node-card {
+  border-color: var(--signal-line);
+  box-shadow:
+    var(--highlight),
+    0 0 0 3px var(--signal-soft),
+    0 12px 40px -8px rgba(0, 0, 0, 0.55);
+}
+.node[data-status='crashed'] .node-card,
+.node[data-status='failed'] .node-card {
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  box-shadow:
+    var(--highlight),
+    0 0 0 3px var(--err-soft),
+    0 10px 30px -8px rgba(0, 0, 0, 0.5);
+}
+.node[data-status='stopped'] .node-card,
+.node[data-status='idle'] .node-card {
+  background: var(--bg-1);
+}
+.node[data-status='stopped'] .node-head,
+.node[data-status='stopped'] .node-foot {
+  opacity: 0.6;
+}
+
+/* busy: rotating conic border */
+.node-busy-ring {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(from var(--angle, 0deg), transparent 0deg, var(--c) 60deg, transparent 140deg, transparent 360deg);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: ring-spin 1.6s linear infinite;
+  pointer-events: none;
+}
+@property --angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes ring-spin {
+  to {
+    --angle: 360deg;
+  }
+}
+
+/* replica deck: stacked cards behind the node */
+.node-deck {
+  --deck: 0;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.node-deck span {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.5);
+}
+.node-deck span:nth-child(1) {
+  transform: translate(calc(min(var(--deck), 1) * 6px), calc(min(var(--deck), 1) * 6px)) scale(calc(1 - min(var(--deck), 1) * 0.015));
+  opacity: calc(min(var(--deck), 1) * 0.9);
+}
+.node-deck span:nth-child(2) {
+  transform: translate(calc(clamp(0, var(--deck) - 1, 1) * 12px), calc(clamp(0, var(--deck) - 1, 1) * 12px)) scale(calc(1 - clamp(0, var(--deck) - 1, 1) * 0.03));
+  opacity: calc(clamp(0, var(--deck) - 1, 1) * 0.65);
+}
+.node-deck span:nth-child(3) {
+  transform: translate(calc(clamp(0, var(--deck) - 2, 1) * 18px), calc(clamp(0, var(--deck) - 2, 1) * 18px)) scale(calc(1 - clamp(0, var(--deck) - 2, 1) * 0.045));
+  opacity: calc(clamp(0, var(--deck) - 2, 1) * 0.4);
+}
+
+.node-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.node-name {
+  font-size: var(--fs-14);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.node-source {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  margin-top: 1px;
+}
+.node-more {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity var(--t-fast), background var(--t-fast), color var(--t-fast);
+  align-self: flex-start;
+}
+.node:hover .node-more,
+.node.selected .node-more {
+  opacity: 1;
+}
+.node-more:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.node-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+}
+.node-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-10);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+.node-rps {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--signal);
+  animation: fade-in 300ms;
+}
+.node-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  min-height: 28px;
+}
+.node-replicas {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.node-lb {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--signal);
+  border: 1px solid var(--signal-line);
+}
+.node-host,
+.node-volume {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  margin-top: -3px;
+}
+.node-volume {
+  color: var(--text-4);
+}
+
+/* replica pips — little rack LEDs that glow with traffic */
+.pips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  max-width: 104px;
+}
+.pip {
+  --load: 0;
+  width: 8px;
+  height: 14px;
+  border-radius: 2.5px;
+  background: var(--idle);
+  opacity: 0.5;
+  transition:
+    background var(--t-base),
+    opacity var(--t-base),
+    box-shadow var(--t-slow) var(--ease-out),
+    transform var(--t-slow) var(--ease-spring);
+  animation: pip-in 420ms var(--ease-spring) both;
+}
+.pip[data-state='healthy'] {
+  background: var(--ok);
+  opacity: calc(0.7 + var(--load) * 0.3);
+  box-shadow: 0 0 calc(var(--load) * 10px) color-mix(in srgb, var(--ok) calc(var(--load) * 80%), transparent);
+}
+.pip[data-state='starting'] {
+  background: var(--warn);
+  opacity: 1;
+  animation:
+    pip-in 420ms var(--ease-spring) both,
+    blink 0.9s var(--ease-in-out) infinite;
+}
+.pip[data-state='unhealthy'],
+.pip[data-state='exited'] {
+  background: var(--err);
+  opacity: 1;
+}
+.pip[data-state='draining'] {
+  background: var(--idle);
+  opacity: 0.35;
+  transform: scaleY(0.6);
+}
+.pip[data-state='pending'] {
+  background: transparent;
+  border: 1px dashed var(--line-3);
+  opacity: 1;
+}
+@keyframes pip-in {
+  from {
+    transform: scaleY(0.2);
+    opacity: 0;
+  }
+}
+
+.spark {
+  display: block;
+  overflow: visible;
+}
+.spark-line {
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+}
+.spark-fill {
+  fill: var(--signal-soft);
+}
+
+/* ───────────── ingress / edge router ───────────── */
+.ingress {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 168px;
+  padding: 11px 12px;
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(120% 140% at 0% 0%, var(--signal-soft), transparent 60%),
+    var(--bg-1);
+  border: 1px solid var(--signal-line);
+  box-shadow: var(--highlight), 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  opacity: 0;
+}
+.ingress-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.ingress-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--signal);
+  color: var(--signal-ink);
+}
+.ingress-title {
+  font-weight: 600;
+  font-size: var(--fs-13);
+}
+.ingress-sub {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+}
+.ingress-stats {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-2);
+}
+.ingress-stats b {
+  color: var(--signal);
+  font-weight: 500;
+}
+
+/* ───────────── controls & minimap ───────────── */
+.canvas-chrome {
+  position: absolute;
+  z-index: var(--z-chrome);
+}
+.canvas-controls {
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-2);
+  transition: left var(--t-slow) var(--ease-out);
+}
+.cc-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-items: center;
+  color: var(--text-2);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.cc-btn:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.cc-zoom {
+  min-width: 48px;
+  height: 28px;
+  font-size: var(--fs-11);
+  color: var(--text-2);
+  border-radius: var(--r-sm);
+}
+.cc-zoom:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+.cc-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--line-2);
+  margin: 0 3px;
+}
+.minimap {
+  bottom: 16px;
+  padding: 4px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-2);
+  transition: right var(--t-slow) var(--ease-out);
+  cursor: crosshair;
+}
+.minimap canvas {
+  display: block;
+  border-radius: 6px;
+}

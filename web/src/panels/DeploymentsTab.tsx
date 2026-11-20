@@ -1,0 +1,147 @@
+import { useEffect, useRef, useState } from 'react';
+import type { Deployment, ServiceView } from '../lib/types.ts';
+import { useStore, deploymentsFor } from '../lib/store.ts';
+import { Badge, Button, Tooltip, toastError, Empty } from '../components/ui.tsx';
+import { Icon } from '../components/Icon.tsx';
+import { deployTone, timeAgo, duration, isBusy } from '../lib/format.ts';
+import { rollback, deploy } from '../lib/actions.ts';
+import { sse, api } from '../lib/api.ts';
+import { LogView, type ViewLine } from '../components/LogView.tsx';
+import { useAutoHeight } from '../motion/hooks.ts';
+
+const triggerIcon: Record<string, any> = { agent: 'bot', git: 'git', rollback: 'history', restart: 'refresh', create: 'sparkle', manual: 'user', config: 'sliders' };
+
+function DeployLog({ dep }: { dep: Deployment }) {
+  const [lines, setLines] = useState<ViewLine[]>([]);
+  const k = useRef(0);
+  const live = isBusy(dep.status);
+  useEffect(() => {
+    setLines([]);
+    k.current = 0;
+    const stop = sse(`/deployments/${dep.id}/logs/stream`, {
+      backlog: (arr: { ts: number; text: string }[]) => setLines(arr.map((l) => ({ key: k.current++, ts: l.ts, text: l.text }))),
+      line: (l: { ts: number; text: string }) => setLines((prev) => [...prev.slice(-3000), { key: k.current++, ts: l.ts, text: l.text }]),
+    });
+    return stop;
+  }, [dep.id]);
+  return <LogView lines={lines} live={live} className="deploy-log" emptyText={live ? 'Starting…' : 'No log output.'} />;
+}
+
+function DeploymentRow({ d, s, expanded, onToggle }: { d: Deployment; s: ServiceView; expanded: boolean; onToggle: () => void }) {
+  const wrap = useRef<HTMLDivElement>(null);
+  useAutoHeight(wrap, [expanded]);
+  const isActive = s.activeDeploymentId === d.id;
+  const busy = isBusy(d.status);
+  const elapsed = d.startedAt ? (d.finishedAt ?? Date.now()) - d.startedAt : null;
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!busy) return;
+    const i = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(i);
+  }, [busy]);
+
+  return (
+    <div className={`deploy-row ${expanded ? 'open' : ''} ${isActive ? 'is-active' : ''}`} data-status={d.status}>
+      <button className="deploy-summary" onClick={onToggle}>
+        <span className="deploy-rail" data-tone={deployTone[d.status]} />
+        <div className="grow" style={{ minWidth: 0 }}>
+          <div className="row" style={{ gap: 8 }}>
+            <Badge tone={deployTone[d.status]} live={busy}>
+              {d.status}
+            </Badge>
+            {isActive && <span className="active-chip">LIVE</span>}
+            <span className="deploy-msg truncate">{d.commitMessage ?? d.sourceLabel}</span>
+          </div>
+          <div className="deploy-meta">
+            <span className="actor-pill">
+              <Icon name={triggerIcon[d.trigger] ?? 'user'} size={11} />
+              {d.actor}
+            </span>
+            <span>{d.trigger}</span>
+            <span>·</span>
+            <span>{timeAgo(d.createdAt)}</span>
+            {elapsed != null && (
+              <>
+                <span>·</span>
+                <span className="tnum">{duration(elapsed)}</span>
+              </>
+            )}
+            {d.commitSha && (
+              <>
+                <span>·</span>
+                <span className="mono">{d.commitSha.slice(0, 7)}</span>
+              </>
+            )}
+            {d.builder && (
+              <>
+                <span>·</span>
+                <span>{d.builder}</span>
+              </>
+            )}
+          </div>
+          {d.error && !expanded && <div className="deploy-error truncate">{d.error}</div>}
+        </div>
+        <div className="row" style={{ gap: 2 }} onClick={(e) => e.stopPropagation()}>
+          {d.status === 'queued' && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={async () => {
+                try {
+                  await api.post(`/deployments/${d.id}/cancel`);
+                } catch (e) {
+                  toastError(e);
+                }
+              }}
+            >
+              Cancel
+            </Button>
+          )}
+          {!isActive && d.image && (d.status === 'superseded' || d.status === 'active') && (
+            <Tooltip label="Redeploy this version">
+              <Button size="sm" variant="ghost" icon="history" onClick={() => void rollback(s, d)}>
+                Rollback
+              </Button>
+            </Tooltip>
+          )}
+          {d.status === 'failed' && (
+            <Button size="sm" variant="ghost" icon="refresh" onClick={() => void deploy(s)}>
+              Retry
+            </Button>
+          )}
+        </div>
+        <Icon name="chevronDown" size={15} className="deploy-chev" />
+      </button>
+      <div className="deploy-expand" ref={wrap}>
+        <div>{expanded && <DeployLog dep={d} />}</div>
+      </div>
+    </div>
+  );
+}
+
+export function DeploymentsTab({ service: s }: { service: ServiceView }) {
+  const current = useStore((st) => st.current);
+  const deps = deploymentsFor(current, s.id);
+  const [open, setOpen] = useState<string | null>(() => {
+    const first = deps[0];
+    return first && (isBusy(first.status) || first.status === 'failed') ? first.id : null;
+  });
+  // Auto-expand a deploy that just started.
+  const newest = deps[0]?.id;
+  const prevNewest = useRef(newest);
+  useEffect(() => {
+    if (newest && newest !== prevNewest.current) setOpen(newest);
+    prevNewest.current = newest;
+  }, [newest]);
+
+  if (!deps.length) return <Empty icon="rocket" title="No deployments yet" body="Deploy this service to see builds and history here." />;
+  return (
+    <div className="tab-pad">
+      <div className="deploy-list">
+        {deps.map((d) => (
+          <DeploymentRow key={d.id} d={d} s={s} expanded={open === d.id} onToggle={() => setOpen(open === d.id ? null : d.id)} />
+        ))}
+      </div>
+    </div>
+  );
+}

@@ -116,7 +116,8 @@ export function refreshServiceStatus(serviceId: string) {
     const crashing = (backoffUntil.get(serviceId) ?? 0) > Date.now();
     if (crashing && healthy === 0) next = 'crashed';
     else if (healthy >= want) next = 'running';
-    else if (healthy > 0) next = 'degraded';
+    // Scaling up: new replicas still starting while the rest serve traffic is healthy, not degraded.
+    else if (healthy > 0) next = reps.every((r) => r.state === 'healthy' || r.state === 'starting') ? 'running' : 'degraded';
     else if (reps.some((r) => r.state === 'starting')) next = 'deploying';
     else next = reps.length ? 'crashed' : 'deploying';
   }

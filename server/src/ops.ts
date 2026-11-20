@@ -76,7 +76,7 @@ export function listProjects() {
 }
 
 export function getProjectOrThrow(projectId: string): Project {
-  const p = projectsTable.get(projectId) ?? projectsTable.all('WHERE json_extract(data, "$.slug") = ?', projectId)[0];
+  const p = projectsTable.get(projectId) ?? projectsTable.all(`WHERE json_extract(data, '$.slug') = ?`, projectId)[0];
   if (!p) throw new HttpError(404, `project not found: ${projectId}`);
   return p;
 }
