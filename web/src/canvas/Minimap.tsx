@@ -115,8 +115,10 @@ export function Minimap({
     onJump((root.clientWidth - panelWidth) / 2 - wx * cam.z, root.clientHeight / 2 - wy * cam.z);
   };
 
+  // Not enough canvas left beside the panel: get out of the way of the zoom controls.
+  const narrow = (rootRef.current?.clientWidth ?? 1200) - panelWidth < 560;
   return (
-    <div className="minimap glass canvas-chrome" style={{ right: 16 + panelWidth }}>
+    <div className="minimap glass canvas-chrome" style={{ right: 16 + panelWidth, opacity: narrow ? 0 : 1, pointerEvents: narrow ? 'none' : undefined }}>
       <canvas
         ref={canvasRef}
         style={{ width: W, height: H }}

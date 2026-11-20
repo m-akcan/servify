@@ -248,6 +248,8 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
   const pending = services.filter((s) => s.pendingChanges.length && s.activeDeploymentId);
   const undeployed = services.filter((s) => !s.activeDeploymentId && s.status === 'idle' && !Object.values(state.deployments).some((d) => d.serviceId === s.id));
   const empty = services.length === 0;
+  // Beside an open panel on a narrow window the floating bars would be clipped; the panel has its own banner.
+  const cramped = open && window.innerWidth - panelW < 720;
 
   return (
     <div className="project-view">
@@ -326,7 +328,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         </Button>
       </div>
 
-      {pending.length === 0 && undeployed.length > 0 && !empty && (
+      {!cramped && pending.length === 0 && undeployed.length > 0 && !empty && (
         <div className="pending-bar glass rise-in" style={{ marginLeft: open ? -panelW / 2 : 0, borderColor: 'var(--line-2)' }}>
           <span className="pending-dot" style={{ background: 'var(--idle)', boxShadow: 'none', animation: 'none' }} />
           <span>
@@ -337,7 +339,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
           </Button>
         </div>
       )}
-      {pending.length > 0 && (
+      {!cramped && pending.length > 0 && (
         <div className="pending-bar glass rise-in" style={{ marginLeft: open ? -panelW / 2 : 0 }}>
           <span className="pending-dot" />
           <span>

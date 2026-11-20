@@ -487,7 +487,9 @@
   border-radius: var(--r-md);
   border: 1px solid var(--line-2);
   box-shadow: var(--shadow-2);
-  transition: right var(--t-slow) var(--ease-out);
+  transition:
+    right var(--t-slow) var(--ease-out),
+    opacity var(--t-base);
   cursor: crosshair;
 }
 .minimap canvas {
