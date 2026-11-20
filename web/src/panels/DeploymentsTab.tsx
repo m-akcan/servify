@@ -42,7 +42,19 @@ function DeploymentRow({ d, s, expanded, onToggle }: { d: Deployment; s: Service
 
   return (
     <div className={`deploy-row ${expanded ? 'open' : ''} ${isActive ? 'is-active' : ''}`} data-status={d.status}>
-      <button className="deploy-summary" onClick={onToggle}>
+      <div
+        className="deploy-summary"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
+      >
         <span className="deploy-rail" data-tone={deployTone[d.status]} />
         <div className="grow" style={{ minWidth: 0 }}>
           <div className="row" style={{ gap: 8 }}>
@@ -111,7 +123,7 @@ function DeploymentRow({ d, s, expanded, onToggle }: { d: Deployment; s: Service
           )}
         </div>
         <Icon name="chevronDown" size={15} className="deploy-chev" />
-      </button>
+      </div>
       <div className="deploy-expand" ref={wrap}>
         <div>{expanded && <DeployLog dep={d} />}</div>
       </div>

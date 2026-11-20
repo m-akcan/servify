@@ -20,6 +20,8 @@ function useRegistryVersion() {
         setV(registry.version);
       });
     });
+    // Nodes register in layout effects, before this passive effect subscribes: catch up now.
+    setV(registry.version);
     return () => {
       off();
       cancelAnimationFrame(raf);

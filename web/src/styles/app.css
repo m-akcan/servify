@@ -754,6 +754,7 @@ a.panel-link:hover {
   border-color: color-mix(in srgb, var(--ok) 30%, transparent);
 }
 .deploy-summary {
+  cursor: pointer;
   display: flex;
   align-items: center;
   gap: 12px;
