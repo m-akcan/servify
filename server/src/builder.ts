@@ -86,6 +86,8 @@ async function cliBuild(ctx: string, dockerfile: string, tag: string, labels: Re
     env: { DOCKER_HOST: dockerHostEnv, DOCKER_BUILDKIT: '1', BUILDKIT_PROGRESS: 'plain' },
     onLine: (l) => {
       if (/buildx component is missing|unknown flag: --progress|docker: not found/i.test(l)) missingBuildx = true;
+      // Drop BuildKit's per-chunk download/extract progress; keep the "done" lines.
+      if (/^#\d+ (sha256:[0-9a-f]+|extracting sha256:[0-9a-f]+) /.test(l) && !/ done$/.test(l)) return;
       log(l);
     },
   }).catch((e) => {

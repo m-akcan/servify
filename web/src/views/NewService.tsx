@@ -11,7 +11,7 @@ import { registry } from '../canvas/geometry.ts';
 /** Spiral out from the viewport centre to the first grid slot that doesn't overlap a node. */
 function freeSlotNear(c: Pt): Pt {
   const W = 256;
-  const H = 150;
+  const H = 200; // room for the build ticker that appears while deploying
   const rects = [...registry.rects.values()];
   const free = (x: number, y: number) => rects.every((r) => x + W + 40 < r.x || x > r.x + r.w + 40 || y + H + 40 < r.y || y > r.y + r.h + 40);
   const ox = c.x - W / 2;
