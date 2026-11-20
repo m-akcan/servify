@@ -156,4 +156,8 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     process.exit(0);
   });
 }
-main();
+main().catch((e) => {
+  // A half-started Servify (router up, dashboard not) would only confuse: fail loudly instead.
+  console.error('servify failed to start:', e);
+  process.exit(1);
+});

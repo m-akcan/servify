@@ -238,7 +238,7 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
       if (r.code !== 0) throw new Error(`${method} exited with ${r.code}: ${r.stderr.slice(-400) || 'no output'}`);
     }
     const size = statSync(tmp).size;
-    if (size < 20) throw new Error('the backup came out empty');
+    if (size <= 20) throw new Error('the backup came out empty'); // 20 bytes = a gzip of nothing
     rec.key = objectKey(d, svc, method, now);
     await store(d, rec.key, tmp);
     rec.sizeBytes = size;

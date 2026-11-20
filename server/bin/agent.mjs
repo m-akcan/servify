@@ -38,7 +38,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 /** TLS to Servify, pin-checked, then an HTTP Upgrade on `path`. Resolves with the raw socket. */
 function dial(path) {
   return new Promise((resolve, reject) => {
-    const sock = tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false });
+    const sock = tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false, allowHalfOpen: true });
     const fail = (e) => {
       sock.destroy();
       reject(e);
@@ -75,8 +75,8 @@ function dial(path) {
 function connectTarget(target) {
   return new Promise((resolve, reject) => {
     let s;
-    if (target === 'docker') s = net.connect({ path: dockerSock });
-    else if (target && Number.isInteger(target.port) && target.port > 0 && target.port < 65536) s = net.connect({ host: '127.0.0.1', port: target.port });
+    if (target === 'docker') s = net.connect({ path: dockerSock, allowHalfOpen: true });
+    else if (target && Number.isInteger(target.port) && target.port > 0 && target.port < 65536) s = net.connect({ host: '127.0.0.1', port: target.port, allowHalfOpen: true });
     else return reject(new Error('target not allowed'));
     s.once('connect', () => {
       s.off('error', reject);
@@ -170,6 +170,14 @@ async function run() {
         });
         control.on('close', done);
         control.on('error', () => {});
+        // Streams may be half-open; the control connection never is. Servify pings every 10s: silence means it's gone.
+        control.on('end', () => control.destroy());
+        let last = Date.now();
+        control.on('data', () => (last = Date.now()));
+        const watchdog = setInterval(() => {
+          if (Date.now() - last > 40_000) control.destroy();
+        }, 5000);
+        control.on('close', () => clearInterval(watchdog));
       });
       log('disconnected');
     } catch (e) {

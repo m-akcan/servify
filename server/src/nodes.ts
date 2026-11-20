@@ -180,7 +180,7 @@ export function forwardPort(nodeId: string, remotePort: number): Promise<number>
   let f = c.forwards.get(remotePort);
   if (!f) {
     f = (async () => {
-      const server = net.createServer((sock) => splice(sock, nodeId, remotePort));
+      const server = net.createServer({ allowHalfOpen: true }, (sock) => splice(sock, nodeId, remotePort));
       await listen(server, 0, '127.0.0.1');
       return { server, port: (server.address() as net.AddressInfo).port };
     })();
@@ -266,6 +266,7 @@ function attachControl(node: ServerNode, socket: Duplex, address: string | null)
     }
   });
   socket.on('close', () => dropConn(c, 'disconnected', true));
+  socket.on('end', () => socket.destroy()); // half-open is for streams, not the control connection
   socket.on('error', () => {});
 }
 
@@ -285,7 +286,8 @@ async function onHello(c: Conn, raw: any, address: string | null) {
   };
   try {
     rmSync(c.sockPath, { force: true });
-    const server = net.createServer((sock) => splice(sock, c.nodeId, 'docker'));
+    // Half-open: the docker CLI closes its write side after sending (exec, attach, build) and still reads.
+    const server = net.createServer({ allowHalfOpen: true }, (sock) => splice(sock, c.nodeId, 'docker'));
     await listen(server, c.sockPath);
     chmodSync(c.sockPath, 0o600);
     c.sockServer = server;
@@ -378,7 +380,7 @@ export function startAgentListener(): Promise<void> {
   listening ??= (async () => {
     const tls = await agentTlsMaterial();
     const script = () => readFileSync(AGENT_SCRIPT);
-    listener = https.createServer({ key: tls.keyPem, cert: tls.certPem }, (req, res) => {
+    listener = https.createServer({ key: tls.keyPem, cert: tls.certPem, allowHalfOpen: true } as https.ServerOptions, (req, res) => {
       // The agent script is public code; the join command pins its hash.
       if (req.method === 'GET' && req.url === '/agent.mjs') {
         res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' }).end(script());
@@ -441,7 +443,8 @@ async function joinCommand(token: string) {
     docker: [
       'docker run -d --name servify-agent --restart unless-stopped --network host',
       '-v /var/run/docker.sock:/var/run/docker.sock node:22-alpine sh -c',
-      `'wget -q --no-check-certificate -O /agent.mjs ${url}/agent.mjs && echo "${hash}  /agent.mjs" | sha256sum -c -s && exec node /agent.mjs ${args}'`,
+      // Downloaded and verified once; container restarts reuse the verified copy (re-run the command to upgrade).
+      `'test -f /agent.mjs || { wget -q --no-check-certificate -O /tmp/agent.mjs ${url}/agent.mjs && echo "${hash}  /tmp/agent.mjs" | sha256sum -c -s && mv /tmp/agent.mjs /agent.mjs; } && exec node /agent.mjs ${args}'`,
     ].join(' \\\n  '),
     node: `node server/bin/agent.mjs ${args}`,
   };
