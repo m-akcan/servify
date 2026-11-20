@@ -36,7 +36,7 @@ export const api = {
 };
 
 /** Server-Sent Events with automatic reconnect and typed handlers. */
-export function sse(path: string, handlers: Record<string, (data: any) => void>, onOpen?: () => void, opts: { staleMs?: number } = {}): () => void {
+export function sse(path: string, handlers: Record<string, (data: any) => void>, onOpen?: () => void, opts: { staleMs?: number; onDown?: () => void } = {}): () => void {
   let es: EventSource | null = null;
   let closed = false;
   let retry = 500;
@@ -45,6 +45,7 @@ export function sse(path: string, handlers: Record<string, (data: any) => void>,
   const staleMs = opts.staleMs ?? 35_000;
   const watchdog = setInterval(() => {
     if (closed || !es || Date.now() - lastSeen < staleMs) return;
+    opts.onDown?.();
     es.close();
     lastSeen = Date.now();
     connect();
@@ -71,6 +72,7 @@ export function sse(path: string, handlers: Record<string, (data: any) => void>,
       });
     }
     es.onerror = () => {
+      opts.onDown?.();
       es?.close();
       if (closed) return;
       setTimeout(connect, retry);

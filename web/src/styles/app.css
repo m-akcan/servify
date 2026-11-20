@@ -1908,3 +1908,21 @@ a.panel-link:hover {
     flex-wrap: wrap;
   }
 }
+
+.reconnect {
+  position: absolute;
+  z-index: var(--z-toast);
+  top: 12px;
+  left: 50%;
+  translate: -50% 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  color: var(--warn);
+  font-size: var(--fs-12);
+  box-shadow: var(--shadow-2);
+}

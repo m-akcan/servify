@@ -7,7 +7,7 @@ import { openPalette } from '../components/CommandPalette.tsx';
 import { getThemePref, setThemePref } from '../lib/theme.ts';
 import { api } from '../lib/api.ts';
 import { checkAuth } from '../lib/store.ts';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 export function Logo({ size = 22 }: { size?: number }) {
   return (
@@ -17,6 +17,22 @@ export function Logo({ size = 22 }: { size?: number }) {
       <rect x="5" y="17" width="10" height="10" rx="2.6" fill="var(--signal)" opacity=".55" />
       <rect x="17" y="17" width="10" height="10" rx="2.6" fill="var(--signal)" opacity=".22" />
     </svg>
+  );
+}
+
+function ReconnectBanner({ connected }: { connected: boolean }) {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    if (connected) return setShow(false);
+    const t = setTimeout(() => setShow(true), 2500);
+    return () => clearTimeout(t);
+  }, [connected]);
+  if (!show) return null;
+  return (
+    <div className="reconnect glass rise-in">
+      <span className="spinner" style={{ width: 12, height: 12 }} />
+      Reconnecting to Servify…
+    </div>
   );
 }
 
@@ -103,7 +119,10 @@ export function Shell({ children }: { children: ReactNode }) {
           )}
         </div>
       </header>
-      <main className="main">{children}</main>
+      <main className="main">
+        {children}
+        <ReconnectBanner connected={connected} />
+      </main>
     </div>
   );
 }
