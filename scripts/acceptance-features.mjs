@@ -248,6 +248,40 @@ async function main() {
   check('deleting a service can keep its volume', (await api('GET', `/projects/${P.id}/volumes`)).find((v) => v.id === volId)?.serviceId === null);
 
   // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ PostgreSQL cluster (replication + failover)');
+  const pgc = (await api('POST', `/projects/${P.id}/services`, { templateId: 'postgres-cluster', name: 'pgc' })).service;
+  const cli = (await api('POST', `/projects/${P.id}/services`, { image: 'postgres:17-alpine', name: 'pgcli', protocol: 'none', startCommand: 'exec sleep infinity', env: { PGPASSWORD: '${{ pgc.POSTGRES_PASSWORD }}' } })).service;
+  const cstatus = async () => (await api('GET', `/services/${pgc.id}`)).clusterStatus;
+  const formed = await waitFor(async () => {
+    const c = await cstatus();
+    return c.members.filter((m) => m.role === 'primary').length === 1 && c.members.filter((m) => m.syncState === 'quorum').length === 2 && c;
+  }, 600_000, 'cluster');
+  check('cluster forms: 1 primary + 2 synchronous standbys', !!formed);
+  await running(P.id, 'pgcli');
+  const pq = (t, host = 'pgc') => exec(cli.id, `psql -h ${host} -U postgres -d app -qtAX -c "${t}"`);
+  const names = await exec(cli.id, "getent ahosts pgc | awk '{print $1}' | sort -u | wc -l; getent ahosts pgc-read | awk '{print $1}' | sort -u | wc -l");
+  check('writes name → primary only, -read → standbys', names.output.trim().split('\n').join(',') === '1,2', names.output);
+  await pq('create table w(v int primary key)');
+  check('standbys are read-only', /read-only/.test((await pq('insert into w values (-1)', 'pgc-read')).output ?? ''));
+  await exec(cli.id, 'nohup sh -c \'i=0; while [ ! -f /tmp/stop ]; do i=$((i+1)); psql -h pgc -U postgres -d app -qtAX -c "insert into w values ($i)" >/dev/null 2>&1 && echo $i >> /tmp/acks; sleep 0.05; done\' >/dev/null 2>&1 &');
+  await sleep(3000);
+  const was = (await cstatus()).primary;
+  execSync(`docker pause ${(await cstatus()).members.find((m) => m.index === was).containerId}`);
+  const failedOver = await waitFor(async () => (await cstatus()).primary !== was, 120_000, 'failover');
+  check('a hung primary fails over automatically', !!failedOver);
+  await sleep(5000);
+  await exec(cli.id, 'touch /tmp/stop');
+  await sleep(1500);
+  const acked = (await exec(cli.id, 'cat /tmp/acks')).output.trim().split('\n').filter(Boolean);
+  const have = new Set((await pq('select v from w')).output.trim().split('\n'));
+  check('no acknowledged write is lost', acked.length > 10 && acked.every((a) => have.has(a)), `${acked.length} acknowledged, ${acked.filter((a) => !have.has(a)).length} missing`);
+  const healed = await waitFor(async () => {
+    const c = await cstatus();
+    return c.members.filter((m) => m.role === 'primary').length === 1 && c.members.filter((m) => m.syncState === 'quorum').length === 2 && c;
+  }, 600_000, 'old primary rebuilt');
+  check('the old primary is fenced and rebuilt as a standby', !!healed && healed.members.find((m) => m.index === was)?.role === 'standby');
+
+  // ─────────────────────────────────────────────────────────────
   console.log('\n▸ docker compose import');
   const yaml = `name: compose-${Date.now().toString(36)}
 services:

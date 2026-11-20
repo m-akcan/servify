@@ -33,9 +33,12 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Environments & PR previews.** Copy a project into `staging` (own URLs, fresh data, optional branch), and get a `pr-<n>` environment for every same-repo pull request, deleted when it closes.
 - **Docker Compose import.** Paste a `docker-compose.yml`; services, variables (`.env` interpolation), volumes, replicas and limits carry over, compose hostnames keep working, and unsafe settings are refused with a warning.
 - **History.** Runtime logs and metrics are kept for 7 days in SQLite — they survive redeploys and restarts, and can be searched, filtered by deployment and charted up to a week back.
+- **PostgreSQL clusters.** A primary and streaming standbys, each on its own volume, with synchronous replication, automatic fenced failover, one-click switchover, and separate write (`DATABASE_URL`) and read (`DATABASE_READ_URL`) addresses.
+- **Per-replica volumes.** Give each replica its own volume so software that replicates itself can scale; deploys roll one replica at a time.
+- **Runs in the background.** `servify service install` starts it at login (launchd) or with your session/boot (systemd).
 - **Volumes you can move.** Volumes are first-class: create them, attach them to a service, detach them (the data stays, as a card on the canvas), drag them onto another service, rename and delete them. Sizes are shown live.
 - **Secrets encrypted at rest** (AES-256-GCM) with a master key you control.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 42 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 44 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -101,7 +104,7 @@ claude mcp add --transport http servify http://localhost:7700/mcp --header "Auth
 { "mcpServers": { "servify": { "command": "node", "args": ["/path/to/servify/server/bin/servify.mjs", "mcp"], "env": { "SERVIFY_URL": "http://localhost:7700", "SERVIFY_TOKEN": "svf_…" } } } }
 ```
 
-Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `import_compose`, `load_test`, `run_job`, `list_runs`, `backup_service`, `list_backups`, `restore_backup`, `list_environments`, `create_environment`, `set_previews`, `list_certificates`, `list_volumes`, `create_volume`, `attach_volume`, `detach_volume`, `delete_volume`.
+Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `import_compose`, `load_test`, `run_job`, `list_runs`, `backup_service`, `list_backups`, `restore_backup`, `list_environments`, `create_environment`, `set_previews`, `list_certificates`, `list_volumes`, `create_volume`, `attach_volume`, `detach_volume`, `delete_volume`, `cluster_status`, `switchover`.
 
 Example — an agent can create a full stack in one call with `import_project`:
 
@@ -158,6 +161,30 @@ Settings → Notifications: add Slack, Discord, Telegram, ntfy, email or webhook
 ## Volumes
 
 A volume belongs to a project and is attached to at most one service. It shows as a tab under its service on the canvas (name and size). From its menu you can **detach** it — the service restarts without it and the volume stays on the canvas as a detached card, data intact — and then drag it onto any service in the project to **attach** it at a mount path. "Attach volume…" on a service (or "New volume here" on the canvas) creates a fresh one. Deleting a service keeps its volumes as detached volumes unless you ask otherwise; deleting a volume is the only thing that removes its data. Attach and detach redeploy the service immediately, so a volume is never mounted by two services at once, and a rollback never mounts a volume that has moved away. A service with a volume runs as a single replica.
+
+## PostgreSQL clusters
+
+Create a service from the **PostgreSQL cluster** template: three replicas, each with its own volume. Replica 0 initialises as the primary; the others clone it with `pg_basebackup` and stream from it. Apps write through `${{ db.DATABASE_URL }}` (the service name points at the primary only) and can read through `${{ db.DATABASE_READ_URL }}` (`<name>-read`, the standbys). The TCP proxy also routes to the primary.
+
+- **Synchronous replication** (on by default): every commit waits for at least one standby (`ANY 1`), so a failover loses no acknowledged write. If no standby is streaming, Servify switches to asynchronous and alerts you rather than blocking writes.
+- **Automatic failover:** if the primary is unreachable for 15 seconds (configurable, or off), Servify fences it — removes its container and keeps the reconciler from restarting it — promotes the most up-to-date standby, records it as the primary, moves the service name to it, re-points the other standbys, and then rebuilds the old primary as a standby. A member that claims to be a primary but isn't the primary of record is fenced on sight; when the situation is ambiguous nothing is wiped and you get an alert.
+- **Switchover** ("Make primary" on a standby, or the `switchover` tool) hands over gracefully before maintenance. **Rebuild** re-clones a standby that fell behind.
+- Deploys roll standbys first and the primary last; backups dump from the primary; restores re-initialise the whole cluster.
+
+All replicas run on this machine, so this protects against a crashed or hung database, not against losing the machine.
+
+Volumes in general can be **per replica** ("One volume per replica" when creating one): each replica mounts its own volume, created on demand, and scaling down keeps the volumes for when you scale back up.
+
+## Start on boot
+
+```bash
+pnpm service install     # launchd agent on macOS, systemd user unit on Linux
+pnpm service status
+pnpm service uninstall
+pnpm service print       # show the file without installing anything
+```
+
+The service runs `servify start` with the `SERVIFY_*` and `DOCKER_HOST` variables of the shell you install it from, restarts it if it crashes, and logs to `~/.servify/logs/servify.log`. On Linux, `sudo loginctl enable-linger $USER` makes it start at boot without logging in.
 
 ## Backups
 

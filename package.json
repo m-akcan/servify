@@ -15,6 +15,7 @@
     "typecheck": "pnpm -r typecheck",
     "test:e2e": "node scripts/acceptance.mjs",
     "mcp": "node server/bin/servify.mjs mcp",
-    "token": "node server/bin/servify.mjs token"
+    "token": "node server/bin/servify.mjs token",
+    "service": "node server/bin/servify.mjs service"
   }
 }

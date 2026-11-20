@@ -656,3 +656,64 @@
 .vol-choice .faint {
   font-size: 11px;
 }
+
+/* ───────────── database clusters ───────────── */
+.cluster-card {
+  padding: 16px;
+}
+.cluster-members {
+  display: flex;
+  flex-direction: column;
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.cluster-member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  border-bottom: 1px solid var(--line);
+}
+.cluster-member .badge {
+  min-width: 82px;
+  justify-content: center;
+}
+.cm-index {
+  width: 26px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.cm-meta {
+  font-size: 11.5px;
+}
+.cluster-member.primary .cm-index {
+  color: var(--signal);
+}
+.cluster-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+.node-cluster {
+  display: inline-flex;
+  margin-top: 4px;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--signal-soft);
+  color: var(--signal);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+:root[data-theme='light'] .node-cluster {
+  color: #5c7300;
+}
+.node-cluster.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.node-cluster.busy {
+  background: var(--build-soft);
+  color: var(--build);
+}

@@ -373,7 +373,14 @@ async function manage(svc: Service) {
   }
   for (const k of [...st.members.keys()]) if (k >= want && !held.has(k)) st.members.delete(k);
 
-  if (deploying) return; // a deploy owns the containers; never fail over mid-roll
+  if (deploying) {
+    if (!primaryOk && !st.alerted.has('down-while-deploying')) {
+      st.alerted.add('down-while-deploying');
+      console.log(`[cluster] ${svc.name}: primary #${primaryIdx} unreachable during a deploy — failover waits for the deploy`);
+    }
+    return; // a deploy owns the containers; never fail over mid-roll
+  }
+  st.alerted.delete('down-while-deploying');
 
   // Split-brain guard: anyone else claiming to be a primary is fenced. Only rebuilt when the primary of record is healthy.
   for (const [i, p] of probes) {
@@ -395,6 +402,7 @@ async function manage(svc: Service) {
   }
 
   // Primary unreachable. A crash restart usually brings it back within seconds; fail over only if it doesn't.
+  if (!st.primaryDownSince) console.log(`[cluster] ${svc.name}: primary #${primaryIdx} unreachable`);
   st.primaryDownSince ??= Date.now();
   const after = svc.cluster!.failoverAfterSec;
   if (!after || Date.now() - st.primaryDownSince < after * 1000) return;

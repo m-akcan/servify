@@ -33,7 +33,11 @@ export type ServiceView = Service & {
   domainInfo: DomainInfo[];
   backupMethod: 'pg_dumpall' | 'mysqldump' | 'mongodump' | 'volume' | null;
   restoring: boolean;
+  clusterStatus: ClusterStatus | null;
 };
+
+export type ClusterMember = { index: number; role: 'primary' | 'standby' | 'starting' | 'down' | 'fenced' | 'rebuilding'; lsn: string | null; lagBytes: number | null; streaming: number | null; syncState: string | null; containerId: string | null };
+export type ClusterStatus = { kind: 'postgres'; primary: number; failoverAfterSec: number; synchronous: boolean; members: ClusterMember[]; primaryDownSince: number | null; lastFailoverAt: number | null; degradedAsync: boolean; operation: string | null };
 
 export type ProjectListItem = Project & {
   serviceCount: number;

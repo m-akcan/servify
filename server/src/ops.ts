@@ -474,6 +474,10 @@ export const updateServiceInput = z.object({
     .nullable()
     .optional()
     .describe('Scheduled backups of the service data (databases are dumped, other volumes archived)'),
+  cluster: z
+    .object({ failoverAfterSec: z.number().int().min(0).max(3600).optional(), synchronous: z.boolean().optional() })
+    .optional()
+    .describe('Database cluster settings: failoverAfterSec (0 = manual only), synchronous replication. Use switchover to change the primary.'),
   schedule: z.string().nullable().optional().describe('Cron expression (e.g. "*/15 * * * *", "@daily"). Turns the service into a scheduled job; null to clear.'),
   x: z.number().optional(),
   y: z.number().optional(),
@@ -575,6 +579,10 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
       if (!destinationById(b.destinationId)) throw new HttpError(400, `unknown backup destination: ${b.destinationId}`);
       set('backup', b, 'backups');
     }
+  }
+  if (patch.cluster !== undefined) {
+    if (!svc.cluster) throw new HttpError(400, `${svc.name} is not a database cluster`);
+    set('cluster', { ...svc.cluster, ...patch.cluster }, 'cluster settings');
   }
   if (patch.schedule !== undefined) {
     const sched = patch.schedule?.trim() || null;

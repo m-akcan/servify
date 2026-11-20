@@ -64,3 +64,10 @@
 - [x] Detach marks the record first, takes the service over, drains, then redeploys; attach checks the volume isn't mounted anywhere and queues a redeploy.
 - [x] Service delete keeps volumes as detached by default in the UI; project delete removes its detached volumes.
 - [x] UI: volume tabs under service cards, detached volume cards (drag onto a service to attach), Attach / New / Rename / Detach / Delete dialogs, settings section. MCP: 42 tools.
+
+## Round 4 — per-replica volumes, PostgreSQL clusters, start on boot
+- [x] Per-replica volume sets (members created on demand, kept on scale-down), rolling per-index deploys; shared volumes still force 1 replica. Gate: distinct data ×3, 3→2→3 reuse, rolling redeploy; suites 34/29.
+- [x] Experiments first (plain Docker): replication pg_hba line at init, clone ownership, standby re-point via ALTER SYSTEM + reload, quorum sync, an unpaused old primary is writable (→ fencing required). Image ships gosu, not su-exec.
+- [x] `pgcluster.ts`: role polling, primary-only routing (service name + TCP proxy), `<name>-read`, sync policy with async fallback, fenced failover, split-brain guard, switchover, rebuild, rolling order (primary first when not running), restore/backup via the primary.
+- [x] Verified: hung primary under writes → failover in ~20s, 0/156 acknowledged writes lost, old primary rebuilt; switchover (API + UI); rolling redeploy; backup/restore; Servify restart keeps the primary of record; killed primary restarts without failover.
+- [x] `servify service install|uninstall|status|print` (launchd plist validated with plutil; systemd unit generated, untested on Linux). Not installed on this machine.

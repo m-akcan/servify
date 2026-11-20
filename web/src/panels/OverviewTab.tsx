@@ -11,6 +11,7 @@ import { toastError } from '../components/ui.tsx';
 import type { PanelTab } from './ServicePanel.tsx';
 import type { LbStrategy } from '../lib/types.ts';
 import { ScheduleCard } from './ScheduleCard.tsx';
+import { ClusterCard } from './ClusterCard.tsx';
 
 function Stat({ label, value, format, unit, icon }: { label: string; value: number; format: (n: number) => string; unit?: string; icon: any }) {
   const ref = useRef<HTMLSpanElement>(null);
@@ -128,6 +129,8 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
         <Stat label="Memory" value={memMb} format={(n) => mem(n).split(' ')[0]} unit={memMb >= 1024 ? 'GB' : 'MB'} icon="memory" />
       </div>
 
+      {s.clusterStatus && <ClusterCard service={s} />}
+
       {s.deployedSchedule ? (
         <ScheduleCard service={s} />
       ) : (
@@ -136,7 +139,9 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
           <div className="grow">
             <div className="h3">Replicas</div>
             <div className="faint" style={{ fontSize: 12, marginTop: 2 }}>
-              {stateful
+              {s.cluster
+                ? `1 primary + ${Math.max(0, s.replicas - 1)} standby${s.replicas === 2 ? '' : 's'} · each with its own volume. Adding a replica adds a standby that clones the primary.`
+                : stateful
                 ? 'Stateful service with a volume — runs as a single replica to keep data safe.'
                 : s.protocol === 'none'
                   ? 'Workers run in parallel; no load balancer needed.'
@@ -145,10 +150,10 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
                     : 'Add replicas to load-balance traffic and survive crashes.'}
             </div>
           </div>
-          <Stepper value={s.replicas} min={0} max={stateful ? 1 : 32} onChange={(v) => void scale(s, v)} disabled={stateful && s.replicas >= 1 && false} />
+          <Stepper value={s.replicas} min={s.cluster ? Math.max(1, s.cluster.primary + 1) : 0} max={stateful ? 1 : s.cluster ? 6 : 32} onChange={(v) => void scale(s, v)} disabled={stateful && s.replicas >= 1 && false} />
         </div>
         {s.protocol === 'http' && s.activeDeploymentId && !s.stopped && <LoadTester serviceId={s.id} />}
-        {s.protocol !== 'none' && !stateful && (
+        {s.protocol !== 'none' && !stateful && !s.cluster && (
           <div className="row" style={{ gap: 10 }}>
             <span className="label">Strategy</span>
             <Segmented<LbStrategy>

@@ -385,17 +385,33 @@ export const docker = {
   async exec(id: string, cmd: string[], timeoutMs = 30000): Promise<{ exitCode: number; output: string }> {
     const ex = await call<{ Id: string }>('POST', `/containers/${id}/exec`, {
       body: { AttachStdout: true, AttachStderr: true, Tty: false, Cmd: cmd },
+      timeout: Math.min(timeoutMs, 10_000),
     });
-    const res = await stream('POST', `/exec/${ex.Id}/start`, { body: { Detach: false, Tty: false }, timeout: timeoutMs });
-    let output = '';
-    const lines: string[] = [];
-    for await (const f of demuxLines(res)) {
-      lines.push(f.text);
-      if (lines.length > 2000) lines.shift();
+    // A hard deadline: once the stream is open the socket has no idle timeout, so a command that never exits (or a
+    // daemon that never answers) would otherwise hang the caller forever.
+    let res: http.IncomingMessage | undefined;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      res?.destroy(new Error(`exec timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+    try {
+      res = await stream('POST', `/exec/${ex.Id}/start`, { body: { Detach: false, Tty: false }, timeout: timeoutMs });
+      if (timedOut) res.destroy();
+      const lines: string[] = [];
+      for await (const f of demuxLines(res)) {
+        lines.push(f.text);
+        if (lines.length > 2000) lines.shift();
+      }
+      if (timedOut) throw new Error(`exec timed out after ${timeoutMs} ms`);
+      const info = await call<any>('GET', `/exec/${ex.Id}/json`, { timeout: 5000 });
+      return { exitCode: info.ExitCode ?? -1, output: lines.join('\n') };
+    } catch (e) {
+      if (timedOut) throw new Error(`exec timed out after ${timeoutMs} ms`);
+      throw e;
+    } finally {
+      clearTimeout(timer);
     }
-    output = lines.join('\n');
-    const info = await call<any>('GET', `/exec/${ex.Id}/json`);
-    return { exitCode: info.ExitCode ?? -1, output };
   },
 };
 
