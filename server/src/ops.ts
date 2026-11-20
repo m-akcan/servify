@@ -740,7 +740,8 @@ async function checkPorts(actor: Actor, svc: Service, ports: NonNullable<UpdateS
     if (clash) throw new HttpError(409, `${p.host}/${p.protocol} is already published by ${clash.name}`);
     if (node === LOCAL) {
       const own = [config.port, config.proxyPort, config.httpsPort, config.agentPort];
-      if (p.protocol === 'tcp' && (own.includes(p.host) || tcpPortInUse(p.host))) throw new HttpError(409, `${p.host} is used by Servify itself (dashboard, router or a TCP proxy)`);
+      // Its own TCP proxy may be on that port — fine if this same update turns it off (svc already holds the new value).
+      if (p.protocol === 'tcp' && (own.includes(p.host) || tcpPortInUse(p.host, svc.id) || svc.publicTcpPort === p.host)) throw new HttpError(409, `${p.host} is used by Servify itself (dashboard, router or a TCP proxy)`);
       if (!(await hostPortFree(p.host, p.protocol, p.hostIp || '0.0.0.0'))) throw new HttpError(409, `${p.host}/${p.protocol} is busy on this machine`);
     }
   }

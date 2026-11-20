@@ -11,7 +11,7 @@ import * as x509 from '@peculiar/x509';
 import acme from 'acme-client';
 import tls from 'node:tls';
 import http from 'node:http';
-import { webcrypto, X509Certificate, randomBytes } from 'node:crypto';
+import { webcrypto, X509Certificate, randomBytes, createPrivateKey, createPublicKey } from 'node:crypto';
 import { certsTable, kv, services as servicesTable, projects as projectsTable } from './db.ts';
 import { seal, open, sealJson, openJson } from './crypto.ts';
 import { getSettings } from './settings.ts';
@@ -228,6 +228,7 @@ async function issue(host: string, opts: { skipCheck?: boolean } = {}) {
     });
     const leaf = new X509Certificate(chain);
     rec.status = 'issued';
+    rec.issuer = 'acme'; // an imported certificate becomes Servify's own once renewed
     rec.issuedAt = Date.now();
     rec.expiresAt = Date.parse(leaf.validTo);
     rec.certPem = chain;
@@ -386,4 +387,52 @@ export function agentTlsMaterial() {
     return { ...mat, fingerprint: new X509Certificate(mat.certPem).fingerprint256 };
   })();
   return agentTls;
+}
+
+// ───────────────────────────── importing existing certificates ─────────────────────────────
+
+/**
+ * Take over a valid certificate issued elsewhere (e.g. by Nginx Proxy Manager) so a switch to Servify has no
+ * certificate gap. It is renewed through ACME like any other, 30 days before it expires.
+ */
+export function importCertificate(host: string, chainPem: string, keyPem: string) {
+  const name = host.trim().toLowerCase();
+  if (!/^[a-z0-9.-]+$/.test(name)) throw new Error(`not a host name: ${host}`);
+  let cert: X509Certificate;
+  try {
+    cert = new X509Certificate(chainPem);
+  } catch {
+    throw new Error('the certificate file is not a PEM certificate');
+  }
+  if (!cert.checkHost(name)) throw new Error(`the certificate is for ${cert.subjectAltName ?? cert.subject}, not ${name}`);
+  const notAfter = Date.parse(cert.validTo);
+  if (!(notAfter > Date.now())) throw new Error(`the certificate expired on ${cert.validTo}`);
+  let priv;
+  try {
+    priv = createPrivateKey(keyPem);
+  } catch {
+    throw new Error('the key file is not a PEM private key');
+  }
+  const a = createPublicKey(priv).export({ type: 'spki', format: 'der' });
+  const b = cert.publicKey.export({ type: 'spki', format: 'der' });
+  if (!a.equals(b)) throw new Error('the key does not belong to this certificate');
+  tls.createSecureContext({ key: keyPem, cert: chainPem }); // the chain must load as Servify will use it
+  const now = Date.now();
+  const prev = certsTable.get(name);
+  save({
+    id: name,
+    host: name,
+    status: 'issued',
+    issuer: 'imported',
+    expiresAt: notAfter,
+    issuedAt: Date.parse(cert.validFrom) || now,
+    lastAttemptAt: prev?.lastAttemptAt ?? null,
+    nextAttemptAt: null,
+    attempts: 0,
+    error: null,
+    certPem: chainPem.trim() + '\n',
+    keySealed: seal(keyPem),
+    createdAt: prev?.createdAt ?? now,
+  });
+  return { host: name, expiresAt: notAfter, issuer: cert.issuer.split('\n').find((l) => l.startsWith('O='))?.slice(2) ?? cert.issuer };
 }

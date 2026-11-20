@@ -6,6 +6,7 @@
  *   servify token <name> [--read]   create an API token directly in the local database
  *   servify service install | uninstall | status | print   run in the background, start at login/boot
  *   servify agent --join <url> --token <t> --fingerprint <fp>   let a Servify run services on this machine
+ *   servify cert import <host> <fullchain.pem> <privkey.pem>   take over an existing certificate
  */
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -44,6 +45,21 @@ if (cmd === 'start') {
   const { createToken } = await import(pathToFileURL(join(here, '../src/auth.ts')).href);
   const { token, record } = createToken(name, rest.includes('--read') ? 'read' : 'write');
   console.log(`Created ${record.scope} token "${record.name}":\n\n  ${token}\n\nIt won't be shown again.`);
+} else if (cmd === 'cert' && rest[0] === 'import') {
+  const [, host, chainFile, keyFile] = rest;
+  if (!host || !chainFile || !keyFile) {
+    console.error('usage: servify cert import <host> <fullchain.pem> <privkey.pem>');
+    process.exit(1);
+  }
+  const { readFileSync } = await import('node:fs');
+  const { importCertificate } = await import(pathToFileURL(join(here, '../src/certs.ts')).href);
+  try {
+    const r = importCertificate(host, readFileSync(chainFile, 'utf8'), readFileSync(keyFile, 'utf8'));
+    console.log(`imported ${r.host} (${r.issuer}), valid until ${new Date(r.expiresAt).toISOString().slice(0, 10)} — restart Servify to serve it`);
+  } catch (e) {
+    console.error(`${host}: ${e.message}`);
+    process.exit(1);
+  }
 } else if (cmd === 'agent') {
   await import(pathToFileURL(join(here, 'agent.mjs')).href);
 } else if (cmd === 'service') {

@@ -273,7 +273,8 @@ export interface CertRecord {
   id: string;
   host: string;
   status: 'pending' | 'issued' | 'failed';
-  issuer: 'acme' | 'internal';
+  /** imported: taken over from elsewhere — kept until an ACME renewal replaces it. */
+  issuer: 'acme' | 'internal' | 'imported';
   expiresAt: number | null;
   issuedAt: number | null;
   lastAttemptAt: number | null;
