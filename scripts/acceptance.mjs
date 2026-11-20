@@ -242,7 +242,15 @@ try {
   const jd = await api('POST', `/services/${job.service.id}/deploy`);
   const jdd = await waitDeploy(jd.id);
   check('cron service armed', jdd.status === 'active', jdd.error ?? '');
-  await api('POST', `/services/${job.service.id}/run`);
+  // The schedule fires every minute; retry if a scheduled run is in progress (409).
+  await waitFor(async () => {
+    try {
+      await api('POST', `/services/${job.service.id}/run`);
+      return true;
+    } catch {
+      return false;
+    }
+  }, 30_000, 'manual run accepted');
   let runs = [];
   const manualOk = await waitFor(async () => {
     runs = await api('GET', `/services/${job.service.id}/runs`);

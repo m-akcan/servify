@@ -910,6 +910,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
 
 export async function runServiceJob(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
+  if (isJobRunning(svc.id)) throw new HttpError(409, `${svc.name} is already running — wait for the current run to finish`);
   // Fire and return the run immediately; completion arrives as a job.run event.
   const p = runJob(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
   p.catch(() => {});
