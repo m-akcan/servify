@@ -104,9 +104,10 @@ function setServiceStatus(serviceId: string, status: Service['status'], patch: P
 
 function sourceLabel(svc: Service): string {
   const s = svc.source;
+  if (s.type === 'external') return s.url;
   if (s.type === 'image') return s.image;
   if (s.type === 'git') return `${s.repo.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '')}${s.branch ? `@${s.branch}` : ''}`;
-  return s.path;
+  return (s as any).path;
 }
 
 /** Queue a deployment for the service. Returns immediately; the pipeline runs in the background. */

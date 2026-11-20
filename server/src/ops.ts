@@ -22,6 +22,7 @@ import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
 import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { clusterStatus } from './pgcluster.ts';
+import { isExternal, parseExternalUrl, externalTarget } from './external.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
@@ -64,6 +65,7 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.server = { id: node, name: node === LOCAL ? 'This machine' : nodeName(node), online: isOnline(node) };
   // Private names (service.project.internal / ${{ x.HOST }}) only resolve on the same server in this version.
   out.crossServerRefs = referencedServicesOn(s);
+  out.external = externalTarget(s);
   out.restoring = isRestoring(s.id);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
@@ -221,6 +223,7 @@ export const createServiceInput = z.object({
   y: z.number().optional(),
   deploy: z.boolean().optional().describe('Deploy immediately (default true)'),
   server: z.string().optional().describe('Server to run on (id or name from list_servers). Default: this machine.'),
+  external: z.string().optional().describe('Route to an address on another machine instead of running anything, e.g. http://192.168.1.20:8080 (owner only)'),
 });
 export type CreateServiceInput = z.infer<typeof createServiceInput>;
 
@@ -230,6 +233,7 @@ function inferName(input: CreateServiceInput): string {
   if (input.image) return input.image.split('/').pop()!.split(':')[0].split('@')[0];
   if (input.repo) return normalizeRepo(input.repo).split('/').pop()!.replace(/\.git$/, '');
   if (input.path) return input.path.replace(/\/+$/, '').split('/').pop() || 'app';
+  if (input.external) return input.external.replace(/^[a-z]+:\/\//i, '').split(/[:/]/)[0].replace(/\./g, '-') || 'external';
   return 'service';
 }
 
@@ -358,7 +362,11 @@ export async function createService(actor: Actor, projectId: string, raw: Create
       token: input.token?.trim() || undefined,
     };
   else if (input.path) source = { type: 'local', path: input.path.trim(), dockerfile: input.dockerfile?.trim() || undefined };
-  else throw new HttpError(400, 'provide one of: templateId, image, repo, path');
+  else if (input.external) {
+    // The router can reach anything this machine can: pointing it somewhere is the owner's call.
+    requireOwner(actor, 'External routes');
+    source = { type: 'external', ...parseExternalUrl(input.external, input.protocol ?? 'http') };
+  } else throw new HttpError(400, 'provide one of: templateId, image, repo, path, external');
 
   // A GitHub "tree" URL carries branch and subdirectory.
   if (input.repo) {
@@ -416,16 +424,23 @@ export async function createService(actor: Actor, projectId: string, raw: Create
     updatedAt: Date.now(),
   };
   if (protocol === 'tcp') svc.publicTcpPort = await allocateTcpPort();
+  if (source.type === 'external') {
+    svc.replicas = 1;
+    svc.autoDeploy = false;
+    svc.status = 'deploying'; // until the first probe answers
+    if (svc.nodeId) throw new HttpError(400, 'an external route runs on this machine’s router — no server to pick');
+  }
   servicesTable.insert(svc);
   syncServiceVolumes(svc);
   bus.publish({ type: 'service.updated', service: svc });
   recordActivity(actor, 'service.created', `Created ${svc.name} from ${describeSource(source)}`, project.id, svc.id);
   let deployment: Deployment | null = null;
-  if (input.deploy !== false) deployment = queueDeployment(svc, 'create', actor);
+  if (input.deploy !== false && source.type !== 'external') deployment = queueDeployment(svc, 'create', actor);
   return { service: serializeService(servicesTable.get(svc.id)!), deployment: deployment ? serializeDeployment(deployment) : null };
 }
 
 function describeSource(s: Source) {
+  if (s.type === 'external') return s.url;
   if (s.type === 'image') return s.image;
   if (s.type === 'git') return s.repo.replace(/^https:\/\/github\.com\//, '');
   return s.path;
@@ -497,6 +512,7 @@ export const updateServiceInput = z.object({
     .nullable()
     .optional()
     .describe('Scheduled backups of the service data (databases are dumped, other volumes archived)'),
+  external: z.string().optional().describe('New address of an external route (owner only)'),
   ports: z
     .array(z.object({ container: z.number().int().min(1).max(65535), host: z.number().int().min(1).max(65535), protocol: z.enum(['tcp', 'udp']), hostIp: z.string().nullable().optional() }))
     .optional()
@@ -521,6 +537,14 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
       changes.push(label);
     }
   };
+  if (isExternal(svc)) {
+    if ((patch.replicas !== undefined && patch.replicas !== 1) || patch.volumes?.length || patch.ports?.length || patch.autoscale?.enabled || patch.image || patch.repo || patch.path)
+      throw new HttpError(400, `${svc.name} is a route to another machine: no replicas, volumes, ports or builds`);
+    if (patch.external !== undefined) {
+      requireOwner(actor, 'External routes');
+      set('source', { type: 'external', ...parseExternalUrl(patch.external, patch.protocol ?? svc.protocol) }, 'address');
+    }
+  } else if (patch.external !== undefined) throw new HttpError(400, 'only a route can change its address; create a new external service instead');
   if (patch.name !== undefined) set('name', patch.name.trim(), 'name');
   if (patch.icon !== undefined) set('icon', patch.icon);
   if (patch.image !== undefined) set('source', { type: 'image', image: patch.image.trim() }, 'source');
@@ -641,6 +665,10 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   return serializeService(svc);
 }
 
+function notExternal(svc: Service, what: string) {
+  if (isExternal(svc)) throw new HttpError(400, `${svc.name} is a route to ${(svc.source as any).url} — there's nothing to ${what} here`);
+}
+
 /** Host folders, published ports and external routes reach outside the container sandbox: the owner decides. */
 export function requireOwner(actor: Actor, what: string) {
   if (actor.type !== 'user') throw new HttpError(403, `${what} can only be set by the owner in the dashboard, not with an agent token`);
@@ -755,6 +783,7 @@ export function referencedServicesOn(s: Service): string[] {
 /** Run a service on another server: redeploy there (zero downtime for stateless services), then retire the old replicas. */
 export async function moveService(actor: Actor, serviceId: string, serverRef: string) {
   const svc = getServiceOrThrow(serviceId);
+  notExternal(svc, 'move');
   const target = resolveServer(serverRef);
   const from = nodeOf(svc);
   if (target === from) return serializeService(svc);
@@ -781,6 +810,7 @@ export async function scaleService(actor: Actor, serviceId: string, replicas: nu
 
 export function deployService(actor: Actor, serviceId: string, trigger: 'manual' | 'agent' | 'git' | 'config' = actor.type === 'agent' ? 'agent' : 'manual') {
   const svc = getServiceOrThrow(serviceId);
+  notExternal(svc, 'deploy');
   if (svc.stopped) {
     svc.stopped = false;
     servicesTable.put(svc);
@@ -791,12 +821,14 @@ export function deployService(actor: Actor, serviceId: string, trigger: 'manual'
 /** Zero-downtime restart: roll the current image onto fresh replicas. */
 export function restartService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
+  notExternal(svc, 'restart');
   const active = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
   if (!active?.image) return deployService(actor, serviceId);
   return serializeDeployment(queueDeployment(svc, 'restart', actor, { image: active.image, port: active.port, fromDeployment: active }));
 }
 
 export function rollbackService(actor: Actor, serviceId: string, deploymentId: string) {
+  notExternal(getServiceOrThrow(serviceId), 'roll back');
   const svc = getServiceOrThrow(serviceId);
   const target = deploymentsTable.get(deploymentId);
   assert(target && target.serviceId === svc.id, 404, 'deployment not found for this service');
@@ -833,6 +865,13 @@ export async function stopService(actor: Actor, serviceId: string) {
 export function startService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   svc.stopped = false;
+  if (isExternal(svc)) {
+    svc.status = 'deploying';
+    servicesTable.put(svc);
+    bus.publish({ type: 'service.updated', service: svc });
+    recordActivity(actor, 'service.started', `Routing to ${svc.name} again`, svc.projectId, svc.id);
+    return { service: serializeService(svc), deployment: null };
+  }
   if (!svc.activeDeploymentId) return { service: serializeService(svc), deployment: deployService(actor, svc.id) };
   const active = deploymentsTable.get(svc.activeDeploymentId);
   if (active && (active.nodeId ?? null) !== (svc.nodeId ?? null)) {
@@ -1070,6 +1109,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   };
   if (s.type === 'image') input.image = s.image;
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
+  else if (s.type === 'external') input.external = s.url;
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
   await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
@@ -1128,12 +1168,13 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   for (const raw of spec.services) {
     const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
     const src = raw.source ?? (tpl ? { type: 'image' as const, image: tpl.image } : undefined);
-    assert(src && ['image', 'git', 'local'].includes(src.type), 400, `service ${raw.name}: invalid source`);
+    assert(src && ['image', 'git', 'local', 'external'].includes(src.type), 400, `service ${raw.name}: invalid source`);
     // Start from the template (all its variables, volumes, port…) when there is one; the spec overrides.
     const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y };
     if (tpl) input.templateId = tpl.id;
     else if (src.type === 'image') input.image = src.image;
     else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile, token: src.token });
+    else if (src.type === 'external') input.external = src.url;
     else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
     if (raw.protocol) input.protocol = raw.protocol;
     if (raw.port) input.port = raw.port;

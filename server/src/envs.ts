@@ -62,6 +62,8 @@ export async function createEnvironment(
   if (siblings.some((p) => p.envName === envName)) throw new HttpError(409, `${base.name} already has an environment called ${envName}`);
 
   const spec = exportProject(base.id, { secrets: true });
+  // External routes point at production machines: environments don't get them.
+  spec.services = spec.services.filter((s) => s.source?.type !== 'external');
   const branch = input.branch?.trim();
   const repo = input.repo ? repoKey(input.repo) : null;
   for (const s of spec.services) {

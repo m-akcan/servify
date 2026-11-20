@@ -15,6 +15,7 @@ import { sleep, id as newId } from './util.ts';
 import { kv } from './db.ts';
 import { notify } from './notify.ts';
 import { mountsFor, hasSharedVolume, hostMountsFor } from './volumes.ts';
+import { externalUpstreams } from './external.ts';
 import { LOCAL, nodeOf, isOnline, onlineNodes, dockerFor, dockerForContainer, setContainerNode, forgetContainer, containerNodeOf, forwardPort, pruneForwards, onNodeChange } from './nodes.ts';
 
 /** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
@@ -118,6 +119,7 @@ export function isHeld(serviceId: string, index: number) {
 }
 
 export function upstreamsFor(svc: Service): Runtime[] {
+  if (svc.source.type === 'external') return externalUpstreams(svc);
   const out: Runtime[] = [];
   for (const r of runtime.values()) {
     if (r.serviceId !== svc.id) continue;
@@ -169,6 +171,7 @@ export function refreshServiceStatus(serviceId: string) {
   const svc = servicesTable.get(serviceId);
   if (!svc) return;
   if (busy.has(serviceId)) return;
+  if (svc.source.type === 'external') return; // its status comes from probing the target (external.ts)
   if (!isOnline(nodeOf(svc))) return; // unknown, not down: keep the last status until the server is back
   let next = svc.status;
   if (svc.stopped) next = 'stopped';

@@ -3,7 +3,9 @@
 export type SourceImage = { type: 'image'; image: string };
 export type SourceGit = { type: 'git'; repo: string; branch?: string; rootDir?: string; dockerfile?: string; token?: string };
 export type SourceLocal = { type: 'local'; path: string; dockerfile?: string };
-export type Source = SourceImage | SourceGit | SourceLocal;
+/** An address on another machine: nothing is deployed, the router just sends traffic there. */
+export type SourceExternal = { type: 'external'; url: string; host: string; port: number };
+export type Source = SourceImage | SourceGit | SourceLocal | SourceExternal;
 
 export type Protocol = 'http' | 'tcp' | 'none';
 export type LbStrategy = 'round-robin' | 'least-conn' | 'ip-hash' | 'random';

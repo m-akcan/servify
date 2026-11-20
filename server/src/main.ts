@@ -134,6 +134,7 @@ async function main() {
   (await import('./volumes.ts')).startVolumes();
   (await import('./pgcluster.ts')).startClusters();
   (await import('./nodes.ts')).startServers();
+  (await import('./external.ts')).startExternal();
   setInterval(() => sessionsTable.prune(), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
