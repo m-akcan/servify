@@ -701,3 +701,15 @@
 .canvas[data-lod='far'] .ingress-stats .faint {
   display: none;
 }
+
+.cron-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-11);
+  color: var(--build);
+  font-weight: 500;
+}
+.cron-chip.running svg {
+  animation: spin 1.2s linear infinite;
+}

@@ -10,6 +10,7 @@ import { api } from '../lib/api.ts';
 import { toastError } from '../components/ui.tsx';
 import type { PanelTab } from './ServicePanel.tsx';
 import type { LbStrategy } from '../lib/types.ts';
+import { ScheduleCard } from './ScheduleCard.tsx';
 
 function Stat({ label, value, format, unit, icon }: { label: string; value: number; format: (n: number) => string; unit?: string; icon: any }) {
   const ref = useRef<HTMLSpanElement>(null);
@@ -127,6 +128,9 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
         <Stat label="Memory" value={memMb} format={(n) => mem(n).split(' ')[0]} unit={memMb >= 1024 ? 'GB' : 'MB'} icon="memory" />
       </div>
 
+      {s.schedule ? (
+        <ScheduleCard service={s} />
+      ) : (
       <section className="card scale-card">
         <div className="scale-head">
           <div className="grow">
@@ -184,6 +188,7 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
           })}
         </div>
       </section>
+      )}
 
       {(s.url || s.tcpAddress || s.protocol !== 'none') && (
         <section className="card net-card">

@@ -5,6 +5,7 @@ import { Button, Segmented, Switch, Field, Stepper, toastError, toast } from '..
 import { Icon } from '../components/Icon.tsx';
 import { remove, stop, start } from '../lib/actions.ts';
 import { useStore } from '../lib/store.ts';
+import { describeCron } from '../lib/format.ts';
 
 async function patch(id: string, body: Record<string, unknown>, quiet = false) {
   try {
@@ -58,6 +59,37 @@ function Section({ title, desc, children, icon }: { title: string; desc?: string
     </section>
   );
 }
+
+const PRESETS: [string, string][] = [
+  ['*/5 * * * *', 'Every 5 min'],
+  ['@hourly', 'Hourly'],
+  ['0 3 * * *', 'Daily 03:00'],
+  ['0 9 * * 1-5', 'Weekdays 09:00'],
+  ['@weekly', 'Weekly'],
+];
+
+function ScheduleField({ service: s }: { service: ServiceView }) {
+  return (
+    <>
+      <Field label="Cron expression" hint={s.schedule ? `${describeCron(s.schedule)} · deploy to apply changes` : 'Empty = a normal always-on service'}>
+        <CommitInput mono value={s.schedule ?? ''} placeholder="e.g. */15 * * * *" onCommit={(v) => void patch(id(s), { schedule: v || null })} />
+      </Field>
+      <div className="row" style={{ flexWrap: 'wrap', gap: 6 }}>
+        {PRESETS.map(([v, l]) => (
+          <button key={v} type="button" className={`chip ${s.schedule === v ? 'chip-on' : ''}`} onClick={() => void patch(id(s), { schedule: v })}>
+            {l}
+          </button>
+        ))}
+        {s.schedule && (
+          <button type="button" className="chip" onClick={() => void patch(id(s), { schedule: null })}>
+            <Icon name="x" size={11} /> Clear
+          </button>
+        )}
+      </div>
+    </>
+  );
+}
+const id = (s: ServiceView) => s.id;
 
 export function SettingsTab({ service: s }: { service: ServiceView }) {
   const proxyPort = useStore((st) => st.current?.proxyPort ?? 8080);
@@ -141,6 +173,10 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         <Field label="Start command" hint="Runs via /bin/sh -c, replacing the image's default command">
           <CommitInput mono value={s.startCommand ?? ''} placeholder="image default" onCommit={(v) => void patch(id, { startCommand: v || null })} />
         </Field>
+      </Section>
+
+      <Section title="Schedule" icon="clock" desc="Run this service as a cron job: a one-off container on a schedule instead of always-on replicas.">
+        <ScheduleField service={s} />
       </Section>
 
       <Section title="Networking" icon="globe">

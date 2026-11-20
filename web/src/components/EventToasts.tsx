@@ -25,6 +25,13 @@ export function EventToasts() {
         if (d.status === 'active') toast({ title: `${name} is live`, body: `${d.sourceLabel}${by}`, tone: 'ok', action: svc ? { label: 'View', onClick: open } : undefined });
         else toast({ title: `${name} failed to deploy`, body: `${(d.error ?? '').slice(0, 120)}${by}`, tone: 'err', duration: 8000, action: svc ? { label: 'Logs', onClick: open } : undefined });
       }
+      if (ev.type === 'job.run' && ev.run.status !== 'running') {
+        const svc = store.get().current?.services[ev.run.serviceId];
+        const name = svc?.name ?? 'Job';
+        if (ev.run.status === 'failed') toast({ title: `${name} run failed`, body: `exit ${ev.run.exitCode ?? '?'} · ${ev.run.output.split('\n').filter(Boolean).pop()?.slice(0, 100) ?? ''}`, tone: 'err', duration: 7000 });
+        else if (ev.run.trigger !== 'schedule') toast({ title: `${name} finished`, body: `exit 0 in ${Math.round(((ev.run.finishedAt ?? Date.now()) - ev.run.startedAt) / 100) / 10}s`, tone: 'ok' });
+        return;
+      }
       if (ev.type === 'activity') {
         const a = ev.entry;
         if (a.action === 'service.crashloop') toast({ title: 'Crash loop detected', body: a.summary, tone: 'err', duration: 8000 });

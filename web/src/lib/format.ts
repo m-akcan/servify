@@ -84,3 +84,29 @@ export function isBusy(status: ServiceStatus | DeploymentStatus) {
 export function copy(text: string) {
   return navigator.clipboard?.writeText(text);
 }
+
+/** Plain-English summary of common cron expressions. */
+export function describeCron(expr: string): string {
+  const e = expr.trim();
+  const macros: Record<string, string> = { '@hourly': 'Every hour', '@daily': 'Every day at midnight', '@midnight': 'Every day at midnight', '@weekly': 'Every Sunday at midnight', '@monthly': 'On the 1st of every month', '@yearly': 'Once a year', '@annually': 'Once a year' };
+  if (macros[e]) return macros[e];
+  const p = e.split(/\s+/);
+  if (p.length !== 5) return e;
+  const [mi, h, dom, mon, dow] = p;
+  const pad = (n: string) => n.padStart(2, '0');
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  if (mi === '*' && h === '*' && dom === '*' && mon === '*' && dow === '*') return 'Every minute';
+  let m = mi.match(/^\*\/(\d+)$/);
+  if (m && h === '*' && dom === '*' && mon === '*' && dow === '*') return `Every ${m[1]} minutes`;
+  m = h.match(/^\*\/(\d+)$/);
+  if (m && /^\d+$/.test(mi) && dom === '*' && mon === '*' && dow === '*') return `Every ${m[1]} hours at :${pad(mi)}`;
+  if (/^\d+$/.test(mi) && h === '*' && dom === '*' && mon === '*' && dow === '*') return `Every hour at :${pad(mi)}`;
+  if (/^\d+$/.test(mi) && /^\d+$/.test(h) && mon === '*') {
+    const t = `${pad(h)}:${pad(mi)}`;
+    if (dom === '*' && dow === '*') return `Every day at ${t}`;
+    if (dom === '*' && dow === '1-5') return `Weekdays at ${t}`;
+    if (dom === '*' && /^\d$/.test(dow)) return `Every ${days[Number(dow) % 7]} at ${t}`;
+    if (/^\d+$/.test(dom) && dow === '*') return `Monthly on day ${dom} at ${t}`;
+  }
+  return e;
+}

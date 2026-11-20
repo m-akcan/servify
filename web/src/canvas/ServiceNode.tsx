@@ -5,7 +5,7 @@ import { registry, snap, NODE_W, nodeControls, type Camera } from './geometry.ts
 import { ServiceGlyph, Icon } from '../components/Icon.tsx';
 import { serviceTone, serviceLabel, num, isBusy } from '../lib/format.ts';
 import { useTraffic, traffic, useDeployTail } from '../lib/store.ts';
-import { duration } from '../lib/format.ts';
+import { duration, describeCron } from '../lib/format.ts';
 
 type Props = {
   service: ServiceView;
@@ -305,6 +305,16 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
             <span className="truncate">{s.activeDeploymentId ? 'Last deploy failed — still serving previous version' : latest.error}</span>
           </div>
         )}
+        {s.schedule ? (
+          <div className="node-foot">
+            <span className={`cron-chip ${s.jobRunning ? 'running' : ''}`}>
+              <Icon name="clock" size={11} />
+              {describeCron(s.schedule)}
+            </span>
+            <span className="spacer" />
+            {s.nextRunAt && <span className="node-replicas tnum">next {new Date(s.nextRunAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
+          </div>
+        ) : (
         <div className="node-foot">
           <Pips service={s} replicas={replicas} />
           <span className="node-replicas tnum">
@@ -314,6 +324,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
           <span className="spacer" />
           {s.protocol !== 'none' && <Sparkline serviceId={s.id} />}
         </div>
+        )}
         {host && (
           <div className="node-host truncate">
             <Icon name={s.protocol === 'tcp' ? 'network' : 'globe'} size={12} />
