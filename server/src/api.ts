@@ -28,6 +28,21 @@ import { replicasOf } from './engine.ts';
 
 type Env = { Variables: { principal: Principal } };
 
+/**
+ * Register the abort listener before any await: Hono never calls onAbort listeners added
+ * after the client has already gone, which would leak subscriptions and Docker streams.
+ */
+function abortSignal(stream: { onAbort: (fn: () => void) => void }) {
+  let aborted = false;
+  let resolve!: () => void;
+  const done = new Promise<void>((r) => (resolve = r));
+  stream.onAbort(() => {
+    aborted = true;
+    resolve();
+  });
+  return { done, get aborted() { return aborted; } };
+}
+
 export const api = new Hono<Env>();
 
 api.onError((err, c) => {
@@ -182,12 +197,10 @@ api.put('/services/:id/variables', async (c) => {
 });
 api.delete('/services/:id/variables/:key', (c) => c.json(ops.deleteVariable(actor(c), c.req.param('id'), c.req.param('key'))));
 api.get('/services/:id/variables/resolved', (c) => {
-  const r = ops.previewVariables(c.req.param('id'));
-  if (!view(c).revealSecrets) {
-    const svc = ops.getServiceOrThrow(c.req.param('id'));
-    for (const k of svc.secretKeys) if (k in r.env) r.env[k] = '••••••••';
-  }
-  return c.json(r);
+  // Resolution can pull secrets from other services (e.g. a Postgres password inside DATABASE_URL),
+  // so read-only tokens never see resolved values.
+  if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot view resolved variables');
+  return c.json(ops.previewVariables(c.req.param('id')));
 });
 api.get('/services/:id/deployments', (c) => c.json(ops.listDeployments(c.req.param('id'), Number(c.req.query('limit') ?? 30), view(c))));
 api.get('/services/:id/metrics', (c) => c.json(ops.serviceMetrics(c.req.param('id'), Number(c.req.query('seconds') ?? 300))));
@@ -230,7 +243,9 @@ api.delete('/services/:id/loadtest', (c) => c.json(ops.stopLoadTest(ops.getServi
 api.get('/services/:id/logs/stream', (c) => {
   const svc = ops.getServiceOrThrow(c.req.param('id'));
   return streamSSE(c, async (stream) => {
+    const sig = abortSignal(stream);
     const backlog = await ops.serviceLogs(svc.id, { tail: Number(c.req.query('tail') ?? 300) });
+    if (sig.aborted) return;
     await stream.writeSSE({ event: 'backlog', data: JSON.stringify(backlog) });
     const queue: ops.LogLine[] = [];
     let flushTimer: NodeJS.Timeout | null = null;
@@ -245,7 +260,7 @@ api.get('/services/:id/logs/stream', (c) => {
       if (!flushTimer) flushTimer = setTimeout(flush, 80);
     });
     const ping = setInterval(() => void stream.writeSSE({ event: 'ping', data: '' }), 15000);
-    await new Promise<void>((resolve) => stream.onAbort(resolve));
+    await sig.done;
     clearInterval(ping);
     stop();
   });
@@ -263,6 +278,7 @@ api.post('/deployments/:id/cancel', (c) => c.json(ops.cancelDeployment(actor(c),
 api.get('/deployments/:id/logs/stream', (c) => {
   const depId = c.req.param('id');
   return streamSSE(c, async (stream) => {
+    const sig = abortSignal(stream);
     const lines = readDeploymentLog(depId).map((l) => {
       const sp = l.indexOf(' ');
       return { ts: Number(l.slice(0, sp)), text: l.slice(sp + 1) };
@@ -273,7 +289,7 @@ api.get('/deployments/:id/logs/stream', (c) => {
       if (ev.type === 'deployment.updated' && ev.deployment.id === depId) void stream.writeSSE({ event: 'status', data: ev.deployment.status });
     });
     const ping = setInterval(() => void stream.writeSSE({ event: 'ping', data: '' }), 15000);
-    await new Promise<void>((resolve) => stream.onAbort(resolve));
+    await sig.done;
     clearInterval(ping);
     unsub();
   });
@@ -285,6 +301,7 @@ api.get('/events', (c) => {
   const projectId = c.req.query('project');
   const v = view(c);
   return streamSSE(c, async (stream) => {
+    const sig = abortSignal(stream);
     await stream.writeSSE({ event: 'message', data: JSON.stringify({ type: 'hello', version: config.version } satisfies ServerEvent) });
     const unsub = bus.subscribe((ev) => {
       if (projectId) {
@@ -299,7 +316,7 @@ api.get('/events', (c) => {
       void stream.writeSSE({ event: 'message', data: JSON.stringify(payload) });
     });
     const ping = setInterval(() => void stream.writeSSE({ event: 'ping', data: '' }), 15000);
-    await new Promise<void>((resolve) => stream.onAbort(resolve));
+    await sig.done;
     clearInterval(ping);
     unsub();
   });

@@ -22,6 +22,7 @@ import {
   waitHealthy,
   refreshServiceStatus,
   LABEL,
+  converging,
 } from './engine.ts';
 import { buildSource } from './builder.ts';
 import { nextRun } from './cron.ts';
@@ -231,7 +232,9 @@ async function runDeployment(depId: string, actor: Actor) {
     dep.status = 'deploying';
     saveDep(dep);
     setServiceStatus(svc.id, 'deploying');
-    const want = Math.max(1, effectiveReplicas({ ...svc, stopped: false }));
+    // Let any reconcile already touching this service finish before we take ownership.
+    for (let i = 0; converging.has(svc.id) && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
+    const want = Math.max(1, effectiveReplicas({ ...svc, stopped: false, schedule: null }, dep));
     const oldContainers = replicasOf(svc.id)
       .filter((r) => r.deploymentId !== dep.id)
       .map((r) => r.containerId);
@@ -260,6 +263,7 @@ async function runDeployment(depId: string, actor: Actor) {
 
     // ─── switch traffic ───
     svc = servicesTable.get(svc.id)!;
+    if (!svc) throw new Error('service was deleted during the deploy');
     const prevActive = svc.activeDeploymentId;
     dep.status = 'active';
     dep.finishedAt = Date.now();
@@ -271,7 +275,15 @@ async function runDeployment(depId: string, actor: Actor) {
         saveDep(prev);
       }
     }
-    setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, stopped: false, detectedPort: dep.port });
+    if (svc.stopped) {
+      // Stopped while we were rolling out: keep the new version as the one to start later, but honour the stop.
+      setServiceStatus(svc.id, 'stopped', { activeDeploymentId: dep.id, detectedPort: dep.port });
+      log('▸ Service was stopped during the deploy — new version saved, replicas shut down');
+      await drainAndRemove([...newContainers, ...oldContainers], 1000);
+      newContainers = [];
+      return;
+    }
+    setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, detectedPort: dep.port });
     log(`✓ Traffic switched to ${dep.id.slice(-6)}`);
     recordActivity(actor, 'deployment.active', `${svc.name} is live (${dep.sourceLabel})`, svc.projectId, svc.id);
 

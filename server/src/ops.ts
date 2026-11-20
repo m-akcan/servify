@@ -391,7 +391,8 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.volumes !== undefined) set('volumes', patch.volumes, 'volumes');
   if (patch.replicas !== undefined) {
     const tpl = svc.templateId ? getTemplate(svc.templateId) : null;
-    if (patch.replicas > 1 && (svc.volumes.length > 0 || tpl?.singleton)) {
+    const deployedVolumes = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.config.volumes.length ?? 0 : 0;
+    if (patch.replicas > 1 && (svc.volumes.length > 0 || deployedVolumes > 0 || tpl?.singleton)) {
       throw new HttpError(400, `${svc.name} has a persistent volume; replicas would corrupt its data. Stateful services run as a single replica.`);
     }
     set('replicas', patch.replicas, 'replicas');

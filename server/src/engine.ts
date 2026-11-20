@@ -163,11 +163,17 @@ export function refreshServiceStatus(serviceId: string) {
   }
 }
 
-export function effectiveReplicas(svc: Service): number {
+export function effectiveReplicas(svc: Service, dep?: Deployment | null): number {
   if (svc.stopped || svc.schedule) return 0; // cron services run as one-off jobs, not replicas
-  if (svc.volumes.length > 0) return Math.min(1, svc.replicas);
+  // Cap on what is actually mounted (the deployed config), not just the editable setting:
+  // removing a volume in settings must not let N replicas share the deployed volume.
+  const deployed = dep ?? (svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null);
+  if (svc.volumes.length > 0 || (deployed?.config.volumes.length ?? 0) > 0) return Math.min(1, svc.replicas);
   return Math.max(0, svc.replicas);
 }
+
+/** Services whose containers the reconciler is touching right now (the deployer waits for these). */
+export const converging = new Set<string>();
 
 // ───────────────────────────── container creation ─────────────────────────────
 
@@ -505,32 +511,44 @@ async function reconcileOnce() {
   // Orphans: containers whose service no longer exists.
   for (const [sid, list] of byService) {
     if (!servicesTable.get(sid)) {
-      await Promise.all(list.map((c) => docker.removeContainer(c.Id, true)));
+      await Promise.allSettled(list.map((c) => docker.removeContainer(c.Id, true)));
       for (const c of list) runtime.delete(c.Id);
       byService.delete(sid);
     }
   }
 
-  const all = servicesTable.all();
-  for (const svc of all) {
-    const list = byService.get(svc.id) ?? [];
-    for (const c of list) {
-      if (!runtime.has(c.Id) || runtime.get(c.Id)!.dockerState !== c.State) await adopt(c.Id);
+  const ids = servicesTable.all().map((s) => s.id);
+  for (const sid of ids) {
+    try {
+      for (const c of byService.get(sid) ?? []) {
+        if (!runtime.has(c.Id) || runtime.get(c.Id)!.dockerState !== c.State) await adopt(c.Id);
+      }
+      // Re-read state right before acting: a deploy may have switched versions while this pass ran.
+      const svc = servicesTable.get(sid);
+      if (!svc) continue;
+      if (busy.has(sid)) {
+        publishReplicas(svc);
+        continue;
+      }
+      converging.add(sid);
+      try {
+        const fresh = (await docker.listContainers([`${LABEL.service}=${sid}`])).filter((c) => isOurs(c.Labels) && c.Labels[LABEL.managed] === 'true');
+        if (!busy.has(sid)) await convergeService(servicesTable.get(sid) ?? svc, fresh);
+      } finally {
+        converging.delete(sid);
+      }
+      publishReplicas(servicesTable.get(sid) ?? svc);
+    } catch (e) {
+      console.error(`[engine] converge ${sid} failed:`, (e as Error).message);
     }
-    if (busy.has(svc.id)) {
-      publishReplicas(svc);
-      continue;
-    }
-    await convergeService(svc, list);
-    publishReplicas(svc);
   }
 }
 
 async function convergeService(svc: Service, list: ContainerSummary[]) {
   const inflight = busy.get(svc.id);
   const active = svc.activeDeploymentId;
-  const want = active ? effectiveReplicas(svc) : 0;
   const dep = active ? deploymentsTable.get(active) : null;
+  const want = active ? effectiveReplicas(svc, dep) : 0;
 
   const toRemove: string[] = [];
   const ofActive = new Map<number, ContainerSummary>();
@@ -560,6 +578,7 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
   const backingOff = (backoffUntil.get(svc.id) ?? 0) > Date.now();
 
   for (let i = 0; i < want; i++) {
+    if (busy.has(svc.id)) return; // a deploy just started: it owns the containers now
     const c = ofActive.get(i);
     if (!c) {
       if (backingOff) continue;
@@ -573,7 +592,7 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
       const r = runtime.get(c.Id);
       r?.crashTimes.push(Date.now());
       await docker.startContainer(c.Id).catch(async () => {
-        await docker.removeContainer(c.Id, true);
+        await docker.removeContainer(c.Id, true).catch(() => {});
         runtime.delete(c.Id);
       });
       await adopt(c.Id);

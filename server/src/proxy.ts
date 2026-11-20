@@ -172,6 +172,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse) {
         noteConn(up.containerId, -1);
       }
     };
+    let finished = false;
     const preq = http.request(
       { host: up.host!, port: up.port!, method: req.method, path: req.url, headers: forwardHeaders(req, svc), agent },
       (pres) => {
@@ -181,19 +182,24 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse) {
         res.writeHead(pres.statusCode ?? 502, headers);
         pres.pipe(res);
         pres.on('end', () => {
+          finished = true;
           release();
           count(svc.id, up.containerId, performance.now() - t0, (pres.statusCode ?? 502) >= 500);
         });
         pres.on('error', release);
-        res.on('close', () => {
-          release();
-          if (!pres.complete) pres.destroy();
-        });
       },
     );
+    // Client went away (or the response finished): never leave the upstream or the counter dangling.
+    res.once('close', () => {
+      if (!finished && !preq.destroyed) preq.destroy();
+      release();
+    });
+    // Idle upstream timeout — a hung replica must not pin connections forever.
+    preq.setTimeout(120_000, () => preq.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
     let sentBody = false;
     preq.on('error', (err: NodeJS.ErrnoException) => {
       release();
+      if (res.destroyed || res.writableEnded) return; // client already gone — nothing to retry or report
       const connectFail = err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' || err.code === 'EHOSTUNREACH';
       if (retry && connectFail && !sentBody && !res.headersSent) return attempt(false);
       count(svc.id, up.containerId, performance.now() - t0, true);
@@ -222,7 +228,9 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
     socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n');
     return;
   }
+  let counted = false;
   const upstream = net.connect(up.port!, up.host!, () => {
+    counted = true;
     noteConn(up.containerId, 1);
     const headers = forwardHeaders(req, svc);
     headers.connection = 'Upgrade';
@@ -246,7 +254,7 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
   const onClose = () => {
     if (closed) return;
     closed = true;
-    noteConn(up.containerId, -1);
+    if (counted) noteConn(up.containerId, -1);
     close();
   };
   upstream.on('error', onClose);
@@ -297,8 +305,9 @@ function syncTcp() {
       upstream.on('close', end);
     });
     server.on('error', (e) => {
-      console.error(`[proxy] tcp listener for ${sid} on :${port} failed: ${(e as Error).message}`);
+      console.error(`[proxy] tcp listener for ${sid} on :${port} failed: ${(e as Error).message} — retrying`);
       tcpServers.delete(sid);
+      setTimeout(() => (tcpDirty = true), 5000);
     });
     server.listen(port, config.proxyHost);
     tcpServers.set(sid, { port, server });
