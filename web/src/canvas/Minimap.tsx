@@ -1,4 +1,4 @@
-import { useEffect, useRef, type RefObject } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import { registry, bounds, INGRESS_ID, type Camera } from './geometry.ts';
 import type { ServiceView } from '../lib/types.ts';
 import { serviceTone } from '../lib/format.ts';
@@ -116,7 +116,13 @@ export function Minimap({
   };
 
   // Not enough canvas left beside the panel: get out of the way of the zoom controls.
-  const narrow = (rootRef.current?.clientWidth ?? 1200) - panelWidth < 560;
+  const [winW, setWinW] = useState(window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setWinW(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const narrow = (rootRef.current?.clientWidth ?? winW) - panelWidth < 560;
   return (
     <div className="minimap glass canvas-chrome" style={{ right: 16 + panelWidth, opacity: narrow ? 0 : 1, pointerEvents: narrow ? 'none' : undefined }}>
       <canvas
