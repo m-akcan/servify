@@ -14,7 +14,7 @@ import { config } from './config.ts';
 import { sleep, id as newId } from './util.ts';
 import { kv } from './db.ts';
 import { notify } from './notify.ts';
-import { mountsFor } from './volumes.ts';
+import { mountsFor, hasSharedVolume } from './volumes.ts';
 
 /** Every Servify instance (data dir) gets its own id so instances never touch each other's containers. */
 export const INSTANCE_ID = (() => {
@@ -208,7 +208,7 @@ export function effectiveReplicas(svc: Service, dep?: Deployment | null): number
   if (svc.stopped || deployedSchedule(svc, deployed)) return 0; // cron services run as one-off jobs, not replicas
   // Cap on what is actually mounted (the deployed config), not just the editable setting:
   // removing a volume in settings must not let N replicas share the deployed volume.
-  if (svc.volumes.length > 0 || (deployed?.config.volumes.length ?? 0) > 0) return Math.min(1, svc.replicas);
+  if (hasSharedVolume(svc.volumes) || hasSharedVolume(deployed?.config.volumes)) return Math.min(1, svc.replicas);
   return Math.max(0, svc.replicas);
 }
 
@@ -235,7 +235,7 @@ export async function createReplica(svc: Service, dep: Deployment, index: number
   env.SERVIFY_DEPLOYMENT_ID = dep.id;
 
   // Only volumes currently attached to this service are mounted (volumes can move between services).
-  const mounts = mountsFor(svc.id, dep.config.volumes);
+  const mounts = mountsFor(svc.id, dep.config.volumes, index);
   for (const m of mounts) {
     await docker.createVolume(m.Source, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });
   }

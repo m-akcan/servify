@@ -7,7 +7,7 @@ import { serviceTone, serviceLabel, num, isBusy } from '../lib/format.ts';
 import { useTraffic, traffic, useDeployTail } from '../lib/store.ts';
 import { duration, describeCron } from '../lib/format.ts';
 import { VolumeTabs } from './VolumeNodes.tsx';
-import type { VolumeRecord } from '../lib/types.ts';
+import type { VolumeGroup } from '../lib/volumes.tsx';
 
 type Props = {
   service: ServiceView;
@@ -22,7 +22,7 @@ type Props = {
   onStartConnect: (id: string, e: React.PointerEvent) => void;
   onFocusNode: (id: string) => void;
   connectTarget: boolean;
-  volumes?: VolumeRecord[];
+  volumes?: VolumeGroup[];
   inMulti: boolean;
   getMulti: () => Set<string>;
   onToggleMulti: (id: string) => void;

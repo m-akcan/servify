@@ -24,6 +24,8 @@ export interface Volume {
   mountPath: string;
   /** The VolumeRecord this mount refers to (volumes are first-class and can move between services). */
   volumeId?: string;
+  /** One volume per replica (a "volume set") instead of one shared volume — for databases that replicate themselves. */
+  perReplica?: boolean;
 }
 
 /** A persistent volume. Lives in a project; attached to at most one service at a time. */
@@ -35,6 +37,9 @@ export interface VolumeRecord {
   dockerName: string;
   /** Attached service, or null when detached (data kept). */
   serviceId: string | null;
+  /** Per-replica sets: all members share a setId (= member 0's id); replicaIndex says whose data it is. */
+  setId?: string | null;
+  replicaIndex?: number | null;
   /** Where it is (or was last) mounted. */
   mountPath: string;
   /** Canvas position while detached. */

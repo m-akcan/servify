@@ -38,25 +38,40 @@ export function listVolumes(projectId: string): VolumeRecord[] {
 
 export function getVolumeOrThrow(ref: string, projectId?: string): VolumeRecord {
   const v = volumesTable.get(ref);
-  if (v) return v;
-  // "project/volume" or a bare name (unique within the project).
+  if (v) return leaderOf(v);
+  // "project/volume" or a bare name (unique within the project; sets are addressed by their leader).
   const [p, name] = ref.includes('/') ? ref.split('/') : [projectId ?? null, ref];
-  const candidates = volumesTable.all().filter((x) => x.name === name);
+  const candidates = volumesTable.all().filter((x) => x.name === name && (!x.setId || x.setId === x.id));
   const filtered = p ? candidates.filter((x) => x.projectId === p || projectsTable.get(x.projectId)?.slug === p) : candidates;
   if (filtered.length === 1) return filtered[0];
   if (filtered.length > 1) throw new HttpError(409, `ambiguous volume "${ref}" — use its id or "project/volume"`);
   throw new HttpError(404, `volume not found: ${ref}`);
 }
 
+/** A volume and, for per-replica sets, all its members (leader = replica 0 = the set id). */
+export function membersOf(v: VolumeRecord): VolumeRecord[] {
+  if (!v.setId) return [v];
+  return volumesTable.all('WHERE project_id = ?', v.projectId).filter((x) => x.setId === v.setId).sort((a, b) => (a.replicaIndex ?? 0) - (b.replicaIndex ?? 0));
+}
+export function leaderOf(v: VolumeRecord): VolumeRecord {
+  return v.setId && v.setId !== v.id ? volumesTable.get(v.setId) ?? v : v;
+}
+
 /**
- * The Docker volume to mount for a service's mount entry — or null when that volume is no longer attached
- * to this service (never mount someone else's data).
+ * The Docker volume to mount for a service's mount entry on replica `index` — or null when that volume is no
+ * longer attached to this service (never mount someone else's data). Per-replica sets grow on demand.
  */
-export function dockerVolumeFor(serviceId: string, mount: Volume): string | null {
+export function dockerVolumeFor(serviceId: string, mount: Volume, index = 0): string | null {
   if (mount.volumeId) {
     const rec = volumesTable.get(mount.volumeId);
     if (!rec) return null;
-    return rec.serviceId === serviceId ? rec.dockerName : null;
+    if (rec.serviceId !== serviceId) return null;
+    if (!mount.perReplica || !rec.setId) return rec.dockerName;
+    const member = membersOf(rec).find((m) => (m.replicaIndex ?? 0) === index);
+    if (member) return member.serviceId === serviceId ? member.dockerName : null;
+    const vid = id('vol');
+    save({ ...rec, id: vid, dockerName: `svf-vol-${vid.slice(4)}`, replicaIndex: index, sizeBytes: 0, createdAt: Date.now(), updatedAt: Date.now() });
+    return `svf-vol-${vid.slice(4)}`;
   }
   // Mount entries written before migration (old deployment snapshots): resolve through the legacy name.
   const legacy = legacyDockerName(serviceId, mount.name);
@@ -65,15 +80,20 @@ export function dockerVolumeFor(serviceId: string, mount: Volume): string | null
   return legacy;
 }
 
-/** Docker mounts for a list of mount entries, skipping volumes that moved away. */
-export function mountsFor(serviceId: string, mounts: Volume[]) {
+/** Docker mounts for replica `index`, skipping volumes that moved away. */
+export function mountsFor(serviceId: string, mounts: Volume[], index = 0) {
   const out: { Type: 'volume'; Source: string; Target: string }[] = [];
   for (const m of mounts) {
-    const src = dockerVolumeFor(serviceId, m);
+    const src = dockerVolumeFor(serviceId, m, index);
     if (src) out.push({ Type: 'volume', Source: src, Target: m.mountPath });
     else console.warn(`[volumes] ${m.name} is no longer attached to ${serviceId} — not mounting it`);
   }
   return out;
+}
+
+/** Shared (single) volumes force one replica; per-replica sets don't. */
+export function hasSharedVolume(mounts: Volume[] | undefined) {
+  return (mounts ?? []).some((m) => !m.perReplica);
 }
 
 export async function ensureDockerVolume(v: VolumeRecord) {
@@ -88,11 +108,12 @@ export function syncServiceVolumes(svc: Service): Service {
   let changed = false;
   const next = svc.volumes.map((m) => {
     if (m.volumeId && volumesTable.get(m.volumeId)) {
-      const rec = volumesTable.get(m.volumeId)!;
-      if (rec.mountPath !== m.mountPath || rec.serviceId !== svc.id) {
-        rec.mountPath = m.mountPath;
-        rec.serviceId = svc.id;
-        save(rec);
+      for (const rec of membersOf(volumesTable.get(m.volumeId)!)) {
+        if (rec.mountPath !== m.mountPath || rec.serviceId !== svc.id) {
+          rec.mountPath = m.mountPath;
+          rec.serviceId = svc.id;
+          save(rec);
+        }
       }
       return m;
     }
@@ -112,6 +133,8 @@ export function syncServiceVolumes(svc: Service): Service {
       x: svc.x,
       y: svc.y + 240,
       sizeBytes: null,
+      setId: m.perReplica ? vid : null,
+      replicaIndex: m.perReplica ? 0 : null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -180,7 +203,8 @@ export function freeSpot(projectId: string, x: number, y: number, exceptId?: str
 function cleanName(raw: string | undefined, projectId: string, exceptId?: string): string {
   const name = slugify(raw?.trim() || 'volume').slice(0, 48);
   if (!NAME_RE.test(name)) throw new HttpError(400, 'volume names use letters, digits, dot, dash and underscore');
-  if (volumesTable.all('WHERE project_id = ?', projectId).some((v) => v.name === name && v.id !== exceptId)) throw new HttpError(409, `a volume called ${name} already exists in this project`);
+  const except = exceptId ? volumesTable.get(exceptId) : null;
+  if (volumesTable.all('WHERE project_id = ?', projectId).some((v) => v.name === name && v.id !== exceptId && !(except?.setId && v.setId === except.setId))) throw new HttpError(409, `a volume called ${name} already exists in this project`);
   return name;
 }
 
@@ -188,7 +212,7 @@ function checkMountPath(p: string) {
   if (!p?.startsWith('/') || p === '/' || p.includes('..')) throw new HttpError(400, 'mount path must be an absolute path like /data');
 }
 
-export async function createVolume(actor: Actor, projectId: string, input: { name?: string; serviceId?: string; mountPath?: string; x?: number; y?: number }) {
+export async function createVolume(actor: Actor, projectId: string, input: { name?: string; serviceId?: string; mountPath?: string; x?: number; y?: number; perReplica?: boolean }) {
   const project = projectsTable.get(projectId) ?? projectsTable.all().find((p) => p.slug === projectId);
   if (!project) throw new HttpError(404, 'project not found');
   const name = cleanName(input.name, project.id);
@@ -202,11 +226,13 @@ export async function createVolume(actor: Actor, projectId: string, input: { nam
     mountPath: input.mountPath?.trim() || '/data',
     ...freeSpot(project.id, input.x ?? 0, input.y ?? 0),
     sizeBytes: 0,
+    setId: input.perReplica ? vid : null,
+    replicaIndex: input.perReplica ? 0 : null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
   await ensureDockerVolume(v);
-  recordActivity(actor, 'volume.created', `Created volume ${name}`, project.id);
+  recordActivity(actor, 'volume.created', `Created ${input.perReplica ? 'per-replica volume set' : 'volume'} ${name}`, project.id);
   if (input.serviceId) return attachVolume(actor, v.id, input.serviceId, input.mountPath ?? '/data');
   return withSize(v);
 }
@@ -222,15 +248,19 @@ export async function attachVolume(actor: Actor, volumeRef: string, serviceId: s
   checkMountPath(path);
   if (svc.volumes.some((m) => m.mountPath === path)) throw new HttpError(409, `${svc.name} already has a volume at ${path}`);
   // A deploy in flight is fine: it keeps its own snapshot, and the redeploy below queues behind it.
-  const inUse = await docker.containersUsingVolume(v.dockerName);
-  if (inUse.length) throw new HttpError(409, `${v.name} is still mounted by a running container — wait a moment and retry`);
-
-  await ensureDockerVolume(v);
-  v.serviceId = svc.id;
-  v.mountPath = path;
-  save(v);
-  svc.volumes = [...svc.volumes, { name: v.name, mountPath: path, volumeId: v.id }];
-  const scaledDown = svc.replicas > 1;
+  const members = membersOf(v);
+  for (const m of members) {
+    if ((await docker.containersUsingVolume(m.dockerName)).length) throw new HttpError(409, `${v.name} is still mounted by a running container — wait a moment and retry`);
+  }
+  for (const m of members) {
+    await ensureDockerVolume(m);
+    m.serviceId = svc.id;
+    m.mountPath = path;
+    save(m);
+  }
+  const perReplica = !!v.setId;
+  svc.volumes = [...svc.volumes, { name: v.name, mountPath: path, volumeId: v.id, ...(perReplica ? { perReplica: true } : {}) }];
+  const scaledDown = !perReplica && svc.replicas > 1;
   if (scaledDown) svc.replicas = 1; // shared data → one replica
   if (svc.autoscale.enabled) svc.autoscale = { ...svc.autoscale, enabled: false };
   svc.updatedAt = Date.now();
@@ -247,9 +277,12 @@ export async function detachVolume(actor: Actor, volumeRef: string) {
   const svc = servicesTable.get(v.serviceId);
   if (svc && busy.has(svc.id)) throw new HttpError(409, `${svc.name} is deploying — try again when it's done`);
   // Mark it detached first: from here on no replica of the old service can mount it (mountsFor checks).
-  v.serviceId = null;
-  if (svc) Object.assign(v, freeSpot(v.projectId, svc.x + 38, svc.y + 250, v.id));
-  save(v);
+  const spot = svc ? freeSpot(v.projectId, svc.x + 38, svc.y + 250, v.id) : null;
+  for (const m of membersOf(v)) {
+    m.serviceId = null;
+    if (spot) Object.assign(m, spot);
+    save(m);
+  }
   if (svc) {
     // Take the service over, stop what still mounts the volume, then let it come back without it.
     busy.set(svc.id, new Set(['volume']));
@@ -283,6 +316,7 @@ export function updateVolume(actor: Actor, volumeRef: string, patch: { name?: st
     const name = cleanName(patch.name, v.projectId, v.id);
     recordActivity(actor, 'volume.renamed', `Renamed volume ${v.name} → ${name}`, v.projectId, v.serviceId);
     v.name = name;
+    for (const m of membersOf(v)) if (m.id !== v.id) save({ ...m, name });
     if (v.serviceId) {
       const svc = servicesTable.get(v.serviceId);
       if (svc) {
@@ -294,17 +328,20 @@ export function updateVolume(actor: Actor, volumeRef: string, patch: { name?: st
   }
   if (patch.x !== undefined) v.x = Math.round(patch.x);
   if (patch.y !== undefined) v.y = Math.round(patch.y);
+  for (const m of membersOf(v)) if (m.id !== v.id && (patch.x !== undefined || patch.y !== undefined)) save({ ...m, x: v.x, y: v.y });
   return withSize(save(v));
 }
 
 export async function deleteVolume(actor: Actor, volumeRef: string) {
   const v = getVolumeOrThrow(volumeRef);
   if (v.serviceId) throw new HttpError(409, `${v.name} is attached to ${servicesTable.get(v.serviceId)?.name ?? 'a service'} — detach it first`);
-  const inUse = await docker.containersUsingVolume(v.dockerName, true);
-  for (const c of inUse) await docker.removeContainer(c.Id, true);
-  await docker.removeVolume(v.dockerName);
-  volumesTable.delete(v.id);
-  bus.publish({ type: 'volume.deleted', volumeId: v.id, projectId: v.projectId });
+  for (const m of membersOf(v)) {
+    const inUse = await docker.containersUsingVolume(m.dockerName, true);
+    for (const c of inUse) await docker.removeContainer(c.Id, true);
+    await docker.removeVolume(m.dockerName);
+    volumesTable.delete(m.id);
+    bus.publish({ type: 'volume.deleted', volumeId: m.id, projectId: m.projectId });
+  }
   recordActivity(actor, 'volume.deleted', `Deleted volume ${v.name} and its data`, v.projectId);
 }
 
@@ -316,14 +353,17 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
       if (!keep) await docker.removeVolume(legacyDockerName(svc.id, m.name));
       continue;
     }
-    if (keep) {
-      rec.serviceId = null;
-      Object.assign(rec, freeSpot(rec.projectId, svc.x + 38, svc.y, rec.id));
-      save(rec);
-    } else {
-      await docker.removeVolume(rec.dockerName);
-      volumesTable.delete(rec.id);
-      bus.publish({ type: 'volume.deleted', volumeId: rec.id, projectId: rec.projectId });
+    const spot = keep ? freeSpot(rec.projectId, svc.x + 38, svc.y, rec.id) : null;
+    for (const member of membersOf(rec)) {
+      if (keep) {
+        member.serviceId = null;
+        Object.assign(member, spot);
+        save(member);
+      } else {
+        await docker.removeVolume(member.dockerName);
+        volumesTable.delete(member.id);
+        bus.publish({ type: 'volume.deleted', volumeId: member.id, projectId: member.projectId });
+      }
     }
   }
 }

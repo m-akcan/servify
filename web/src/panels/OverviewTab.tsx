@@ -108,7 +108,7 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
   }, [s.id]);
   const cpu = replicas.reduce((a, r) => a + (stats[r.containerId]?.cpu ?? 0), 0);
   const memMb = replicas.reduce((a, r) => a + (stats[r.containerId]?.memMb ?? 0), 0);
-  const stateful = s.volumes.length > 0;
+  const stateful = s.volumes.some((v) => !v.perReplica);
   const maxRps = Math.max(0.001, ...replicas.map((r) => t?.replicas[r.containerId] ?? 0));
 
   const setStrategy = async (strategy: LbStrategy) => {

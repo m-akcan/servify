@@ -6,6 +6,7 @@ import { EdgesLayer, IngressNode, type EdgeSpec } from './Edges.tsx';
 import { Particles } from './Particles.tsx';
 import { Minimap } from './Minimap.tsx';
 import { DetachedVolumeNode } from './VolumeNodes.tsx';
+import { groupVolumes, type VolumeGroup } from '../lib/volumes.tsx';
 import type { VolumeRecord } from '../lib/types.ts';
 import type { ProjectState } from '../lib/store.ts';
 import { latestDeployment } from '../lib/store.ts';
@@ -329,12 +330,14 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
   // Drag-to-connect: a draft edge follows the pointer from a node's port to a target node.
   const [draft, setDraft] = useState<{ from: string; x: number; y: number; over: string | null } | null>(null);
   const [volumeOver, setVolumeOver] = useState<string | null>(null);
+  // Per-replica sets show as one volume (×N, total size), addressed by their leader.
+  const volumeGroups = useMemo(() => groupVolumes(Object.values(state.volumes ?? {})), [state.volumes]);
   const volumesByService = useMemo(() => {
-    const m = new Map<string, VolumeRecord[]>();
-    for (const v of Object.values(state.volumes ?? {})) if (v.serviceId) m.set(v.serviceId, [...(m.get(v.serviceId) ?? []), v]);
+    const m = new Map<string, VolumeGroup[]>();
+    for (const v of volumeGroups) if (v.serviceId) m.set(v.serviceId, [...(m.get(v.serviceId) ?? []), v]);
     return m;
-  }, [state.volumes]);
-  const detachedVolumes = useMemo(() => Object.values(state.volumes ?? {}).filter((v) => !v.serviceId), [state.volumes]);
+  }, [volumeGroups]);
+  const detachedVolumes = useMemo(() => volumeGroups.filter((v) => !v.serviceId), [volumeGroups]);
   const serviceIdSet = useMemo(() => new Set(Object.keys(state.services)), [state.services]);
   const startConnect = useCallback((id: string, e: React.PointerEvent) => {
     const root = rootRef.current!;

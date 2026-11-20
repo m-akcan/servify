@@ -17,7 +17,7 @@ import { isLocalHost } from './certs.ts';
 import { getSettings, destinationById } from './settings.ts';
 import { backupMethod, backupService, listBackups, isRestoring } from './backups.ts';
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
-import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes } from './volumes.ts';
+import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
@@ -451,7 +451,7 @@ export const updateServiceInput = z.object({
   domains: z.array(z.string()).optional(),
   publicTcpPort: z.number().int().min(0).max(65535).nullable().optional().describe('Host port for the TCP proxy; 0 = pick a free one; null = off'),
   volumes: z
-    .array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/'), volumeId: z.string().optional() }))
+    .array(z.object({ name: z.string().regex(/^[a-zA-Z0-9_.-]+$/), mountPath: z.string().startsWith('/'), volumeId: z.string().optional(), perReplica: z.boolean().optional() }))
     .optional()
     .describe('Mounts. New entries (no volumeId) create a fresh volume. To remove one, use detach_volume.'),
   startCommand: z.string().nullable().optional(),
@@ -522,8 +522,8 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   }
   if (patch.replicas !== undefined) {
     const tpl = svc.templateId ? getTemplate(svc.templateId) : null;
-    const deployedVolumes = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.config.volumes.length ?? 0 : 0;
-    if (patch.replicas > 1 && (svc.volumes.length > 0 || deployedVolumes > 0 || tpl?.singleton)) {
+    const deployedShared = svc.activeDeploymentId ? hasSharedVolume(deploymentsTable.get(svc.activeDeploymentId)?.config.volumes) : false;
+    if (patch.replicas > 1 && (hasSharedVolume(svc.volumes) || deployedShared || tpl?.singleton)) {
       throw new HttpError(400, `${svc.name} has a persistent volume; replicas would corrupt its data. Stateful services run as a single replica.`);
     }
     set('replicas', patch.replicas, 'replicas');

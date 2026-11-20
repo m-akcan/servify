@@ -125,7 +125,7 @@ export function serviceMenu(s: ServiceView, opts: { open: (tab?: string) => void
   items.push({ type: 'sep' });
   items.push({ label: !deployed ? 'Deploy' : s.pendingChanges.length ? 'Deploy changes' : 'Redeploy', icon: 'rocket', onSelect: () => void deploy(s) });
   if (s.activeDeploymentId) items.push({ label: 'Restart', icon: 'refresh', onSelect: () => void restart(s) });
-  if (!s.volumes.length && s.protocol !== 'none') {
+  if (!s.volumes.some((v) => !v.perReplica) && s.protocol !== 'none') {
     items.push({ label: 'Add replica', icon: 'layers', onSelect: () => void scale(s, s.replicas + 1) });
     if (s.replicas > 1) items.push({ label: 'Remove replica', icon: 'minus', onSelect: () => void scale(s, s.replicas - 1) });
   }

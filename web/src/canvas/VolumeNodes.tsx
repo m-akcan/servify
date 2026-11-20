@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { VolumeRecord } from '../lib/types.ts';
+import type { VolumeGroup } from '../lib/volumes.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { openMenuAt, openMenu } from '../components/ui.tsx';
 import { volumeMenu, bytes, openVolumeDialog } from '../lib/volumes.tsx';
@@ -7,7 +7,7 @@ import { api } from '../lib/api.ts';
 import { registry, type Camera } from './geometry.ts';
 
 /** The tab docked under a service card for each attached volume. */
-export function VolumeTabs({ volumes }: { volumes: VolumeRecord[] }) {
+export function VolumeTabs({ volumes }: { volumes: VolumeGroup[] }) {
   if (!volumes.length) return null;
   return (
     <div className="vol-tabs">
@@ -27,7 +27,7 @@ export function VolumeTabs({ volumes }: { volumes: VolumeRecord[] }) {
           }}
         >
           <Icon name="database" size={12} />
-          <span className="vol-tab-name truncate">{v.name}</span>
+          <span className="vol-tab-name truncate">{v.name}{v.members > 1 ? ` ×${v.members}` : ''}</span>
           <span className="vol-tab-size">{bytes(v.sizeBytes)}</span>
         </button>
       ))}
@@ -45,7 +45,7 @@ export function DetachedVolumeNode({
   serviceIds,
   onHover,
 }: {
-  volume: VolumeRecord;
+  volume: VolumeGroup;
   getCamera: () => Camera;
   serviceIds: Set<string>;
   onHover: (serviceId: string | null) => void;
@@ -120,7 +120,7 @@ export function DetachedVolumeNode({
       <div className="grow" style={{ minWidth: 0 }}>
         <div className="vol-node-name truncate">{v.name}</div>
         <div className="vol-node-meta">
-          detached · {bytes(v.sizeBytes)}
+          detached{v.members > 1 ? ` · ×${v.members}` : ''} · {bytes(v.sizeBytes)}
         </div>
       </div>
       <button className="vol-node-more" onClick={(e) => openMenuAt(e.currentTarget, volumeMenu(v), 'right')} aria-label={`${v.name} actions`}>

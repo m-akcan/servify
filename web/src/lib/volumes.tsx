@@ -2,7 +2,7 @@ import { useState, useSyncExternalStore } from 'react';
 import { api } from './api.ts';
 import { store, useStore, createStore } from './store.ts';
 import type { ServiceView, VolumeRecord } from './types.ts';
-import { Button, Modal, Field, toast, toastError, confirmDialog, type MenuItem } from '../components/ui.tsx';
+import { Button, Modal, Field, Switch, toast, toastError, confirmDialog, type MenuItem } from '../components/ui.tsx';
 import { Icon, ServiceGlyph } from '../components/Icon.tsx';
 
 export function bytes(n: number | null | undefined) {
@@ -11,6 +11,24 @@ export function bytes(n: number | null | undefined) {
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`;
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(n < 10 * 1024 ** 2 ? 1 : 0)} MB`;
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
+export type VolumeGroup = VolumeRecord & { members: number };
+
+/** One entry per volume or per-replica set (leader + total size + member count). */
+export function groupVolumes(all: VolumeRecord[]): VolumeGroup[] {
+  const sets = new Map<string, VolumeRecord[]>();
+  const out: VolumeGroup[] = [];
+  for (const v of all) {
+    if (!v.setId) out.push({ ...v, members: 1 });
+    else sets.set(v.setId, [...(sets.get(v.setId) ?? []), v]);
+  }
+  for (const [setId, members] of sets) {
+    const leader = members.find((m) => m.id === setId) ?? members[0];
+    const total = members.reduce((a, m) => a + (m.sizeBytes && m.sizeBytes > 0 ? m.sizeBytes : 0), 0);
+    out.push({ ...leader, sizeBytes: total, members: members.length });
+  }
+  return out.sort((a, b) => a.createdAt - b.createdAt);
 }
 
 // ───────────────────────────── dialogs ─────────────────────────────
@@ -130,7 +148,8 @@ function RenameDialog({ volumeId, onClose }: { volumeId: string; onClose: () => 
 function AttachDialog({ onClose, volumeId, serviceId, mountPath, createAt }: { onClose: () => void; volumeId?: string; serviceId?: string; mountPath?: string; createAt?: { x: number; y: number } }) {
   const cur = useStore((s) => s.current);
   const services = cur ? cur.order.map((id) => cur.services[id]).filter(Boolean) : [];
-  const detached = cur ? Object.values(cur.volumes).filter((v) => !v.serviceId) : [];
+  const detached = cur ? groupVolumes(Object.values(cur.volumes)).filter((v) => !v.serviceId) : [];
+  const [perReplica, setPerReplica] = useState(false);
   const fixedVolume = volumeId ? cur?.volumes[volumeId] : null;
   const [choice, setChoice] = useState<string>(volumeId ?? (createAt ? 'new' : detached[0]?.id ?? 'new'));
   const [target, setTarget] = useState<string>(serviceId ?? (createAt ? '' : services[0]?.id ?? ''));
@@ -146,7 +165,7 @@ function AttachDialog({ onClose, volumeId, serviceId, mountPath, createAt }: { o
     setBusy(true);
     try {
       if (choice === 'new') {
-        await api.post(`/projects/${cur.project.id}/volumes`, { name: name || undefined, serviceId: target || undefined, mountPath: path, ...(createAt ?? {}) });
+        await api.post(`/projects/${cur.project.id}/volumes`, { name: name || undefined, serviceId: target || undefined, mountPath: path, perReplica, ...(createAt ?? {}) });
         toast({ title: target ? `Volume attached to ${svc?.name}` : 'Volume created', body: target ? `${svc?.name} redeploys with it at ${path}.` : 'Drag it onto a service to attach it.', tone: 'ok' });
       } else {
         await api.post(`/volumes/${choice}/attach`, { serviceId: target, mountPath: path });
@@ -187,7 +206,7 @@ function AttachDialog({ onClose, volumeId, serviceId, mountPath, createAt }: { o
                   }}
                 >
                   <Icon name="database" size={14} />
-                  <span className="grow mono">{v.name}</span>
+                  <span className="grow mono">{v.name}{v.members > 1 ? ` ×${v.members}` : v.setId ? ' (per replica)' : ''}</span>
                   <span className="faint mono">{bytes(v.sizeBytes)}</span>
                 </button>
               ))}
@@ -195,9 +214,18 @@ function AttachDialog({ onClose, volumeId, serviceId, mountPath, createAt }: { o
           </Field>
         )}
         {choice === 'new' && (
-          <Field label="Name" hint="Optional — letters, digits, dot, dash, underscore.">
-            <input className="input mono" placeholder={svc ? `${svc.slug}-data` : 'volume'} value={name} onChange={(e) => setName(e.target.value.replace(/[^a-zA-Z0-9_.-]/g, ''))} />
-          </Field>
+          <>
+            <Field label="Name" hint="Optional — letters, digits, dot, dash, underscore.">
+              <input className="input mono" placeholder={svc ? `${svc.slug}-data` : 'volume'} value={name} onChange={(e) => setName(e.target.value.replace(/[^a-zA-Z0-9_.-]/g, ''))} />
+            </Field>
+            <label className="setting-row" style={{ cursor: 'pointer' }}>
+              <div className="grow">
+                <div className="title">One volume per replica</div>
+                <div className="desc">Each replica gets its own volume, so the service can keep scaling — for software that replicates its own data (database clusters, Redis replicas…).</div>
+              </div>
+              <Switch checked={perReplica} onChange={setPerReplica} />
+            </label>
+          </>
         )}
         <Field label={createAt ? 'Attach to (optional)' : 'Service'}>
           <div className="vol-choices">
@@ -221,7 +249,7 @@ function AttachDialog({ onClose, volumeId, serviceId, mountPath, createAt }: { o
             <input className="input mono" value={path} onChange={(e) => setPath(e.target.value)} placeholder="/data" />
           </Field>
         )}
-        {svc && svc.replicas > 1 && <div className="callout callout-warn"><Icon name="alert" size={15} /><div className="grow">{svc.name} runs {svc.replicas} replicas — it will be scaled to 1 so they don't share the data.</div></div>}
+        {svc && svc.replicas > 1 && !(choice === 'new' ? perReplica : chosen?.setId) && <div className="callout callout-warn"><Icon name="alert" size={15} /><div className="grow">{svc.name} runs {svc.replicas} replicas — it will be scaled to 1 so they don't share the data.</div></div>}
         <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel

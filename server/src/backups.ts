@@ -337,6 +337,7 @@ export function restoreBackup(actor: Actor, backupId: string) {
   if (!svc) throw new HttpError(404, 'the service of this backup no longer exists');
   if (busy.has(svc.id)) throw new HttpError(409, `${svc.name} is deploying — wait for it to finish`);
   if (!svc.activeDeploymentId || svc.stopped) throw new HttpError(409, `start ${svc.name} before restoring into it`);
+  if (b.method === 'volume' && svc.volumes.some((v) => v.perReplica)) throw new HttpError(400, `${svc.name} keeps one volume per replica — restoring a single archive into it is ambiguous; attach a fresh volume set instead`);
   if (backupMethod(svc) !== b.method) throw new HttpError(400, `this ${b.method} backup doesn't match how ${svc.name} is backed up now (${backupMethod(svc) ?? 'nothing'})`);
   if (restoring.has(svc.id)) throw new HttpError(409, 'a restore is already running');
   restoring.add(svc.id);

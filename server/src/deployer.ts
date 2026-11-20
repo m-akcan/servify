@@ -28,6 +28,16 @@ import {
 import { buildSource } from './builder.ts';
 import { nextRun } from './cron.ts';
 import { notify } from './notify.ts';
+import { hasSharedVolume } from './volumes.ts';
+
+/** Order to roll per-replica services in (clusters override: standbys first, primary last). */
+let rollingOrderHook: ((svc: Service, want: number) => number[] | null) | null = null;
+export function setRollingOrder(fn: typeof rollingOrderHook) {
+  rollingOrderHook = fn;
+}
+function rollingOrder(svc: Service, want: number): number[] {
+  return rollingOrderHook?.(svc, want) ?? Array.from({ length: want }, (_, i) => i);
+}
 import { iconForStack } from './ops.ts';
 
 const lock = new KeyedLock();
@@ -264,30 +274,55 @@ async function runDeployment(depId: string, actor: Actor) {
     setServiceStatus(svc.id, 'deploying');
     // Let any reconcile already touching this service finish before we take ownership.
     for (let i = 0; converging.has(svc.id) && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
-    const want = Math.max(1, svc.volumes.length || dep.config.volumes.length ? 1 : svc.replicas);
+    // Shared volume → one replica, recreated. Per-replica volumes → rolled one index at a time (replica i's
+    // data is never mounted by two containers). Stateless → surge.
+    const shared = hasSharedVolume(dep.config.volumes) || hasSharedVolume(svc.volumes);
+    const rolling = !shared && dep.config.volumes.some((v) => v.perReplica);
+    const want = shared ? 1 : Math.max(1, svc.replicas);
     const oldContainers = replicasOf(svc.id)
       .filter((r) => r.deploymentId !== dep.id)
       .map((r) => r.containerId);
-    const recreate = dep.config.volumes.length > 0;
+    const recreate = shared;
     if (recreate && oldContainers.length) {
       log(`▸ Stateful service: stopping ${oldContainers.length} old replica(s) before starting the new one`);
       await drainAndRemove(oldContainers, 3000);
     }
-    log(`▸ Starting ${want} replica${want > 1 ? 's' : ''}`);
-    newContainers = await Promise.all(
-      Array.from({ length: want }, (_, i) => createReplica(svc!, dep, i)),
-    );
     const grace = (svc.healthcheck.graceSec || 60) * 1000;
-    const health = await waitHealthy(newContainers, svc, grace, log);
-    if (!health.ok) {
-      if (health.cid) {
-        const tail = await tailContainer(health.cid, 40);
-        if (tail.length) {
-          log('── last output from the failing replica ──');
-          for (const l of tail) log(l);
+    if (rolling) {
+      log(`▸ Rolling ${want} replica${want > 1 ? 's' : ''} one at a time (each has its own volume)`);
+      for (const i of rollingOrder(svc, want)) {
+        const old = replicasOf(svc.id).filter((r) => r.deploymentId !== dep.id && r.index === i).map((r) => r.containerId);
+        if (old.length) {
+          log(`▸ Replica ${i}: stopping the old version`);
+          await drainAndRemove(old, 3000);
         }
+        const cid = await createReplica(svc!, dep, i);
+        newContainers.push(cid);
+        const h = await waitHealthy([cid], svc, grace, log);
+        if (!h.ok) {
+          const tail = await tailContainer(cid, 40);
+          if (tail.length) {
+            log(`── last output from replica ${i} ──`);
+            for (const l of tail) log(l);
+          }
+          throw new Error(`replica ${i}: ${h.reason ?? 'failed health checks'}`);
+        }
+        log(`✓ Replica ${i} healthy`);
       }
-      throw new Error(health.reason ?? 'replicas failed health checks');
+    } else {
+      log(`▸ Starting ${want} replica${want > 1 ? 's' : ''}`);
+      newContainers = await Promise.all(Array.from({ length: want }, (_, i) => createReplica(svc!, dep, i)));
+      const health = await waitHealthy(newContainers, svc, grace, log);
+      if (!health.ok) {
+        if (health.cid) {
+          const tail = await tailContainer(health.cid, 40);
+          if (tail.length) {
+            log('── last output from the failing replica ──');
+            for (const l of tail) log(l);
+          }
+        }
+        throw new Error(health.reason ?? 'replicas failed health checks');
+      }
     }
     log(`✓ ${want}/${want} replicas healthy`);
 

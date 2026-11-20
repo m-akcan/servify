@@ -58,7 +58,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
       Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
       Labels: { 'servify.job': 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id, [LABEL.service]: svc.id, 'servify.run': run.id },
       HostConfig: {
-        Mounts: mountsFor(svc.id, dep.config.volumes),
+        Mounts: mountsFor(svc.id, dep.config.volumes, 0),
         NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
         Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
         Init: true,
