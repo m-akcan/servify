@@ -105,6 +105,7 @@ function ImportModal({ open, onClose }: { open: boolean; onClose: () => void }) 
   const [showEnv, setShowEnv] = useState(false);
   const [plan, setPlan] = useState<ComposePlan | null>(null);
   const [deploy, setDeploy] = useState(true);
+  const [adoptVolumes, setAdoptVolumes] = useState(false);
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
   let parsed: any = null;
@@ -132,7 +133,7 @@ function ImportModal({ open, onClose }: { open: boolean; onClose: () => void }) 
         const r = await api.post<{ project: Project }>('/projects/import', { spec: parsed, deploy });
         finish(r.project.slug);
       } else {
-        const r = await api.post<{ project: Project; warnings: string[] }>('/projects/import-compose', { yaml, env: envText || undefined, basePath: basePath || undefined, deploy });
+        const r = await api.post<{ project: Project; warnings: string[] }>('/projects/import-compose', { yaml, env: envText || undefined, basePath: basePath || undefined, deploy, adoptVolumes });
         if (r.warnings.length) toast({ title: `Imported with ${r.warnings.length} note${r.warnings.length === 1 ? '' : 's'}`, body: r.warnings[0], tone: 'warn' });
         finish(r.project.slug);
       }
@@ -273,6 +274,11 @@ function ImportModal({ open, onClose }: { open: boolean; onClose: () => void }) 
               </div>
             )}
           </>
+        )}
+        {mode === 'compose' && (
+          <label className="row" style={{ gap: 10, fontSize: 13 }} title="Uses the Docker volumes this Compose project already created (<project>_<volume>) instead of empty ones. Run `docker compose down` first — without -v.">
+            <Switch checked={adoptVolumes} onChange={setAdoptVolumes} /> Take over the existing Docker volumes (keeps the data; run <code className="inline-code">docker compose down</code> first)
+          </label>
         )}
         <label className="row" style={{ gap: 10, fontSize: 13 }}>
           <Switch checked={deploy} onChange={setDeploy} /> Deploy everything after import

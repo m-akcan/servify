@@ -80,3 +80,16 @@
 - [x] Fixed along the way: docker CLI hijacked streams need half-open sockets (exec without stdin lost its output); the control connection must not be half-open (agent never noticed Servify restarting); the join one-liner re-downloaded on restart and failed its pinned hash after an upgrade (now verifies once, keeps the copy); a 20-byte (empty gzip) backup counted as success; a failed `main()` left a half-started process.
 - [x] Verified against docker-in-docker: deploy/route/exec/logs/stats, a folder build on the server, postgres + volume, backups through the tunnel, agent outage without churn, reconnect, wrong token, move both ways via API and UI, a 3-member cluster with failover (20s) and rebuild on the server. MCP: 46 tools.
 - [ ] Not built: private networking between servers, spreading one service's replicas across servers, moving volume data between servers, a highly available control plane.
+
+## Round 6 — start at login
+- [x] Settings → General switch (launchd agent / systemd user unit, per-data-dir label), `servify service` shares the code; one Servify per data directory (pid + start-time lock).
+
+## Round 7 — hosting existing workloads (from inspecting a real server: 40 containers, 21 compose projects, NPM)
+- [x] Host folders (allowlist `SERVIFY_HOST_MOUNTS`, deny list, must exist, realpath re-check, opt-in SELinux `z`/`Z`, read-only), re-validated at container create.
+- [x] Read-only shares of another service's volume (same project + server, no sets).
+- [x] Adopt existing Docker volumes (refused while any outside container references them, any state); forget-keep-data; adopted never deleted implicitly; deleting a volume never removes foreign containers.
+- [x] Published ports TCP/UDP (one replica, stop-first, clash/busy/own-port checks); external routes (separate probe table, Host + WebSocket pass-through, refuse deploy-shaped ops).
+- [x] Data-safety audit: backups/restores/deletes only touch owned volumes; environments strip host folders, shares, ports and external routes; owner-only gates in the service layer (REST, MCP, imports).
+- [x] Compose import: host folders (owner + allowlist, `:ro`/`:z`), UDP → published ports, `adoptVolumes`.
+- [x] `scripts/acceptance-hosting.mjs`: 51/51. MCP: 48 tools.
+- [ ] SELinux relabel untested (no Fedora host here); not yet tried on the real server.

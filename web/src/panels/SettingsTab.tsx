@@ -177,9 +177,30 @@ function ServiceServer({ service: s }: { service: ServiceView }) {
 
 function ServiceVolumes({ service: s }: { service: ServiceView }) {
   const vols = useStore((st) => st.current?.volumes);
-  const attached = s.volumes.map((m) => ({ m, v: m.volumeId ? vols?.[m.volumeId] : undefined }));
+  const attached = s.volumes.filter((m) => !m.hostPath && !m.borrowed).map((m) => ({ m, v: m.volumeId ? vols?.[m.volumeId] : undefined }));
+  const extra = s.volumes.filter((m) => m.hostPath || m.borrowed);
+  const unmount = async (mountPath: string) => {
+    try {
+      await api.post(`/services/${s.id}/unmount`, { mountPath });
+      toast({ title: `Removed ${mountPath}`, body: 'Nothing was deleted.', tone: 'ok' });
+    } catch (e) {
+      toastError(e, 'Could not remove it');
+    }
+  };
   return (
     <>
+      {extra.map((m) => (
+        <div key={m.mountPath} className="setting-row volume-row">
+          <Icon name={m.hostPath ? 'folder' : 'eye'} size={14} />
+          <span className="mono truncate" style={{ minWidth: 0, maxWidth: '45%' }} title={m.hostPath ?? undefined}>{m.hostPath ?? (m.volumeId && vols?.[m.volumeId]?.name) ?? m.name}</span>
+          <Icon name="arrowRight" size={12} className="faint" />
+          <span className="mono grow truncate">{m.mountPath}</span>
+          <span className="badge" data-tone="idle">{m.hostPath ? 'host folder' : 'shared'}{m.readOnly || m.borrowed ? ' · read-only' : ''}{m.selinux ? ` · :${m.selinux}` : ''}</span>
+          <Button size="sm" variant="ghost" icon="x" onClick={() => void unmount(m.mountPath)}>
+            Remove
+          </Button>
+        </div>
+      ))}
       {attached.map(({ m, v }) => (
         <div key={m.volumeId ?? m.name} className="setting-row volume-row">
           <Icon name="database" size={14} />
@@ -204,9 +225,84 @@ function ServiceVolumes({ service: s }: { service: ServiceView }) {
         <Button icon="plus" onClick={() => openVolumeDialog({ kind: 'attach', serviceId: s.id })}>
           Attach volume
         </Button>
+        <Button variant="ghost" icon="folder" onClick={() => openVolumeDialog({ kind: 'host', serviceId: s.id })}>
+          Host folder
+        </Button>
         <span className="faint" style={{ fontSize: 12 }}>
           A new empty one, or a detached volume from this project.
         </span>
+      </div>
+    </>
+  );
+}
+
+/** Ports published straight on the server (owner only). */
+function PublishedPorts({ service: s }: { service: ServiceView }) {
+  const [rows, setRows] = useState(s.ports ?? []);
+  const [draft, setDraft] = useState({ container: '', host: '', protocol: 'tcp' as 'tcp' | 'udp' });
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setRows(s.ports ?? []), [JSON.stringify(s.ports ?? [])]);
+  const save = async (next: NonNullable<ServiceView['ports']>) => {
+    setBusy(true);
+    try {
+      await api.patch(`/services/${s.id}`, { ports: next });
+      setRows(next);
+      if (s.activeDeploymentId && !s.stopped) {
+        await api.post(`/services/${s.id}/deploy`);
+        toast({ title: 'Ports saved', body: `${s.name} restarts with them (one replica, the old one stops first).`, tone: 'ok' });
+      } else toast({ title: 'Ports saved', body: 'They open on the next start.', tone: 'ok' });
+      setDraft({ container: '', host: '', protocol: draft.protocol });
+    } catch (e) {
+      toastError(e, 'Could not save the ports');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const c = Number(draft.container);
+  const h = Number(draft.host || draft.container);
+  return (
+    <>
+      {rows.map((p) => (
+        <div key={`${p.host}/${p.protocol}`} className="setting-row volume-row">
+          <Icon name="network" size={14} />
+          <span className="mono">
+            {p.hostIp ?? '0.0.0.0'}:{p.host}
+          </span>
+          <Icon name="arrowRight" size={12} className="faint" />
+          <span className="mono grow">container {p.container}</span>
+          <span className="badge" data-tone="idle">
+            {p.protocol.toUpperCase()}
+          </span>
+          <Button size="sm" variant="ghost" icon="x" disabled={busy} onClick={() => void save(rows.filter((x) => x !== p))}>
+            Remove
+          </Button>
+        </div>
+      ))}
+      <div className="row ports-add" style={{ gap: 8 }}>
+        <input className="input mono" style={{ width: 120 }} placeholder="container" inputMode="numeric" value={draft.container} onChange={(e) => setDraft({ ...draft, container: e.target.value.replace(/\D/g, '') })} />
+        <Icon name="arrowRight" size={12} className="faint" />
+        <input className="input mono" style={{ width: 120 }} placeholder={draft.container || 'host'} inputMode="numeric" value={draft.host} onChange={(e) => setDraft({ ...draft, host: e.target.value.replace(/\D/g, '') })} />
+        <Segmented size="sm" value={draft.protocol} onChange={(v) => setDraft({ ...draft, protocol: v })} options={[{ value: 'tcp', label: 'TCP' }, { value: 'udp', label: 'UDP' }]} />
+        <Button icon="plus" loading={busy} disabled={!(c > 0 && c < 65536 && h > 0 && h < 65536)} onClick={() => void save([...rows, { container: c, host: h, protocol: draft.protocol }])}>
+          Publish
+        </Button>
+      </div>
+    </>
+  );
+}
+
+/** The target of an external route, and whether it answers. */
+function ExternalAddress({ service: s }: { service: ServiceView }) {
+  const src = s.source.type === 'external' ? s.source : null;
+  if (!src) return null;
+  const t = s.external;
+  return (
+    <>
+      <Field label="Address" hint="Host and port on your network, plain HTTP (Servify does the HTTPS). For TCP routes, the TCP proxy port forwards here.">
+        <CommitInput mono value={src.url} onCommit={(v) => void patch(s.id, { external: v })} />
+      </Field>
+      <div className="faint" style={{ fontSize: 12 }}>
+        {t?.healthy === true ? `Answering · checked ${t.lastProbe ? new Date(t.lastProbe).toLocaleTimeString() : ''}` : t?.healthy === false ? 'Not answering — the router shows a “service unavailable” page until it does.' : 'Checking…'}
       </div>
     </>
   );
@@ -245,6 +341,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
   const [domainDraft, setDomainDraft] = useState('');
   const id = s.id;
   const src = s.source;
+  const ext = src.type === 'external';
 
   return (
     <div className="settings">
@@ -254,6 +351,12 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         </Field>
       </Section>
 
+      {ext && (
+        <Section title="Address" icon="external" desc="This service is a route: the router sends its traffic to another machine. Nothing runs here.">
+          <ExternalAddress service={s} />
+        </Section>
+      )}
+      {!ext && (
       <Section title="Source" icon={src.type === 'git' ? 'github' : src.type === 'local' ? 'folder' : 'box'} desc="Changes apply on the next deploy.">
         <Segmented
           value={src.type}
@@ -339,10 +442,13 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
           </div>
         )}
       </Section>
+      )}
 
-      <Section title="Schedule" icon="clock" desc="Run this service as a cron job: a one-off container on a schedule instead of always-on replicas.">
-        <ScheduleField service={s} />
-      </Section>
+      {!ext && (
+        <Section title="Schedule" icon="clock" desc="Run this service as a cron job: a one-off container on a schedule instead of always-on replicas.">
+          <ScheduleField service={s} />
+        </Section>
+      )}
 
       <Section title="Networking" icon="globe">
         <Segmented<Protocol>
@@ -351,10 +457,10 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
           options={[
             { value: 'http', label: 'HTTP' },
             { value: 'tcp', label: 'TCP' },
-            { value: 'none', label: 'Worker' },
+            ...(ext ? [] : [{ value: 'none' as Protocol, label: 'Worker' }]),
           ]}
         />
-        {s.protocol !== 'none' && (
+        {s.protocol !== 'none' && !ext && (
           <Field label="Container port" hint="Auto-detected from EXPOSE when empty. PORT is injected into the container.">
             <CommitInput mono value={s.port ? String(s.port) : ''} placeholder="auto" onCommit={(v) => void patch(id, { port: v ? Number(v) : null })} />
           </Field>
@@ -448,7 +554,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         </Section>
       )}
 
-      {!s.volumes.length && (
+      {!s.volumes.length && !ext && !s.ports?.length && (
         <Section title="Autoscaling" icon="layers" desc="Adds replicas under load, removes them when it calms down.">
           <div className="setting-row">
             <div className="grow">
@@ -485,6 +591,8 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         </Section>
       )}
 
+      {!ext && (
+      <>
       <Section title="Resources" icon="cpu" desc="Per-replica limits. Empty = unlimited.">
         <div className="ns-grid">
           <Field label="CPU cores">
@@ -503,6 +611,12 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
       <Section title="Volumes" icon="database" desc="Persistent storage that survives deploys and can move between services. A service with a volume runs as one replica.">
         <ServiceVolumes service={s} />
       </Section>
+
+      <Section title="Published ports" icon="network" desc="Open container ports straight on the server — TCP or UDP — for game servers, voice chat and anything the router doesn’t handle. One replica; anyone who can reach the server can reach these.">
+        <PublishedPorts service={s} />
+      </Section>
+      </>
+      )}
 
       <Section title="Danger zone" icon="alert">
         <div className="setting-row">

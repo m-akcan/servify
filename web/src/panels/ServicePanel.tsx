@@ -53,9 +53,11 @@ export function ServicePanel({ service: s, tab, onClose, onTab }: { service: Ser
           </div>
         </div>
         <div className="row" style={{ gap: 4, alignSelf: 'flex-start' }}>
-          <Button variant={s.pendingChanges.length ? 'primary' : 'secondary'} size="sm" icon="rocket" onClick={() => void deploy(s)} loading={false}>
-            {s.pendingChanges.length ? 'Deploy changes' : 'Deploy'}
-          </Button>
+          {s.source.type !== 'external' && (
+            <Button variant={s.pendingChanges.length ? 'primary' : 'secondary'} size="sm" icon="rocket" onClick={() => void deploy(s)} loading={false}>
+              {s.pendingChanges.length ? 'Deploy changes' : 'Deploy'}
+            </Button>
+          )}
           <Tooltip label="More actions" side="bottom">
             <button className="btn btn-ghost btn-sm btn-icon" onClick={(e) => openMenuAt(e.currentTarget, serviceMenu(s, { open: (t) => onTab((t as PanelTab) ?? 'overview') }), 'right')} aria-label="More">
               <Icon name="more" size={16} />

@@ -821,3 +821,10 @@
   white-space: pre-wrap;
   word-break: break-all;
 }
+.volume-row > svg,
+.volume-row > .badge {
+  flex: none;
+}
+.volume-row .grow {
+  min-width: 3em;
+}

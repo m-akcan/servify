@@ -33,7 +33,7 @@ function diffConfigs(prev: Deployment | undefined, d: Deployment): string[] {
   const out: string[] = [];
   const a = prev.config;
   const b = d.config;
-  const src = (x: Deployment['config']['source']) => (x.type === 'image' ? x.image : x.type === 'git' ? `${x.repo}${x.branch ? '@' + x.branch : ''}` : x.path);
+  const src = (x: Deployment['config']['source']) => (x.type === 'image' ? x.image : x.type === 'git' ? `${x.repo}${x.branch ? '@' + x.branch : ''}` : x.type === 'external' ? x.url : x.path);
   if (src(a.source) !== src(b.source)) out.push(`source → ${src(b.source)}`);
   if (prev.commitSha && d.commitSha && prev.commitSha !== d.commitSha) out.push(`commit ${prev.commitSha.slice(0, 7)} → ${d.commitSha.slice(0, 7)}`);
   if ((a.port ?? null) !== (b.port ?? null)) out.push(`port ${a.port ?? 'auto'} → ${b.port ?? 'auto'}`);

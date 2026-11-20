@@ -40,6 +40,8 @@ export type ServiceView = Service & {
   server?: { id: string; name: string; online: boolean };
   /** Services it references by variable that run on another server (private names won't resolve). */
   crossServerRefs?: string[];
+  /** External routes: the target and whether it answered the last probe. */
+  external?: { host: string; port: number; healthy: boolean | null; lastProbe: number | null } | null;
 };
 
 export type JoinCommand = { url: string; fingerprint: string; docker: string; node: string };

@@ -698,7 +698,7 @@
   const LINES = [
     ['t-prompt', '$ claude mcp add --transport http servify http://localhost:7700/mcp \\'],
     ['t-dim', '    --header "Authorization: Bearer svf_••••••••"'],
-    ['t-ok', '✓ servify connected · 46 tools'],
+    ['t-ok', '✓ servify connected · 48 tools'],
     ['gap'],
     ['t-user', '> The api feels slow under load. Scale it up and check if p95 improves.', 'type'],
     ['gap'],

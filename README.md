@@ -38,7 +38,7 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Runs in the background.** `servify service install` starts it at login (launchd) or with your session/boot (systemd).
 - **Volumes you can move.** Volumes are first-class: create them, attach them to a service, detach them (the data stays, as a card on the canvas), drag them onto another service, rename and delete them. Sizes are shown live.
 - **Secrets encrypted at rest** (AES-256-GCM) with a master key you control.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 46 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 48 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -162,6 +162,22 @@ Settings → Notifications: add Slack, Discord, Telegram, ntfy, email or webhook
 
 A volume belongs to a project and is attached to at most one service. It shows as a tab under its service on the canvas (name and size). From its menu you can **detach** it — the service restarts without it and the volume stays on the canvas as a detached card, data intact — and then drag it onto any service in the project to **attach** it at a mount path. "Attach volume…" on a service (or "New volume here" on the canvas) creates a fresh one. Deleting a service keeps its volumes as detached volumes unless you ask otherwise; deleting a volume is the only thing that removes its data. Attach and detach redeploy the service immediately, so a volume is never mounted by two services at once, and a rollback never mounts a volume that has moved away. A service with a volume runs as a single replica.
 
+### Bringing existing data and setups along
+
+For moving existing Docker setups onto Servify (all owner-only — agent tokens are refused):
+
+- **Take over a Docker volume** ("An existing Docker volume…" when attaching, or `docker compose` import with *Take over the existing Docker volumes*): the Servify volume points at the same Docker volume, nothing is copied. It's refused while any container outside Servify — running or stopped — still references the volume, so stop the old setup first (`docker compose down`, without `-v`). Adopted volumes are never deleted implicitly (deleting their service or project only forgets them); **Forget (keep the data)** hands any volume back.
+- **Host folders** ("Host folder" in a service's volumes): a folder of the server mounted live, for media libraries or files you edit in place. Off until you start Servify with `SERVIFY_HOST_MOUNTS=/srv/media,/home/me/game` — only folders under those paths, never system folders, the Docker socket or Servify's own data. The folder must exist (Docker would silently create a missing one), symlinks are resolved before checking, and it can be read-only. On SELinux machines (Fedora, RHEL) pick a relabel (`z` shared, `Z` private) only if the container gets "permission denied" — relabelling a folder other programs use can break them. Host folders are never backed up, wiped by a restore or deleted.
+- **Read-only shares** ("Share read-only with…" on a volume): another service of the project reads the volume — say a backup container reading a game server's world. It can't write, doesn't own it, and its backups, restores and deletes never touch it; the volume can't be deleted while it's shared.
+
+## Published ports
+
+Some things aren't HTTP and don't fit the TCP proxy: game servers, voice chat (UDP), anything that wants a fixed port. **Published ports** in a service's settings open a container port straight on the server (`0.0.0.0:25565 → 25565`, TCP or UDP). Owner only. A service with published ports runs as one replica and is redeployed stop-first (two containers can't hold one port). Servify refuses ports another service publishes, its own ports, and ports already busy on this machine. Anyone who can reach the server can reach them — check your firewall. Environment copies never get them.
+
+## External routes
+
+**New → Another machine** routes a domain (with automatic HTTPS) or a TCP proxy port to an address Servify doesn't run — a NAS, a VM, another box on your network (`http://192.168.1.20:8080`). Nothing is deployed: Servify health-checks the address, shows it on the canvas, alerts when it stops answering and serves "unavailable" meanwhile. The original `Host` header and WebSockets pass through. Owner only (the router can reach whatever this machine can); plain HTTP targets only, since Servify terminates HTTPS.
+
 ## PostgreSQL clusters
 
 Create a service from the **PostgreSQL cluster** template: three replicas, each with its own volume. Replica 0 initialises as the primary; the others clone it with `pg_basebackup` and stream from it. Apps write through `${{ db.DATABASE_URL }}` (the service name points at the primary only) and can read through `${{ db.DATABASE_READ_URL }}` (`<name>-read`, the standbys). The TCP proxy also routes to the primary.
@@ -217,7 +233,7 @@ The **production ▾** menu next to the project name creates environments: a ful
 
 ## Docker Compose
 
-**Import → Docker Compose**: paste the file (and optionally the folder it lives in, for `build:` contexts, `env_file` and `.env`). Preview shows exactly what each service becomes. Images and builds, ports, `environment`/`env_file`/`${VAR:-default}` interpolation, named volumes, `command`/`entrypoint`, `deploy.replicas`, resource limits, HTTP healthchecks and `depends_on` (layout) carry over; services stay reachable by their compose names. Host bind mounts, `privileged`, host networking/PID, extra capabilities, devices and the Docker socket are never honoured — each produces a warning instead.
+**Import → Docker Compose**: paste the file (and optionally the folder it lives in, for `build:` contexts, `env_file` and `.env`). Preview shows exactly what each service becomes. Images and builds, ports, `environment`/`env_file`/`${VAR:-default}` interpolation, named volumes, `command`/`entrypoint`, `deploy.replicas`, resource limits, HTTP healthchecks and `depends_on` (layout) carry over; services stay reachable by their compose names. Host folders are kept only when the owner imports and `SERVIFY_HOST_MOUNTS` allows them (with `:ro` / `:z` / `:Z`), UDP ports become published ports, and named volumes can be taken over in place. `privileged`, host networking/PID, extra capabilities, devices and the Docker socket are never honoured — each produces a warning instead.
 
 ## Configuration
 
@@ -233,6 +249,7 @@ The **production ▾** menu next to the project name creates environments: a ful
 | `SERVIFY_ALLOWED_HOSTS` | | Extra hostnames allowed to reach the dashboard |
 | `SERVIFY_AGENT_HOST` / `SERVIFY_AGENT_PORT` | `0.0.0.0` / `7701` | Where servers' agents connect (TLS). Only started once a server is added |
 | `SERVIFY_AGENT_PUBLIC_HOST` | first LAN IPv4 | Address shown in the join command |
+| `SERVIFY_HOST_MOUNTS` | | Folders services may mount from the host (comma-separated). Empty = host folders off |
 | `SERVIFY_AUTH` | `password` | `none` disables the dashboard password (single-user machines only) |
 | `SERVIFY_LOG_RETENTION_DAYS` / `SERVIFY_LOG_MAX_LINES` | `7` / `200000` | Runtime log history per service |
 | `SERVIFY_METRICS_RETENTION_DAYS` | `7` | Metrics history |
@@ -268,6 +285,8 @@ node scripts/acceptance-features.mjs  # HTTPS, webhooks, notifications, backups,
 node web/scripts/gen-brand-icons.mjs  # refresh the service logos (simple-icons, CC0)
 ```
 
+`scripts/acceptance-hosting.mjs` checks host folders, read-only shares, adopted volumes, published TCP/UDP ports, external routes, the Compose import that uses them, the owner-only gates and that restores and deletes never touch data a service doesn't own (see its header).
+
 `scripts/acceptance-servers.mjs` starts a second Docker daemon (docker-in-docker), joins it with the real agent command and checks deploys, routing, builds, exec, backups, an agent outage, moves and a PostgreSQL cluster on it (see its header for the instance settings it needs).
 
 The acceptance script deploys, load-balances, scales, redeploys under load (asserting zero failed requests), kills replicas, checks the TCP proxy and variable references, then cleans up. Set `SERVIFY_TOKEN` when auth is on. The feature suite needs owner access (`SERVIFY_COOKIE` or `SERVIFY_AUTH=none`); `SERVIFY_DATA_DIR` adds the "no plaintext secrets on disk" check. Both default to `http://localhost:7700` — point `SERVIFY_URL` at a test instance.
@@ -279,7 +298,7 @@ The acceptance script deploys, load-balances, scales, redeploys under load (asse
 - API tokens are stored as SHA-256 hashes and can be read-only. Secrets are masked for read-only tokens; instance settings can only be changed by the owner (not by agent tokens).
 - Service variables, git tokens, resolved environments, notification credentials, storage keys, ACME account keys and certificate keys are encrypted at rest (AES-256-GCM). Back up `master.key` (or use `SERVIFY_MASTER_KEY`): without it the secrets are gone, and Servify refuses to start with the wrong key rather than overwrite them. Not encrypted: what Docker itself stores (a running container's environment), build logs, cron job output and runtime logs — keep secrets out of your log output.
 - Git webhooks are verified with HMAC-SHA256 (GitHub, Gitea) or the secret token (GitLab) in constant time; payloads are capped at 2 MB.
-- Compose imports never mount host folders or the Docker socket and never grant privileges.
+- Compose imports never mount the Docker socket and never grant privileges. Host folders, published ports, external routes and taking over Docker volumes are owner-only (agent tokens get 403), checked again when containers are created, and left out of environment copies. Host folders must be under `SERVIFY_HOST_MOUNTS`.
 
 ## License
 
