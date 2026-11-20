@@ -253,15 +253,22 @@ async function issue(host: string, opts: { skipCheck?: boolean } = {}) {
 }
 
 let syncing = false;
+/** How long an imported certificate waits for its domain to be routed before it is forgotten. */
+const IMPORT_GRACE_MS = 24 * 3600_000;
+
 export async function syncCertificates() {
   if (syncing) return;
   syncing = true;
   try {
     const s = getSettings().https;
     const wanted = new Set(s.enabled ? wantedHosts() : []);
-    // Forget certificates for hosts that are no longer routed.
+    // Forget certificates for hosts that are no longer routed. Imported ones get a day's grace (import first,
+    // add the route after) and are only forgotten while HTTPS is on, so switching it off never drops them.
     for (const r of certsTable.all()) {
-      if (!wanted.has(r.id) && r.issuer === 'acme' && Date.now() - (r.lastAttemptAt ?? 0) > 60_000) {
+      if (wanted.has(r.id)) continue;
+      const unusedAcme = r.issuer === 'acme' && Date.now() - (r.lastAttemptAt ?? 0) > 60_000;
+      const unusedImport = r.issuer === 'imported' && s.enabled && ((r.expiresAt ?? 0) < Date.now() || Date.now() - r.createdAt > IMPORT_GRACE_MS);
+      if (unusedAcme || unusedImport) {
         certsTable.delete(r.id);
         issuedContexts.delete(r.id);
       }
