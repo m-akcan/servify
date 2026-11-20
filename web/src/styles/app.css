@@ -1971,3 +1971,19 @@ a.panel-link:hover {
 button.chip {
   cursor: pointer;
 }
+
+.failure-hint {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.failure-hint svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
