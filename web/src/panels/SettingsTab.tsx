@@ -71,7 +71,7 @@ const PRESETS: [string, string][] = [
 function ScheduleField({ service: s }: { service: ServiceView }) {
   return (
     <>
-      <Field label="Cron expression" hint={s.schedule ? `${describeCron(s.schedule)} · deploy to apply changes` : 'Empty = a normal always-on service'}>
+      <Field label="Cron expression" hint={s.schedule ? `${describeCron(s.schedule)}${(s.deployedSchedule ?? null) !== s.schedule ? ' · takes effect on the next deploy (replicas are replaced by scheduled runs)' : ''}` : s.deployedSchedule ? 'Cleared — deploy to switch back to always-on replicas' : 'Empty = a normal always-on service'}>
         <CommitInput mono value={s.schedule ?? ''} placeholder="e.g. */15 * * * *" onCommit={(v) => void patch(id(s), { schedule: v || null })} />
       </Field>
       <div className="row" style={{ flexWrap: 'wrap', gap: 6 }}>

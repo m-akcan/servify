@@ -128,7 +128,7 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
         <Stat label="Memory" value={memMb} format={(n) => mem(n).split(' ')[0]} unit={memMb >= 1024 ? 'GB' : 'MB'} icon="memory" />
       </div>
 
-      {s.schedule ? (
+      {s.deployedSchedule ? (
         <ScheduleCard service={s} />
       ) : (
       <section className="card scale-card">

@@ -207,7 +207,8 @@ async function runDeployment(depId: string, actor: Actor) {
     (dep as any).resolvedEnv = env;
 
     // ─── scheduled job: nothing long-lived to start, the image is simply armed ───
-    if (svc.schedule) {
+    const schedule = ((dep.config as any).schedule as string | null) ?? null;
+    if (schedule) {
       dep.status = 'active';
       dep.finishedAt = Date.now();
       saveDep(dep);
@@ -220,11 +221,11 @@ async function runDeployment(depId: string, actor: Actor) {
         }
       }
       setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, stopped: false, detectedPort: dep.port });
-      const next = nextRun(svc.schedule);
-      log(`✓ Cron job armed — schedule "${svc.schedule}"${next ? `, next run ${next.toLocaleString()}` : ''}`);
+      const next = nextRun(schedule);
+      log(`✓ Cron job armed — schedule "${schedule}"${next ? `, next run ${next.toLocaleString()}` : ''}`);
       const old = replicasOf(svc.id).map((r) => r.containerId);
       if (old.length) await drainAndRemove(old, 2000);
-      recordActivity(actor, 'deployment.active', `${svc.name} armed on schedule ${svc.schedule}`, svc.projectId, svc.id);
+      recordActivity(actor, 'deployment.active', `${svc.name} armed on schedule ${schedule}`, svc.projectId, svc.id);
       return;
     }
 
@@ -234,7 +235,7 @@ async function runDeployment(depId: string, actor: Actor) {
     setServiceStatus(svc.id, 'deploying');
     // Let any reconcile already touching this service finish before we take ownership.
     for (let i = 0; converging.has(svc.id) && i < 100; i++) await new Promise((r) => setTimeout(r, 100));
-    const want = Math.max(1, effectiveReplicas({ ...svc, stopped: false, schedule: null }, dep));
+    const want = Math.max(1, svc.volumes.length || dep.config.volumes.length ? 1 : svc.replicas);
     const oldContainers = replicasOf(svc.id)
       .filter((r) => r.deploymentId !== dep.id)
       .map((r) => r.containerId);

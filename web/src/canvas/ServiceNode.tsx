@@ -305,11 +305,11 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
             <span className="truncate">{s.activeDeploymentId ? 'Last deploy failed — still serving previous version' : latest.error}</span>
           </div>
         )}
-        {s.schedule ? (
+        {s.deployedSchedule ? (
           <div className="node-foot">
             <span className={`cron-chip ${s.jobRunning ? 'running' : ''}`}>
               <Icon name="clock" size={11} />
-              {describeCron(s.schedule)}
+              {describeCron(s.deployedSchedule)}
             </span>
             <span className="spacer" />
             {s.nextRunAt && <span className="node-replicas tnum">next {new Date(s.nextRunAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}

@@ -17,7 +17,7 @@ export type {
 
 import type { Service, Project, Deployment, Replica } from '../../../server/src/types.ts';
 
-export type ServiceView = Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[]; nextRunAt?: number | null; jobRunning?: boolean };
+export type ServiceView = Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[]; nextRunAt?: number | null; jobRunning?: boolean; deployedSchedule?: string | null };
 
 export type ProjectListItem = Project & {
   serviceCount: number;

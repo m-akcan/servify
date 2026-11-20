@@ -143,7 +143,7 @@ export function refreshServiceStatus(serviceId: string) {
   let next = svc.status;
   if (svc.stopped) next = 'stopped';
   else if (!svc.activeDeploymentId) next = svc.status === 'failed' ? 'failed' : 'idle';
-  else if (svc.schedule) next = 'running';
+  else if (deployedSchedule(svc)) next = 'running';
   else {
     const reps = replicasOf(serviceId).filter((r) => r.deploymentId === svc.activeDeploymentId);
     const healthy = reps.filter((r) => r.state === 'healthy').length;
@@ -163,11 +163,17 @@ export function refreshServiceStatus(serviceId: string) {
   }
 }
 
+/** The schedule that is actually deployed (editing the setting only takes effect on deploy). */
+export function deployedSchedule(svc: Service, dep?: Deployment | null): string | null {
+  const d = dep ?? (svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null);
+  return ((d?.config as any)?.schedule as string | null | undefined) ?? null;
+}
+
 export function effectiveReplicas(svc: Service, dep?: Deployment | null): number {
-  if (svc.stopped || svc.schedule) return 0; // cron services run as one-off jobs, not replicas
+  const deployed = dep ?? (svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null);
+  if (svc.stopped || deployedSchedule(svc, deployed)) return 0; // cron services run as one-off jobs, not replicas
   // Cap on what is actually mounted (the deployed config), not just the editable setting:
   // removing a volume in settings must not let N replicas share the deployed volume.
-  const deployed = dep ?? (svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null);
   if (svc.volumes.length > 0 || (deployed?.config.volumes.length ?? 0) > 0) return Math.min(1, svc.replicas);
   return Math.max(0, svc.replicas);
 }

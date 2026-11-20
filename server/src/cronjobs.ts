@@ -4,7 +4,10 @@ import { services as servicesTable, deployments as deploymentsTable, projects as
 import type { JobRun, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { id, HttpError } from './util.ts';
-import { networkName, volumeName, LABEL, INSTANCE_ID } from './engine.ts';
+import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from './engine.ts';
+
+/** A run that outlives this is killed (a long-lived server image armed as a job by mistake, a hang…). */
+const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
 import { parseCron, cronMatches } from './cron.ts';
 
 const running = new Set<string>();
@@ -23,6 +26,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
   if (running.has(svc.id)) throw new HttpError(409, `${svc.name} is already running`);
   const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
   if (!dep?.image) throw new HttpError(400, `deploy ${svc.name} before running it`);
+  if (!deployedSchedule(svc, dep)) throw new HttpError(400, `${svc.name} is not a scheduled job (set a schedule and deploy first)`);
   const project = projectsTable.get(svc.projectId);
   if (!project) throw new HttpError(404, 'project missing');
   running.add(svc.id);
@@ -65,12 +69,19 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     }
     cid = await docker.createContainer(`svf-job-${svc.slug}-${run.id.slice(-6)}`, spec);
     await docker.startContainer(cid);
-    const exitCode = await docker.waitContainer(cid);
+    const startedCid = cid;
+    let timedOut = false;
+    const killer = setTimeout(() => {
+      timedOut = true;
+      void docker.killContainer(startedCid).catch(() => {});
+    }, MAX_RUNTIME_MS);
+    const exitCode = await docker.waitContainer(cid).finally(() => clearTimeout(killer));
+    if (timedOut) run.output = `killed after ${Math.round(MAX_RUNTIME_MS / 1000)}s (max runtime)\n`;
     const lines: string[] = [];
     const res = await docker.logs(cid, { tail: 400, timestamps: false });
     for await (const f of demuxLines(res)) lines.push(f.text);
     run.exitCode = exitCode;
-    run.output = lines.join('\n');
+    run.output = run.output + lines.join('\n');
     run.status = exitCode === 0 ? 'succeeded' : 'failed';
   } catch (e) {
     run.status = 'failed';
@@ -102,14 +113,26 @@ function tick() {
   if (minute === lastMinute) return;
   lastMinute = minute;
   for (const svc of servicesTable.all()) {
-    if (!svc.schedule || svc.stopped || !svc.activeDeploymentId || running.has(svc.id)) continue;
+    const schedule = deployedSchedule(svc);
+    if (!schedule || svc.stopped || running.has(svc.id)) continue;
     try {
-      if (cronMatches(parseCron(svc.schedule), now)) void runJob(svc, 'schedule', SCHEDULER).catch(() => {});
+      if (cronMatches(parseCron(schedule), now)) void runJob(svc, 'schedule', SCHEDULER).catch(() => {});
     } catch {}
   }
 }
 
+/** Kill and remove any job containers of a service (used by stop / delete). */
+export async function killJobs(serviceId: string) {
+  const list = await docker.listContainers([`servify.job=true`, `${LABEL.service}=${serviceId}`]).catch(() => []);
+  await Promise.allSettled(list.map((c) => docker.removeContainer(c.Id, true)));
+}
+
 export function startScheduler() {
+  // Job containers can't be resumed after a restart: clean up this instance's leftovers.
+  void docker
+    .listContainers([`servify.job=true`, `${LABEL.instance}=${INSTANCE_ID}`])
+    .then((list) => Promise.allSettled(list.map((c) => docker.removeContainer(c.Id, true))))
+    .catch(() => {});
   // Mark runs interrupted by a restart, then check the clock every few seconds.
   for (const r of runsTable.all(`WHERE json_extract(data, '$.status') = 'running'`)) {
     r.status = 'failed';

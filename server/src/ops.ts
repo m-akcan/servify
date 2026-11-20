@@ -9,7 +9,7 @@ import { bus, recordActivity, type Actor } from './events.ts';
 import { id, slugify, secret, HttpError, assert } from './util.ts';
 import { getTemplate, templates } from './templates.ts';
 import { queueDeployment, readDeploymentLog, isDeploying } from './deployer.ts';
-import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, volumeName } from './engine.ts';
+import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, volumeName, deployedSchedule } from './engine.ts';
 import { docker, demuxLines } from './docker.ts';
 import { referencedServices, publicUrl, resolveEnv } from './vars.ts';
 import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
@@ -17,7 +17,7 @@ import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
 import { config } from './config.ts';
 import { validateCron, nextRun } from './cron.ts';
-import { runJob, listRuns, isJobRunning } from './cronjobs.ts';
+import { runJob, listRuns, isJobRunning, killJobs } from './cronjobs.ts';
 
 const PROJECT_COLORS = ['#d4f25a', '#7ce0c3', '#f2a65a', '#9fb4ff', '#f27a9b', '#c9a7ff', '#5ad1f2'];
 
@@ -33,7 +33,9 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.url = project && s.protocol === 'http' && s.publicHttp ? publicUrl(s, project) : null;
   out.tcpAddress = s.publicTcpPort ? `${config.proxyHost === '0.0.0.0' ? 'localhost' : config.proxyHost}:${s.publicTcpPort}` : null;
   out.pendingChanges = pendingChanges(s);
-  out.nextRunAt = s.schedule && s.activeDeploymentId && !s.stopped ? nextRun(s.schedule)?.getTime() ?? null : null;
+  const live = deployedSchedule(s);
+  out.deployedSchedule = live;
+  out.nextRunAt = live && !s.stopped ? nextRun(live)?.getTime() ?? null : null;
   out.jobRunning = isJobRunning(s.id);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
@@ -431,12 +433,9 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.schedule !== undefined) {
     const sched = patch.schedule?.trim() || null;
     if (sched) {
+      // Only validated here; it takes effect (replacing replicas with scheduled runs) on the next deploy.
       const err = validateCron(sched);
       if (err) throw new HttpError(400, `invalid schedule: ${err}`);
-      if (svc.protocol !== 'none') set('protocol', 'none', 'networking');
-      svc.publicHttp = false;
-      svc.publicTcpPort = null;
-      svc.autoscale = { ...svc.autoscale, enabled: false };
     }
     set('schedule', sched, 'schedule');
   }
@@ -509,6 +508,7 @@ export async function stopService(actor: Actor, serviceId: string) {
   recordActivity(actor, 'service.stopped', `Stopped ${svc.name}`, svc.projectId, svc.id);
   const cids = replicasOf(svc.id).map((r) => r.containerId);
   await drainAndRemove(cids, 3000);
+  await killJobs(svc.id);
   return serializeService(svc);
 }
 
@@ -799,7 +799,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: src.volumes, healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: src.volumes, healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -821,7 +821,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -882,6 +882,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       buildCommand: raw.buildCommand === undefined ? svc.buildCommand : raw.buildCommand,
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),
+      schedule: raw.schedule ?? null,
     } satisfies Partial<Service>);
     if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
     servicesTable.put(svc);

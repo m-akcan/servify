@@ -43,9 +43,9 @@ export function ScheduleCard({ service: s }: { service: ServiceView }) {
           <Icon name="clock" size={18} />
         </div>
         <div className="grow">
-          <div className="h3">{describeCron(s.schedule ?? '')}</div>
+          <div className="h3">{describeCron(s.deployedSchedule ?? '')}</div>
           <div className="faint mono" style={{ fontSize: 11, marginTop: 2 }}>
-            {s.schedule}
+            {s.deployedSchedule}
             {s.nextRunAt && !runningNow ? ` · next ${countdown(s.nextRunAt)}` : ''}
             {!s.activeDeploymentId ? ' · deploy to arm the schedule' : ''}
           </div>

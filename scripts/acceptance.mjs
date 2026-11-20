@@ -227,8 +227,16 @@ try {
   check('autoscaler adds replicas under load', scaled);
   await api('PATCH', `/services/${service.id}`, { autoscale: { enabled: false } });
 
-  // 13. cron job: manual run + scheduled run
+  // 13. cron job: setting a schedule must not touch a serving service until it is deployed
   console.log('\n▸ cron jobs');
+  await waitFor(async () => (await healthyCount(service.id)) >= 1, 60_000, 'web healthy');
+  await api('PATCH', `/services/${service.id}`, { schedule: '*/5 * * * *' });
+  await sleep(7000);
+  const still = await hit(host);
+  const pendingSched = (await api('GET', `/services/${service.id}`)).pendingChanges.includes('schedule');
+  check('schedule edit is staged, service keeps serving', still.status === 200 && pendingSched, `status ${still.status}, pending ${pendingSched}`);
+  await api('PATCH', `/services/${service.id}`, { schedule: null });
+
   const job = await api('POST', `/projects/${project.id}/services`, { image: 'alpine:3.20', name: 'cronjob', protocol: 'none', startCommand: 'echo hello-from-cron-$SERVIFY_JOB_RUN_ID', deploy: false });
   await api('PATCH', `/services/${job.service.id}`, { schedule: '* * * * *' });
   const jd = await api('POST', `/services/${job.service.id}/deploy`);
