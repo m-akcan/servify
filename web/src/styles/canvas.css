@@ -767,3 +767,22 @@
 .edge-line.fade-edge {
   animation: fade-in 600ms var(--ease-out);
 }
+
+.node-ghost {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 256px;
+  pointer-events: none;
+}
+.node-ghost .node-card {
+  min-height: 120px;
+  animation: node-out 360ms var(--ease-in-out) forwards;
+}
+@keyframes node-out {
+  to {
+    opacity: 0;
+    transform: scale(0.88);
+    filter: blur(4px);
+  }
+}

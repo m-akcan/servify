@@ -387,6 +387,19 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
 
   const services = useMemo(() => state.order.map((id) => state.services[id]).filter(Boolean), [state.order, state.services]);
 
+  // Exit animation: removed services linger briefly as non-interactive ghosts.
+  const [ghosts, setGhosts] = useState<typeof services>([]);
+  const prevServices = useRef(services);
+  useEffect(() => {
+    const ids = new Set(services.map((s) => s.id));
+    const gone = prevServices.current.filter((s) => !ids.has(s.id));
+    prevServices.current = services;
+    if (!gone.length) return;
+    setGhosts((g) => [...g, ...gone]);
+    const t = setTimeout(() => setGhosts((g) => g.filter((x) => !gone.some((y) => y.id === x.id))), 380);
+    return () => clearTimeout(t);
+  }, [services]);
+
   const edges: EdgeSpec[] = useMemo(() => {
     const out: EdgeSpec[] = [];
     for (const s of services) {
@@ -421,6 +434,15 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
       <div className="world" ref={worldRef}>
         <EdgesLayer edges={edges} highlight={selectedId} draft={draft} />
         <IngressNode services={services} proxyPort={state.proxyPort} visible={hasIngress} />
+        {ghosts.map((s) => (
+          <div key={`ghost-${s.id}`} className="node-ghost" style={{ transform: `translate3d(${s.x}px, ${s.y}px, 0)` }}>
+            <div className="node-card">
+              <div className="node-head">
+                <div className="node-name truncate">{s.name}</div>
+              </div>
+            </div>
+          </div>
+        ))}
         {services.map((s, i) => (
           <ServiceNode
             key={s.id}
