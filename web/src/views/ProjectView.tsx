@@ -246,6 +246,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
 
   const services = Object.values(state.services);
   const pending = services.filter((s) => s.pendingChanges.length && s.activeDeploymentId);
+  const undeployed = services.filter((s) => !s.activeDeploymentId && s.status === 'idle' && !Object.values(state.deployments).some((d) => d.serviceId === s.id));
   const empty = services.length === 0;
 
   return (
@@ -325,6 +326,17 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         </Button>
       </div>
 
+      {pending.length === 0 && undeployed.length > 0 && !empty && (
+        <div className="pending-bar glass rise-in" style={{ marginLeft: open ? -panelW / 2 : 0, borderColor: 'var(--line-2)' }}>
+          <span className="pending-dot" style={{ background: 'var(--idle)', boxShadow: 'none', animation: 'none' }} />
+          <span>
+            <b>{undeployed.length}</b> service{undeployed.length > 1 ? 's' : ''} not deployed yet
+          </span>
+          <Button size="sm" variant="primary" icon="rocket" onClick={() => undeployed.forEach((s) => void deploy(s))}>
+            Deploy {undeployed.length > 1 ? 'all' : ''}
+          </Button>
+        </div>
+      )}
       {pending.length > 0 && (
         <div className="pending-bar glass rise-in" style={{ marginLeft: open ? -panelW / 2 : 0 }}>
           <span className="pending-dot" />
