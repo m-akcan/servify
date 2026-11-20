@@ -158,6 +158,8 @@ export interface Deployment {
   projectId: string;
   status: DeploymentStatus;
   image: string | null;
+  /** The server it was rolled out on (null = this machine). */
+  nodeId?: string | null;
   /** Detected/used port for this image. */
   port: number | null;
   sourceLabel: string;

@@ -5,7 +5,7 @@
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { normalizeImageRef, type DockerClient } from './docker.ts';
-import { dockerFor, nodeOf, nodeName, LOCAL } from './nodes.ts';
+import { dockerFor, nodeOf, nodeName, onlineNodes, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
 import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable } from './db.ts';
 import type { Deployment, DeployTrigger, Service } from './types.ts';
@@ -191,17 +191,27 @@ async function runDeployment(depId: string, actor: Actor) {
     const src = dep.config.source;
     const node = nodeOf(svc);
     const d = dockerFor(node);
+    dep.nodeId = node === LOCAL ? null : node;
     if (node !== LOCAL) log(`▸ Deploying on server ${nodeName(node)}`);
     const crossRefs = referencedServicesOn(svc);
     if (crossRefs.length) log(`! ${svc.name} references ${crossRefs.join(', ')} on another server — private names (and \${{ ….HOST }}) only resolve on the same server. Move them together, or use their public URL / TCP address.`);
-    // Images live per server: a rollback or a move may need the image built or pulled again there.
+    // Images live per server: after a move, a rollback or restart may find its image elsewhere.
     if (dep.image && !(await d.inspectImage(dep.image))) {
-      if (src.type === 'image') {
+      if (src.type === 'image' && !dep.image.startsWith('servify/')) {
         log(`▸ ${dep.image} is not on ${nodeName(node)} yet`);
-        dep.image = null;
-      } else if (dep.image.startsWith('servify/')) {
-        log(`▸ ${dep.image} is not on ${nodeName(node)} — rebuilding`);
-        dep.image = null;
+        dep.image = null; // pulled below
+      } else {
+        // A built image: copy the exact image from a server that has it (a rebuild could produce different code).
+        let from: string | null = null;
+        for (const n of onlineNodes()) {
+          if (n !== node && (await dockerFor(n).inspectImage(dep.image).catch(() => null))) {
+            from = n;
+            break;
+          }
+        }
+        if (!from) throw new Error(`image ${dep.image} is no longer on any server — deploy again to build it fresh`);
+        log(`▸ Copying ${dep.image} from ${nodeName(from)} to ${nodeName(node)}`);
+        await d.loadImage(await dockerFor(from).exportImage(dep.image));
       }
     }
     if (!dep.image) {

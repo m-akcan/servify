@@ -292,6 +292,13 @@ export function createDockerClient(target: DockerTarget) {
         onLine(key ? `${key}: ${status}` : status);
       }
     },
+    /** The image as a tar stream (`docker save`). */
+    exportImage: (ref: string) => stream('GET', `/images/${encodeURIComponent(ref)}/get`),
+    /** Load a `docker save` tar stream. */
+    async loadImage(tar: Readable): Promise<void> {
+      const res = await stream('POST', '/images/load', { query: { quiet: true }, rawBody: tar, headers: { 'Content-Type': 'application/x-tar' } });
+      for await (const msg of jsonLines(res)) if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
+    },
     removeImage: (ref: string) => call('DELETE', `/images/${encodeURIComponent(ref)}`, { query: { force: false } }).catch(() => {}),
     listImages: (labels: string[] = []) => call<any[]>('GET', '/images/json', { query: { filters: filtersParam({ label: labels }) } }),
 

@@ -718,6 +718,13 @@ export function startService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   svc.stopped = false;
   if (!svc.activeDeploymentId) return { service: serializeService(svc), deployment: deployService(actor, svc.id) };
+  const active = deploymentsTable.get(svc.activeDeploymentId);
+  if (active && (active.nodeId ?? null) !== (svc.nodeId ?? null)) {
+    // Moved while stopped: roll the same version out on the new server (its image may need copying there).
+    servicesTable.put(svc);
+    recordActivity(actor, 'service.started', `Started ${svc.name} on ${nodeName(nodeOf(svc))}`, svc.projectId, svc.id);
+    return { service: serializeService(svc), deployment: restartService(actor, svc.id) };
+  }
   svc.status = 'deploying';
   svc.updatedAt = Date.now();
   servicesTable.put(svc);
@@ -964,7 +971,7 @@ export type ProjectSpec = {
   servify: 1;
   name: string;
   color?: string;
-  services: Array<Partial<Service> & { name: string; source?: Source }>;
+  services: Array<Partial<Service> & { name: string; source?: Source; server?: string }>;
 };
 
 const SPEC_KEYS = [
@@ -983,6 +990,8 @@ export function exportProject(projectId: string, opts: { secrets?: boolean } = {
       const out: any = {};
       for (const k of SPEC_KEYS) out[k] = structuredClone((s as any)[k]);
       out.volumes = (out.volumes ?? []).map(({ volumeId, ...v }: any) => v);
+      // Which server it runs on (by name, so a spec stays readable); imports keep it when that server exists.
+      if (s.nodeId) out.server = nodesTable.get(s.nodeId)?.name ?? s.nodeId;
       if (!opts.secrets) {
         for (const k of s.secretKeys) if (k in out.env && !/\$\{\{/.test(out.env[k])) out.env[k] = '';
         if (out.source?.type === 'git') delete out.source.token;
@@ -1009,6 +1018,9 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
     else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
     if (raw.protocol) input.protocol = raw.protocol;
     if (raw.port) input.port = raw.port;
+    // Same server as the original when it exists here (environments keep services together); otherwise this machine.
+    const server = (raw as any).server as string | undefined;
+    if (server && (nodesTable.get(server) || nodesTable.all().some((n) => n.name.toLowerCase() === server.toLowerCase()))) input.server = server;
     const r = await createService(actor, project.id, input);
     const svc = servicesTable.get(r.service.id)!;
     if (tpl && src.type === 'image' && src.image !== tpl.image) svc.source = { type: 'image', image: src.image };

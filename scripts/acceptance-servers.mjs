@@ -131,6 +131,15 @@ try {
     return b && b.status !== 'running' && b;
   }, 120_000);
   check('a database backup is taken on the server and stored here', bak?.status === 'succeeded' && bak.sizeBytes > 100, JSON.stringify(bak).slice(0, 160));
+  await api('POST', `/services/${db.id}/exec`, { command: `psql -U postgres -d app -qc "insert into t values (8)"` });
+  await api('POST', `/backups/${bak.id}/restore`, {});
+  const restored = await waitFor(async () => {
+    const s = await svc(db.id);
+    if (s.restoring || s.status !== 'running') return false;
+    const r = await api('POST', `/services/${db.id}/exec`, { command: `psql -U postgres -d app -tAc "select string_agg(x::text, ',' order by x) from t"` });
+    return r.exitCode === 0 && r.output.trim();
+  }, 240_000);
+  check('a restore streams the backup back to the server', restored === '7', `got ${restored}`);
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ A lost server changes nothing');
@@ -158,6 +167,31 @@ try {
   }, 240_000);
   check('it runs here and the old replicas are gone from the server', !!done);
   check('no failed requests during the move', down === 0, `${down} failed`);
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ Built images follow the service');
+  await api('POST', `/services/${built.id}/move`, { server: 'local' });
+  const builtHere = await waitFor(async () => (await svc(built.id)).status === 'running' && (await svc(built.id)).server?.id === 'local' && !/built/.test(onNode('docker ps --format {{.Names}}')), 240_000);
+  const deps = await api('GET', `/services/${built.id}/deployments`);
+  const lastLog = ((await api('GET', `/deployments/${deps[0]?.id}/logs`)) || []).map?.((l) => l.text).join('\n') ?? '';
+  check('moving a built service copies its exact image (no rebuild)', !!builtHere && /Copying/.test(lastLog) && !/Commit|Building|docker build/i.test(lastLog), lastLog.split('\n').slice(0, 4).join(' | '));
+  check('it answers from this machine', curl(`built.${P.slug}.localhost`).trim() === 'built');
+  await api('POST', `/services/${built.id}/stop`);
+  await waitFor(async () => (await svc(built.id)).status === 'stopped', 60_000);
+  await api('POST', `/services/${built.id}/move`, { server: serverId });
+  onNode(`sh -c "docker images --format '{{.Repository}}:{{.Tag}}' | grep servify/ | xargs -r docker rmi -f"`);
+  await api('POST', `/services/${built.id}/start`);
+  const startedThere = await waitFor(async () => (await svc(built.id)).status === 'running' && /built/.test(onNode('docker ps --format {{.Names}}')) && curl(`built.${P.slug}.localhost`).trim() === 'built', 240_000);
+  check('a service moved while stopped starts on its new server (image copied back)', !!startedThere);
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ Environments keep their servers');
+  const env = await api('POST', `/projects/${P.id}/environments`, { name: 'staging', deploy: false });
+  const envId = env.project?.id ?? env.id;
+  if (envId) projects.unshift(envId);
+  const envSnap = envId ? await api('GET', `/projects/${envId}`) : { services: [] };
+  const copy = envSnap.services?.find((s) => s.name === 'web');
+  check('a copied service lands on the same server as the original', copy?.server?.id === serverId, JSON.stringify(copy?.server ?? env.__error ?? env).slice(0, 160));
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ PostgreSQL cluster on the server');
