@@ -194,16 +194,18 @@ The agent (`server/bin/agent.mjs`, no dependencies) connects **out** to this Ser
 
 The agent endpoint listens on `0.0.0.0:7701` only once you add a server (`SERVIFY_AGENT_HOST`, `SERVIFY_AGENT_PORT`). The join command uses your first LAN address; set `SERVIFY_AGENT_PUBLIC_HOST` if servers reach this machine under another name (a VPN or public address). Treat an agent token like a password: whoever holds it can pose as that server.
 
-## Start on boot
+## Start at login
+
+**Settings → General → Start Servify at login.** Servify then starts in the background when you log in (a launchd agent on macOS, a systemd user service on Linux) and restarts if it crashes. Turning it on while Servify is running takes effect at your next login; turning it off never stops the running Servify. Logs go to `~/.servify/logs/servify.log`. The same from a terminal:
 
 ```bash
-pnpm service install     # launchd agent on macOS, systemd user unit on Linux
+pnpm service install     # starts it now if Servify isn't running, otherwise from the next login
 pnpm service status
-pnpm service uninstall
+pnpm service uninstall   # also stops it
 pnpm service print       # show the file without installing anything
 ```
 
-The service runs `servify start` with the `SERVIFY_*` and `DOCKER_HOST` variables of the shell you install it from, restarts it if it crashes, and logs to `~/.servify/logs/servify.log`. On Linux, `sudo loginctl enable-linger $USER` makes it start at boot without logging in.
+The login service runs with the `SERVIFY_*` and `DOCKER_HOST` settings Servify had when you turned it on. Each data directory gets its own agent, and only one Servify runs per data directory: a second copy exits right away. On Linux, `sudo loginctl enable-linger $USER` makes it start at boot without logging in.
 
 ## Backups
 

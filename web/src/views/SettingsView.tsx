@@ -160,6 +160,7 @@ function General({ settings, reload }: { settings: Settings; reload: () => void 
           </Button>
         </div>
       </Card>
+      <StartAtLogin />
       {system && (
         <Card title="This instance" desc="Configured with environment variables at startup (see the README).">
           <dl className="kv-grid">
@@ -187,6 +188,63 @@ function General({ settings, reload }: { settings: Settings; reload: () => void 
         </Card>
       )}
     </>
+  );
+}
+
+type Autostart = { supported: boolean; kind: 'launchd' | 'systemd' | null; enabled: boolean; supervised: boolean; file: string | null; logFile: string; stale: boolean };
+
+/** "Start Servify at login": a launchd agent / systemd user unit. Changes take effect at the next login. */
+function StartAtLogin() {
+  const [st, setSt] = useState<Autostart | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api
+      .get<Autostart>('/settings/autostart')
+      .then(setSt)
+      .catch(() => {});
+  }, []);
+  if (!st) return null;
+  const set = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      setSt(await api.put<Autostart>('/settings/autostart', { enabled }));
+      toast({ title: enabled ? 'Servify will start at login' : 'Servify won’t start at login', tone: enabled ? 'ok' : 'idle' });
+    } catch (e) {
+      toastError(e, 'Could not change it');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const desc = !st.supported
+    ? 'Available on macOS and Linux. On Windows, run Servify with Docker Compose and restart: unless-stopped.'
+    : st.enabled
+      ? st.supervised
+        ? 'On. Servify runs in the background, starts when you log in and restarts on its own if it crashes.'
+        : 'On. From your next login Servify starts on its own, in the background. Right now it runs because you started it.'
+      : st.supervised
+        ? 'Off. Servify keeps running until you log out, then stays off.'
+        : 'Off. Servify only runs while you keep it started. Your services keep running in Docker either way, but their addresses and the dashboard need Servify.';
+  return (
+    <Card
+      title="Start Servify at login"
+      desc={desc}
+      icon={<Icon name="power" size={16} />}
+      right={st.supported ? <Switch checked={st.enabled} disabled={busy} onChange={(v) => void set(v)} label="Start Servify at login" /> : undefined}
+    >
+      {st.enabled && (
+        <div className="faint" style={{ fontSize: 12, lineHeight: 1.6 }}>
+          {st.kind === 'launchd' ? 'launchd agent' : 'systemd user service'} <code className="inline-code">{st.file}</code> · logs in <code className="inline-code">{st.logFile}</code>
+          {st.stale && (
+            <div className="row" style={{ gap: 8, marginTop: 8 }}>
+              <span>It was saved with different settings than Servify runs with now.</span>
+              <Button size="sm" disabled={busy} onClick={() => void set(true)}>
+                Update
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
 

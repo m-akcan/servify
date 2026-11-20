@@ -21,6 +21,7 @@ import { startCertificates } from './certs.ts';
 import { startBackups } from './backups.ts';
 import { startLogCollector, flushLogs } from './logstore.ts';
 import { startEnvironments } from './envs.ts';
+import { acquireLock } from './lock.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -38,6 +39,11 @@ const MIME: Record<string, string> = {
 
 async function main() {
   const t0 = Date.now();
+  const other = acquireLock();
+  if (other) {
+    console.log(`  Servify is already running for ${config.dataDir} (pid ${other}) — not starting a second copy.`);
+    process.exit(0);
+  }
   let dockerInfo;
   try {
     dockerInfo = await docker.init();

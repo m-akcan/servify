@@ -3,7 +3,7 @@ import { streamSSE } from 'hono/streaming';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { ZodError } from 'zod';
 import * as ops from './ops.ts';
-import { bus } from './events.ts';
+import { bus, recordActivity } from './events.ts';
 import {
   SESSION_COOKIE,
   isSetUp,
@@ -21,6 +21,7 @@ import { tokensTable, deployments as deploymentsTable } from './db.ts';
 import { HttpError } from './util.ts';
 import { config } from './config.ts';
 import { docker, dockerTarget } from './docker.ts';
+import { autostartStatus, enableAutostart, disableAutostart } from './autostart.ts';
 import { dockerForContainer, listServers, addServer, renameServer, rotateServerToken, removeServer } from './nodes.ts';
 import { readDeploymentLog } from './deployer.ts';
 import type { ServerEvent } from './types.ts';
@@ -445,6 +446,20 @@ function ownerOnly(c: Context<Env>) {
 }
 
 api.get('/settings', (c) => c.json(settings.publicSettings(isOwner(c))));
+// ─── start at login ───
+api.get('/settings/autostart', (c) => c.json(autostartStatus()));
+api.put('/settings/autostart', async (c) => {
+  ownerOnly(c);
+  const { enabled } = await jsonBody<{ enabled: boolean }>(c);
+  try {
+    // Takes effect at the next login: this Servify keeps running either way and never stops itself.
+    const st = enabled ? enableAutostart() : disableAutostart();
+    recordActivity(actor(c), 'settings.autostart', enabled ? 'Servify starts at login' : 'Servify no longer starts at login');
+    return c.json(st);
+  } catch (e) {
+    throw new HttpError(400, (e as Error).message);
+  }
+});
 api.patch('/settings/general', async (c) => {
   ownerOnly(c);
   settings.updateGeneral(actor(c), await jsonBody(c));
