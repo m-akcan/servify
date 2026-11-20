@@ -29,6 +29,17 @@ import { replicasOf } from './engine.ts';
 
 type Env = { Variables: { principal: Principal } };
 
+/** Parse a JSON body; an empty or invalid body becomes a clean 400 (or {} when optional). */
+async function jsonBody<T = any>(c: Context): Promise<T> {
+  const text = await c.req.text();
+  if (!text.trim()) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new HttpError(400, 'request body must be JSON');
+  }
+}
+
 /**
  * Register the abort listener before any await: Hono never calls onAbort listeners added
  * after the client has already gone, which would leak subscriptions and Docker streams.
@@ -72,7 +83,7 @@ api.get('/auth/status', (c) => {
 
 api.post('/auth/setup', async (c) => {
   if (isSetUp()) throw new HttpError(409, 'already set up');
-  const { password } = await c.req.json<{ password: string }>();
+  const { password } = await jsonBody<{ password: string }>(c);
   setPassword(password);
   const s = createSession();
   setCookie(c, SESSION_COOKIE, s.id, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: s.maxAge });
@@ -85,7 +96,7 @@ api.post('/auth/login', async (c) => {
   while (loginAttempts.length && nowTs - loginAttempts[0] > 60_000) loginAttempts.shift();
   if (loginAttempts.length > 10) throw new HttpError(429, 'too many attempts, wait a minute');
   loginAttempts.push(nowTs);
-  const { password } = await c.req.json<{ password: string }>();
+  const { password } = await jsonBody<{ password: string }>(c);
   if (!checkPassword(password ?? '')) throw new HttpError(401, 'wrong password');
   const s = createSession();
   setCookie(c, SESSION_COOKIE, s.id, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: s.maxAge });
@@ -150,9 +161,9 @@ api.get('/system', async (c) => {
 // ───────────────────────────── projects ─────────────────────────────
 
 api.get('/projects', (c) => c.json(ops.listProjects()));
-api.post('/projects', async (c) => c.json(ops.createProject(actor(c), await c.req.json()), 201));
+api.post('/projects', async (c) => c.json(ops.createProject(actor(c), await jsonBody(c)), 201));
 api.get('/projects/:id', (c) => c.json(ops.projectSnapshot(c.req.param('id'), view(c))));
-api.patch('/projects/:id', async (c) => c.json(ops.updateProject(actor(c), c.req.param('id'), await c.req.json())));
+api.patch('/projects/:id', async (c) => c.json(ops.updateProject(actor(c), c.req.param('id'), await jsonBody(c))));
 api.delete('/projects/:id', async (c) => {
   await ops.deleteProject(actor(c), c.req.param('id'));
   return c.json({ ok: true });
@@ -162,7 +173,7 @@ api.get('/projects/:id/export', (c) => {
   return c.json(spec, 200, { 'content-disposition': `attachment; filename="${spec.name.replace(/[^a-z0-9-_]/gi, '_')}.servify.json"` });
 });
 api.post('/projects/import', async (c) => {
-  const body = await c.req.json<{ spec: ops.ProjectSpec; deploy?: boolean; name?: string }>();
+  const body = await jsonBody<{ spec: ops.ProjectSpec; deploy?: boolean; name?: string }>(c);
   return c.json(await ops.importProject(actor(c), body.spec, { deploy: body.deploy, name: body.name }), 201);
 });
 api.post('/projects/:id/demo', async (c) => c.json(await ops.seedDemo(actor(c), c.req.param('id'))));
@@ -173,9 +184,9 @@ api.get('/projects/:id/activity', (c) => {
 
 // ───────────────────────────── services ─────────────────────────────
 
-api.post('/projects/:id/services', async (c) => c.json(await ops.createService(actor(c), c.req.param('id'), await c.req.json()), 201));
+api.post('/projects/:id/services', async (c) => c.json(await ops.createService(actor(c), c.req.param('id'), await jsonBody(c)), 201));
 api.get('/services/:id', (c) => c.json(ops.serializeService(ops.getServiceOrThrow(c.req.param('id')), view(c))));
-api.patch('/services/:id', async (c) => c.json(await ops.updateService(actor(c), c.req.param('id'), await c.req.json())));
+api.patch('/services/:id', async (c) => c.json(await ops.updateService(actor(c), c.req.param('id'), await jsonBody(c))));
 api.delete('/services/:id', async (c) => {
   await ops.deleteService(actor(c), c.req.param('id'), { keepVolumes: c.req.query('keepVolumes') === '1' });
   return c.json({ ok: true });
@@ -186,15 +197,15 @@ api.post('/services/:id/restart', (c) => c.json(ops.restartService(actor(c), c.r
 api.post('/services/:id/stop', async (c) => c.json(await ops.stopService(actor(c), c.req.param('id'))));
 api.post('/services/:id/start', (c) => c.json(ops.startService(actor(c), c.req.param('id'))));
 api.post('/services/:id/scale', async (c) => {
-  const { replicas } = await c.req.json<{ replicas: number }>();
+  const { replicas } = await jsonBody<{ replicas: number }>(c);
   return c.json(await ops.scaleService(actor(c), c.req.param('id'), Number(replicas)));
 });
 api.post('/services/:id/rollback', async (c) => {
-  const { deploymentId } = await c.req.json<{ deploymentId: string }>();
+  const { deploymentId } = await jsonBody<{ deploymentId: string }>(c);
   return c.json(ops.rollbackService(actor(c), c.req.param('id'), deploymentId));
 });
 api.put('/services/:id/variables', async (c) => {
-  const body = await c.req.json<{ variables: Record<string, string>; replace?: boolean; secretKeys?: string[] }>();
+  const body = await jsonBody<{ variables: Record<string, string>; replace?: boolean; secretKeys?: string[] }>(c);
   return c.json(ops.setVariables(actor(c), c.req.param('id'), body.variables ?? {}, { replace: body.replace, secretKeys: body.secretKeys }));
 });
 api.delete('/services/:id/variables/:key', (c) => c.json(ops.deleteVariable(actor(c), c.req.param('id'), c.req.param('key'))));
@@ -232,12 +243,12 @@ api.post('/services/:id/run', async (c) => {
 });
 api.get('/services/:id/runs', (c) => c.json(ops.serviceRuns(c.req.param('id'), Number(c.req.query('limit') ?? 30))));
 api.post('/services/:id/exec', async (c) => {
-  const { command, replica } = await c.req.json<{ command: string; replica?: number }>();
+  const { command, replica } = await jsonBody<{ command: string; replica?: number }>(c);
   return c.json(await ops.execInService(actor(c), c.req.param('id'), command, replica));
 });
 
 api.post('/services/:id/loadtest', async (c) => {
-  const { rps, seconds } = await c.req.json<{ rps?: number; seconds?: number }>();
+  const { rps, seconds } = await jsonBody<{ rps?: number; seconds?: number }>(c);
   return c.json(ops.loadTest(actor(c), c.req.param('id'), rps ?? 30, seconds ?? 30));
 });
 api.delete('/services/:id/loadtest', (c) => c.json(ops.stopLoadTest(ops.getServiceOrThrow(c.req.param('id')).id)));
@@ -335,7 +346,7 @@ api.get('/tokens', (c) => {
 });
 api.post('/tokens', async (c) => {
   if (c.get('principal').actor.type !== 'user') throw new HttpError(403, 'only the owner can manage tokens');
-  const { name, scope } = await c.req.json<{ name: string; scope?: 'read' | 'write' }>();
+  const { name, scope } = await jsonBody<{ name: string; scope?: 'read' | 'write' }>(c);
   const { token, record } = createToken(name ?? 'agent', scope === 'read' ? 'read' : 'write');
   return c.json({ token, record }, 201);
 });
