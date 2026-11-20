@@ -38,7 +38,7 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Runs in the background.** `servify service install` starts it at login (launchd) or with your session/boot (systemd).
 - **Volumes you can move.** Volumes are first-class: create them, attach them to a service, detach them (the data stays, as a card on the canvas), drag them onto another service, rename and delete them. Sizes are shown live.
 - **Secrets encrypted at rest** (AES-256-GCM) with a master key you control.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 44 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 46 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -171,9 +171,28 @@ Create a service from the **PostgreSQL cluster** template: three replicas, each 
 - **Switchover** ("Make primary" on a standby, or the `switchover` tool) hands over gracefully before maintenance. **Rebuild** re-clones a standby that fell behind.
 - Deploys roll standbys first and the primary last; backups dump from the primary; restores re-initialise the whole cluster.
 
-All replicas run on this machine, so this protects against a crashed or hung database, not against losing the machine.
+All members run on one server, so this protects against a crashed or hung database, not against losing that machine.
 
 Volumes in general can be **per replica** ("One volume per replica" when creating one): each replica mounts its own volume, created on demand, and scaling down keeps the volumes for when you scale back up.
+
+## Servers
+
+Run services on other machines. **Servers → Add server** gives you one command to run on the new machine; it needs only Docker:
+
+```bash
+docker run -d --name servify-agent --restart unless-stopped --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock node:22-alpine sh -c '…'
+```
+
+The agent (`server/bin/agent.mjs`, no dependencies) connects **out** to this Servify, so the server needs no open ports. Before it sends its token it checks this Servify's certificate fingerprint (part of the command); the script itself is fetched from this Servify and checked against a hash in the command, then kept, so restarts reuse the verified copy (re-run the command to upgrade). From a Servify checkout you can also run `servify agent --join https://<host>:7701 --token … --fingerprint …`.
+
+- **Placement:** pick the server when you create a service (or `server` in `create_service`). **Move** in a service's settings (or `move_service`) redeploys it on the other server — building or pulling the image there — switches traffic once it is healthy, then removes the old replicas.
+- **Everything runs where the service runs:** builds, image pulls, cron jobs, backups and `exec`; logs, metrics and backup files travel back. The router here reaches remote replicas through the agent's connection.
+- **Volumes stay on their server.** A service with volumes can't move (back it up and restore it into a service on the other server), and a volume can't be attached to a service on another server. PostgreSQL clusters run all members on one server.
+- **Private names resolve per server.** `db`, `${{ db.HOST }}` and friends work between services on the same server. Servify warns (in settings and the deploy log) when a service references one on another server; use the public URL or TCP address, or keep them together.
+- **Offline is not down.** If a server stops answering, its services keep running there; Servify shows them as unreachable, does nothing to them (no restarts, no failovers, no deletes) and re-adopts them when the agent reconnects. You get a notification after a minute.
+
+The agent endpoint listens on `0.0.0.0:7701` only once you add a server (`SERVIFY_AGENT_HOST`, `SERVIFY_AGENT_PORT`). The join command uses your first LAN address; set `SERVIFY_AGENT_PUBLIC_HOST` if servers reach this machine under another name (a VPN or public address). Treat an agent token like a password: whoever holds it can pose as that server.
 
 ## Start on boot
 
@@ -210,6 +229,8 @@ The **production ▾** menu next to the project name creates environments: a ful
 | `SERVIFY_BASE_DOMAIN` | `localhost` | Generated URLs: `<service>.<project>.<base>` |
 | `SERVIFY_TCP_PORT_START` | `15400` | First port for auto-assigned TCP proxies |
 | `SERVIFY_ALLOWED_HOSTS` | | Extra hostnames allowed to reach the dashboard |
+| `SERVIFY_AGENT_HOST` / `SERVIFY_AGENT_PORT` | `0.0.0.0` / `7701` | Where servers' agents connect (TLS). Only started once a server is added |
+| `SERVIFY_AGENT_PUBLIC_HOST` | first LAN IPv4 | Address shown in the join command |
 | `SERVIFY_AUTH` | `password` | `none` disables the dashboard password (single-user machines only) |
 | `SERVIFY_LOG_RETENTION_DAYS` / `SERVIFY_LOG_MAX_LINES` | `7` / `200000` | Runtime log history per service |
 | `SERVIFY_METRICS_RETENTION_DAYS` | `7` | Metrics history |
@@ -244,6 +265,8 @@ node scripts/acceptance.mjs           # end-to-end test against a running instan
 node scripts/acceptance-features.mjs  # HTTPS, webhooks, notifications, backups, history, compose, environments
 node web/scripts/gen-brand-icons.mjs  # refresh the service logos (simple-icons, CC0)
 ```
+
+`scripts/acceptance-servers.mjs` starts a second Docker daemon (docker-in-docker), joins it with the real agent command and checks deploys, routing, builds, exec, backups, an agent outage, moves and a PostgreSQL cluster on it (see its header for the instance settings it needs).
 
 The acceptance script deploys, load-balances, scales, redeploys under load (asserting zero failed requests), kills replicas, checks the TCP proxy and variable references, then cleans up. Set `SERVIFY_TOKEN` when auth is on. The feature suite needs owner access (`SERVIFY_COOKIE` or `SERVIFY_AUTH=none`); `SERVIFY_DATA_DIR` adds the "no plaintext secrets on disk" check. Both default to `http://localhost:7700` — point `SERVIFY_URL` at a test instance.
 

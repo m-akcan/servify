@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import type { ServiceView, Protocol } from '../lib/types.ts';
+import type { ServiceView, Protocol, PublicServer } from '../lib/types.ts';
 import { api } from '../lib/api.ts';
-import { Button, Segmented, Switch, Field, Stepper, toastError, toast, Tooltip, CopyButton } from '../components/ui.tsx';
+import { Button, Segmented, Switch, Field, Stepper, toastError, toast, Tooltip, CopyButton, confirmDialog } from '../components/ui.tsx';
 import { navigate } from '../lib/router.ts';
 import { openVolumeDialog, detachVolume, bytes } from '../lib/volumes.tsx';
 import { Icon } from '../components/Icon.tsx';
@@ -92,6 +92,88 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
   );
 }
 const id = (s: ServiceView) => s.id;
+
+/** Which machine runs the service; moving redeploys it there. */
+function ServiceServer({ service: s }: { service: ServiceView }) {
+  const [servers, setServers] = useState<PublicServer[]>([]);
+  const [target, setTarget] = useState(s.server?.id ?? 'local');
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api
+      .get<PublicServer[]>('/servers')
+      .then(setServers)
+      .catch(() => {});
+  }, []);
+  useEffect(() => setTarget(s.server?.id ?? 'local'), [s.server?.id]);
+  const current = s.server?.id ?? 'local';
+  const move = async () => {
+    const to = servers.find((x) => x.id === target);
+    if (!to) return;
+    const yes = await confirmDialog({
+      title: `Move ${s.name} to ${to.name}?`,
+      body: `Servify deploys ${s.name} on ${to.name} (building or pulling the image there), switches traffic once it is healthy, then removes the old replicas.`,
+      confirm: 'Move',
+    });
+    if (!yes) return;
+    setBusy(true);
+    try {
+      await api.post(`/services/${s.id}/move`, { server: target });
+      toast({ title: `Moving ${s.name} to ${to.name}`, tone: 'build' });
+    } catch (e) {
+      toastError(e, 'Could not move the service');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <div className="setting-row">
+        <div className="grow">
+          <div className="title">
+            Runs on <b>{s.server?.name ?? 'This machine'}</b>
+            {s.server && !s.server.online && <span className="badge" data-tone="err" style={{ marginLeft: 8 }}>offline</span>}
+          </div>
+          <div className="desc">
+            {s.volumes.length
+              ? 'Its volumes live on this server, so it stays here. To move it: back it up, then restore into a service on the other server.'
+              : servers.length > 1
+                ? 'Moving redeploys it on the other server with no downtime, then retires the old replicas.'
+                : 'Add a server to run services on other machines.'}
+          </div>
+        </div>
+        {servers.length > 1 && !s.volumes.length ? (
+          <div className="row" style={{ gap: 6 }}>
+            <select className="select" value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Server">
+              {servers.map((x) => (
+                <option key={x.id} value={x.id} disabled={x.status !== 'online'}>
+                  {x.name}
+                  {x.status !== 'online' ? ' (offline)' : ''}
+                </option>
+              ))}
+            </select>
+            <Button icon="arrowRight" loading={busy} disabled={target === current} onClick={() => void move()}>
+              Move
+            </Button>
+          </div>
+        ) : (
+          servers.length <= 1 && (
+            <Button variant="ghost" icon="server" onClick={() => navigate('/servers')}>
+              Servers
+            </Button>
+          )
+        )}
+      </div>
+      {!!s.crossServerRefs?.length && (
+        <div className="callout" data-tone="warn">
+          <Icon name="alert" size={14} />
+          <span>
+            {s.name} uses variables from {s.crossServerRefs.join(', ')}, which run{s.crossServerRefs.length === 1 ? 's' : ''} on another server. Private names only resolve on the same server — move them together, or point it at their public URL or TCP address.
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
 
 function ServiceVolumes({ service: s }: { service: ServiceView }) {
   const vols = useStore((st) => st.current?.volumes);
@@ -412,6 +494,10 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             <CommitInput mono value={s.resources.memoryMb ? String(s.resources.memoryMb) : ''} placeholder="unlimited" onCommit={(v) => void patch(id, { resources: { memoryMb: v ? Number(v) : null } })} />
           </Field>
         </div>
+      </Section>
+
+      <Section title="Server" icon="server" desc="The machine this service runs on.">
+        <ServiceServer service={s} />
       </Section>
 
       <Section title="Volumes" icon="database" desc="Persistent storage that survives deploys and can move between services. A service with a volume runs as one replica.">

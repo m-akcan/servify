@@ -8,7 +8,7 @@
 import { EventEmitter } from 'node:events';
 import { db } from './db.ts';
 import { demuxLines } from './docker.ts';
-import { dockerForContainer } from './nodes.ts';
+import { dockerForContainer, isOnline } from './nodes.ts';
 import { allRuntime } from './engine.ts';
 import { bus } from './events.ts';
 import type { Replica } from './types.ts';
@@ -91,7 +91,7 @@ function attach(r: Replica) {
 function sync() {
   const reps = allRuntime().filter((r) => r.dockerState === 'running');
   const live = new Set(reps.map((r) => r.containerId));
-  for (const r of reps) attach(r);
+  for (const r of reps) if (isOnline(r.nodeId)) attach(r); // offline servers: resume (with `since`) once back
   for (const [cid, stop] of following) if (!live.has(cid)) {
     // Let the stream drain its last lines (crash output!) before letting go.
     setTimeout(stop, 3000);

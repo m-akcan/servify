@@ -293,6 +293,12 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
           <div className="grow">
             <div className="node-name truncate">{s.name}</div>
             <div className="node-source truncate">{sourceLine(s)}</div>
+            {s.server && s.server.id !== 'local' && (
+              <div className={`node-server ${s.server.online ? '' : 'offline'}`} title={s.server.online ? `Runs on ${s.server.name}` : `${s.server.name} is offline — last known state shown`}>
+                <Icon name="server" size={10} />
+                {s.server.online ? s.server.name : `${s.server.name} offline`}
+              </div>
+            )}
             {s.clusterStatus && (
               <div className={`node-cluster ${s.clusterStatus.operation ? 'busy' : s.clusterStatus.members.some((m) => m.role === 'down' || m.role === 'fenced') ? 'warn' : ''}`}>
                 {s.clusterStatus.operation ? `${s.clusterStatus.operation}…` : `primary #${s.clusterStatus.primary} · ${s.clusterStatus.members.filter((m) => m.role === 'standby').length} standby`}

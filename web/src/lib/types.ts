@@ -17,9 +17,11 @@ export type {
   ApiToken,
   LbStrategy,
   Protocol,
+  PublicServer,
+  ServerInfo,
 } from '../../../server/src/types.ts';
 
-import type { Service, Project, Deployment, Replica, VolumeRecord } from '../../../server/src/types.ts';
+import type { Service, Project, Deployment, Replica, VolumeRecord, PublicServer } from '../../../server/src/types.ts';
 
 export type DomainInfo = { domain: string; url: string; tls: 'issued' | 'pending' | 'failed' | 'off' | 'local'; expiresAt: number | null; error: string | null };
 
@@ -34,7 +36,14 @@ export type ServiceView = Service & {
   backupMethod: 'pg_dumpall' | 'mysqldump' | 'mongodump' | 'volume' | null;
   restoring: boolean;
   clusterStatus: ClusterStatus | null;
+  /** Where it runs. */
+  server?: { id: string; name: string; online: boolean };
+  /** Services it references by variable that run on another server (private names won't resolve). */
+  crossServerRefs?: string[];
 };
+
+export type JoinCommand = { url: string; fingerprint: string; docker: string; node: string };
+export type ServerCreated = { server: PublicServer; token: string; join: JoinCommand };
 
 export type ClusterMember = { index: number; role: 'primary' | 'standby' | 'starting' | 'down' | 'fenced' | 'rebuilding'; lsn: string | null; lagBytes: number | null; streaming: number | null; syncState: string | null; containerId: string | null };
 export type ClusterStatus = { kind: 'postgres'; primary: number; failoverAfterSec: number; synchronous: boolean; members: ClusterMember[]; primaryDownSince: number | null; lastFailoverAt: number | null; degradedAsync: boolean; operation: string | null };

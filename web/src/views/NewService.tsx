@@ -5,7 +5,7 @@ import { useStore, loadTemplates } from '../lib/store.ts';
 import { api } from '../lib/api.ts';
 import { useAutoHeight } from '../motion/hooks.ts';
 import type { Pt } from '../canvas/geometry.ts';
-import type { Template } from '../lib/types.ts';
+import type { Template, PublicServer } from '../lib/types.ts';
 import { registry } from '../canvas/geometry.ts';
 
 /** Spiral out from the viewport centre to the first grid slot that doesn't overlap a node. */
@@ -59,12 +59,18 @@ export function NewServiceModal({
   const [busy, setBusy] = useState(false);
   const [form, setForm] = useState({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false });
   const templates = useStore((s) => s.templates);
+  const [servers, setServers] = useState<PublicServer[]>([]);
+  const [server, setServer] = useState('local');
   const heightRef = useRef<HTMLDivElement>(null);
   useAutoHeight(heightRef, [kind, form.advanced, templates.length]);
 
   useEffect(() => {
     if (open) {
       void loadTemplates();
+      api
+        .get<PublicServer[]>('/servers')
+        .then(setServers)
+        .catch(() => setServers([]));
       setKind(null);
       setForm({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false });
     }
@@ -76,7 +82,7 @@ export function NewServiceModal({
     setBusy(true);
     try {
       const pos = at ?? freeSlotNear(getCenter());
-      const r = await api.post<{ service: { id: string; name: string } }>(`/projects/${projectId}/services`, { ...body, x: Math.round(pos.x / 20) * 20, y: Math.round(pos.y / 20) * 20 });
+      const r = await api.post<{ service: { id: string; name: string } }>(`/projects/${projectId}/services`, { ...body, ...(server !== 'local' ? { server } : {}), x: Math.round(pos.x / 20) * 20, y: Math.round(pos.y / 20) * 20 });
       toast({ title: `${r.service.name} created`, body: 'First deploy started', tone: 'build' });
       onCreated(r.service.id);
     } catch (e) {
@@ -116,6 +122,20 @@ export function NewServiceModal({
           <Icon name="x" size={16} />
         </button>
       </div>
+      {servers.length > 1 && (
+        <div className="ns-server row">
+          <Icon name="server" size={14} />
+          <span className="faint">Run on</span>
+          <select className="select" value={server} onChange={(e) => setServer(e.target.value)} aria-label="Server">
+            {servers.map((x) => (
+              <option key={x.id} value={x.id} disabled={x.status !== 'online'}>
+                {x.name}
+                {x.status !== 'online' ? ' (offline)' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       <div className="ns-body-wrap" ref={heightRef}>
         <div className="ns-body" key={kind ?? 'pick'}>
           {!kind && (

@@ -717,3 +717,107 @@
   background: var(--build-soft);
   color: var(--build);
 }
+
+/* ───────── servers ───────── */
+.servers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 22px;
+}
+.server-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+}
+.server-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+.server-card.online .server-icon {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+.server-card.offline .server-icon {
+  color: var(--err);
+  background: var(--err-soft);
+}
+.server-meta {
+  font-size: 11px;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.server-counts {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.server-counts b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.server-notes {
+  margin-top: 18px;
+  padding: 16px 18px;
+}
+.server-notes ul {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.node-server {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-2);
+  color: var(--text-3);
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-server.offline {
+  color: var(--err);
+  border-color: var(--err-soft);
+}
+@media (max-width: 640px) {
+  .server-card {
+    flex-wrap: wrap;
+  }
+  .server-counts {
+    width: 100%;
+    padding-left: 52px;
+  }
+}
+.ns-server {
+  gap: 8px;
+  padding: 0 20px 12px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.ns-server .select {
+  width: auto;
+  min-width: 160px;
+}
+.join-snippet pre {
+  white-space: pre-wrap;
+  word-break: break-all;
+}

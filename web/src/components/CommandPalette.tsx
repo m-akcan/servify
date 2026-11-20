@@ -73,6 +73,7 @@ export function CommandPalette() {
     return [
       { id: 'home', title: 'All projects', icon: 'grid', group: 'Navigate', run: () => navigate('/') },
       { id: 'agents', title: 'Agents, API tokens & MCP', icon: 'bot', group: 'Navigate', run: () => navigate('/agents') },
+      { id: 'servers', title: 'Servers', icon: 'server', group: 'Navigate', run: () => navigate('/servers') },
       ...projects.map((p) => ({ id: `p-${p.id}`, title: p.name, subtitle: `${p.serviceCount} services`, icon: 'layers' as IconName, group: 'Projects', run: () => navigate(projectPath(p.slug)) })),
       ...projects
         .filter((p) => p.id !== store.get().current?.project.id)

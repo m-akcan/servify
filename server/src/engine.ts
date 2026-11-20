@@ -794,6 +794,8 @@ export async function startEngine() {
   startProber();
   void watchEvents(LOCAL);
   onNodeChange((node, online) => {
+    // The dashboard shows each service's server state: re-send the services that live there.
+    for (const svc of servicesTable.all()) if (nodeOf(svc) === node) bus.publish({ type: 'service.updated', service: svc });
     if (!online) return;
     // Back online: refresh what we knew (new forwarders), follow its events, and converge.
     void (async () => {
