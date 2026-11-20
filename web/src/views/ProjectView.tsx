@@ -210,7 +210,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
     const startX = e.clientX;
     const startW = panelW;
     const el = e.currentTarget as HTMLElement;
-    el.setPointerCapture(e.pointerId);
+     try { el.setPointerCapture(e.pointerId); } catch {}
     document.body.classList.add('resizing');
     let w = startW;
     const move = (ev: PointerEvent) => {

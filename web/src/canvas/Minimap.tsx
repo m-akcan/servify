@@ -122,7 +122,7 @@ export function Minimap({
         style={{ width: W, height: H }}
         onPointerDown={(e) => {
           e.stopPropagation();
-          (e.target as HTMLElement).setPointerCapture(e.pointerId);
+           try { (e.target as HTMLElement).setPointerCapture(e.pointerId); } catch {}
           jumpTo(e.clientX, e.clientY);
         }}
         onPointerMove={(e) => {

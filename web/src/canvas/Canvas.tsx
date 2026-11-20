@@ -239,7 +239,31 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
     if (onNode && !spaceDown.current && e.button !== 1) return;
     if (e.button !== 0 && e.button !== 1) return;
     const el = rootRef.current!;
-    el.setPointerCapture(e.pointerId);
+     try { el.setPointerCapture(e.pointerId); } catch {}
+    if (e.shiftKey && e.button === 0 && !spaceDown.current) {
+      const r = el.getBoundingClientRect();
+      const x0 = e.clientX - r.left;
+      const y0 = e.clientY - r.top;
+      setMarquee({ x0, y0, x1: x0, y1: y0 });
+      const mmove = (ev: PointerEvent) => setMarquee({ x0, y0, x1: ev.clientX - r.left, y1: ev.clientY - r.top });
+      const mup = (ev: PointerEvent) => {
+        el.removeEventListener('pointermove', mmove);
+        el.removeEventListener('pointerup', mup);
+        setMarquee(null);
+        const c = cam.current!.values;
+        const a = screenToWorld({ x: Math.min(x0, ev.clientX - r.left), y: Math.min(y0, ev.clientY - r.top) }, c);
+        const b = screenToWorld({ x: Math.max(x0, ev.clientX - r.left), y: Math.max(y0, ev.clientY - r.top) }, c);
+        const hits = new Set<string>(multiRef.current);
+        for (const [id, rect] of registry.rects) {
+          if (id === INGRESS_ID) continue;
+          if (rect.x < b.x && rect.x + rect.w > a.x && rect.y < b.y && rect.y + rect.h > a.y) hits.add(id);
+        }
+        setMulti(hits);
+      };
+      el.addEventListener('pointermove', mmove);
+      el.addEventListener('pointerup', mup);
+      return;
+    }
     const g = cam.current!;
     const start = { x: e.clientX, y: e.clientY };
     const origin = g.values;
@@ -265,13 +289,16 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
       el.removeEventListener('pointercancel', up);
       setPanning(false);
       if (!moved) {
+        setMulti(new Set());
         onSelect(null);
         return;
       }
       if (performance.now() - last.t < 60) {
-        // Momentum glide.
+        // Momentum glide, capped so a fast flick can't fling the canvas into the void.
+        const speed = Math.hypot(vel.x, vel.y);
+        const k = speed > 2.2 ? 2.2 / speed : 1;
         const v = g.values;
-        g.set({ x: v.x + vel.x * 180, y: v.y + vel.y * 180 }, springs.gentle);
+        g.set({ x: v.x + vel.x * k * 160, y: v.y + vel.y * k * 160 }, springs.gentle);
       }
     };
     el.addEventListener('pointermove', move);
@@ -332,6 +359,29 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
     onSelect(id);
   }, [onSelect]);
 
+  // Multi-selection (shift-click / shift-drag marquee).
+  const [multi, setMulti] = useState<Set<string>>(new Set());
+  const multiRef = useRef(multi);
+  multiRef.current = multi;
+  const getMulti = useCallback(() => multiRef.current, []);
+  const toggleMulti = useCallback((id: string) => {
+    setMulti((m) => {
+      const n = new Set(m);
+      if (selectedId && n.size === 0 && selectedId !== id) n.add(selectedId);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  }, [selectedId]);
+  const [marquee, setMarquee] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMulti(new Set());
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const services = useMemo(() => state.order.map((id) => state.services[id]).filter(Boolean), [state.order, state.services]);
 
   const edges: EdgeSpec[] = useMemo(() => {
@@ -381,9 +431,31 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
             onStartConnect={startConnect}
             onFocusNode={focusNode}
             connectTarget={draft?.over === s.id}
+            inMulti={multi.has(s.id)}
+            getMulti={getMulti}
+            onToggleMulti={toggleMulti}
           />
         ))}
       </div>
+      {marquee && (
+        <div
+          className="marquee"
+          style={{
+            left: Math.min(marquee.x0, marquee.x1),
+            top: Math.min(marquee.y0, marquee.y1),
+            width: Math.abs(marquee.x1 - marquee.x0),
+            height: Math.abs(marquee.y1 - marquee.y0),
+          }}
+        />
+      )}
+      {multi.size > 1 && (
+        <div className="multi-pill glass canvas-chrome">
+          <b>{multi.size}</b> selected · drag to move together
+          <button className="cc-btn" onClick={() => setMulti(new Set())} aria-label="Clear selection">
+            <Icon name="x" size={13} />
+          </button>
+        </div>
+      )}
       <Particles edges={edges} getCamera={getCamera} subscribeCamera={subscribeCamera} />
 
       <div className="canvas-chrome canvas-controls glass" style={{ left: 16 }}>

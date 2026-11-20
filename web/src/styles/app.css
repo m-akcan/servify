@@ -1889,3 +1889,22 @@ a.panel-link:hover {
   border-color: var(--signal);
   background: var(--signal-soft);
 }
+@media (max-width: 760px) {
+  .loadtest {
+    flex-wrap: wrap;
+  }
+  .loadtest .faint {
+    display: none;
+  }
+  .segmented {
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .scale-card .row {
+    flex-wrap: wrap;
+  }
+  .panel-head {
+    flex-wrap: wrap;
+  }
+}

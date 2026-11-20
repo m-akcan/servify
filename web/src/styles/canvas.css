@@ -631,3 +631,32 @@
   stroke: var(--signal);
   stroke-width: 2;
 }
+
+/* ───────────── multi-select ───────────── */
+.marquee {
+  position: absolute;
+  z-index: 15;
+  border: 1px solid var(--signal-line);
+  background: var(--signal-soft);
+  border-radius: 4px;
+  pointer-events: none;
+}
+.multi-pill {
+  bottom: 16px;
+  left: 50%;
+  translate: -50% 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 4px 0 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-2);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  animation: rise-in 300ms var(--ease-out);
+}
+.multi-pill b {
+  color: var(--signal);
+}

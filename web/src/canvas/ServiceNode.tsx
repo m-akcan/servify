@@ -1,7 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Deployment, Replica, ServiceView } from '../lib/types.ts';
 import { SpringGroup, springs, Spring } from '../motion/spring.ts';
-import { registry, snap, NODE_W, type Camera } from './geometry.ts';
+import { registry, snap, NODE_W, nodeControls, type Camera } from './geometry.ts';
 import { ServiceGlyph, Icon } from '../components/Icon.tsx';
 import { serviceTone, serviceLabel, num, isBusy } from '../lib/format.ts';
 import { useTraffic, traffic, useDeployTail } from '../lib/store.ts';
@@ -20,6 +20,9 @@ type Props = {
   onStartConnect: (id: string, e: React.PointerEvent) => void;
   onFocusNode: (id: string) => void;
   connectTarget: boolean;
+  inMulti: boolean;
+  getMulti: () => Set<string>;
+  onToggleMulti: (id: string) => void;
   index: number;
 };
 
@@ -98,7 +101,7 @@ function DeployTicker({ service, latest }: { service: ServiceView; latest: Deplo
   );
 }
 
-export const ServiceNode = memo(function ServiceNode({ service: s, replicas, latest, selected, getCamera, onSelect, onOpenMenu, onMoved, onDragState, onStartConnect, onFocusNode, connectTarget, index }: Props) {
+export const ServiceNode = memo(function ServiceNode({ service: s, replicas, latest, selected, getCamera, onSelect, onOpenMenu, onMoved, onDragState, onStartConnect, onFocusNode, connectTarget, inMulti, getMulti, onToggleMulti, index }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const deckRef = useRef<HTMLDivElement>(null);
   const group = useRef<SpringGroup<'x' | 'y' | 'lift' | 'appear'> | null>(null);
@@ -122,6 +125,12 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
     };
     const off = g.onChange(apply);
     apply(g.values);
+    nodeControls.set(s.id, {
+      targets: () => ({ x: g.targets.x, y: g.targets.y }),
+      jump: (p) => g.jump(p),
+      settle: (p) => g.set({ x: p.x, y: p.y, lift: 0 }, springs.bouncy),
+      lift: (v) => g.set({ lift: v }, springs.snappy),
+    });
     // Staggered entrance.
     const timer = setTimeout(() => g.set({ appear: 1 }, springs.bouncy), 40 + index * 45);
     const ro = new ResizeObserver(() => apply(g.values));
@@ -131,6 +140,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
       clearTimeout(timer);
       ro.disconnect();
       registry.delete(s.id);
+      nodeControls.delete(s.id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.id]);
@@ -159,8 +169,11 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
     const el = e.currentTarget as HTMLElement;
     const start = { x: e.clientX, y: e.clientY };
     const origin = group.current!.targets;
+    const shift = e.shiftKey;
+    // Group drag: everything in the multi-selection moves with this node.
+    const peers = inMulti ? [...getMulti()].filter((id) => id !== s.id && nodeControls.has(id)).map((id) => ({ id, c: nodeControls.get(id)!, o: nodeControls.get(id)!.targets() })) : [];
     let moved = false;
-    el.setPointerCapture(e.pointerId);
+     try { el.setPointerCapture(e.pointerId); } catch {}
     const move = (ev: PointerEvent) => {
       const z = getCamera().z;
       const dx = (ev.clientX - start.x) / z;
@@ -171,15 +184,20 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
         setDragging(true);
         onDragState(true);
         group.current!.set({ lift: 1 }, springs.snappy);
+        for (const p of peers) p.c.lift(1);
       }
-      if (moved) group.current!.jump({ x: origin.x + dx, y: origin.y + dy });
+      if (moved) {
+        group.current!.jump({ x: origin.x + dx, y: origin.y + dy });
+        for (const p of peers) p.c.jump({ x: p.o.x + dx, y: p.o.y + dy });
+      }
     };
     const up = () => {
       el.removeEventListener('pointermove', move);
       el.removeEventListener('pointerup', up);
       el.removeEventListener('pointercancel', up);
       if (!moved) {
-        onSelect(s.id);
+        if (shift) onToggleMulti(s.id);
+        else onSelect(s.id);
         return;
       }
       const v = group.current!.values;
@@ -190,6 +208,13 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
       setDragging(false);
       onDragState(false);
       if (nx !== origin.x || ny !== origin.y) onMoved(s.id, nx, ny, origin.x, origin.y);
+      for (const p of peers) {
+        const t = p.c.targets();
+        const px = snap(t.x);
+        const py = snap(t.y);
+        p.c.settle({ x: px, y: py });
+        if (px !== p.o.x || py !== p.o.y) onMoved(p.id, px, py, p.o.x, p.o.y);
+      }
     };
     el.addEventListener('pointermove', move);
     el.addEventListener('pointerup', up);
@@ -205,7 +230,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
   return (
     <div
       ref={ref}
-      className={`node ${selected ? 'selected' : ''} ${isDragging ? 'dragging' : ''} ${busy ? 'busy' : ''} ${connectTarget ? 'connect-target' : ''}`}
+      className={`node ${selected || inMulti ? 'selected' : ''} ${isDragging ? 'dragging' : ''} ${busy ? 'busy' : ''} ${connectTarget ? 'connect-target' : ''}`}
       data-tone={tone}
       data-status={s.status}
       onPointerDown={onPointerDown}

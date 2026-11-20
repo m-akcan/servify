@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Modal } from './ui.tsx';
 
 const GROUPS: [string, [string, string][]][] = [
-  ['Canvas', [['N', 'New service'], ['F', 'Fit to screen'], ['0', 'Zoom to 100%'], ['+ / −', 'Zoom in / out'], ['Space + drag', 'Pan'], ['⌘ + scroll / pinch', 'Zoom at cursor'], ['Double-click', 'New service here'], ['⌘Z', 'Undo move']]],
+  ['Canvas', [['N', 'New service'], ['F', 'Fit to screen'], ['0', 'Zoom to 100%'], ['+ / −', 'Zoom in / out'], ['Space + drag', 'Pan'], ['⌘ + scroll / pinch', 'Zoom at cursor'], ['Double-click', 'New service here'], ['⌘Z', 'Undo move'], ['⇧ + drag / ⇧ + click', 'Multi-select']]],
   ['Services', [['Tab / ⇧Tab', 'Next / previous service'], ['Esc', 'Close panel'], ['⌫', 'Delete selected'], ['Right-click', 'Service actions'], ['Double-click node', 'Focus & open'], ['Drag the ⊕ port', 'Connect services']]],
   ['Anywhere', [['⌘K', 'Command palette'], ['?', 'This help']]],
 ];

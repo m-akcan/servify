@@ -117,3 +117,7 @@ export function bezierAt(b: Bezier, t: number): Pt {
 }
 
 export const INGRESS_ID = '__ingress__';
+
+/** Imperative handles so a group drag can move every selected node together. */
+export type NodeControl = { targets: () => Pt; jump: (p: Pt) => void; settle: (p: Pt) => void; lift: (v: number) => void };
+export const nodeControls = new Map<string, NodeControl>();
