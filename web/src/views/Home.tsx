@@ -5,7 +5,54 @@ import { navigate, projectPath } from '../lib/router.ts';
 import { Button, Modal, toastError, toast, Empty, Switch, Field } from '../components/ui.tsx';
 import { Icon, BrandMark, ServiceGlyph } from '../components/Icon.tsx';
 import { serviceTone } from '../lib/format.ts';
-import type { Project } from '../lib/types.ts';
+import type { Project, ProjectListItem } from '../lib/types.ts';
+
+type ProjectsView = 'grid' | 'list';
+const VIEW_KEY = 'servify.projects.view';
+function savedView(): ProjectsView | null {
+  try {
+    const v = localStorage.getItem(VIEW_KEY);
+    return v === 'grid' || v === 'list' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+const DOWN = new Set(['crashed', 'failed', 'degraded']);
+const MAX_DOTS = 14;
+
+function ProjectList({ projects }: { projects: ProjectListItem[] }) {
+  return (
+    <div className="project-list rise-in" style={{ animationDelay: '80ms' }}>
+      {projects.map((p) => {
+        const down = p.services.filter((s) => DOWN.has(s.status)).length;
+        return (
+          <button key={p.id} className="project-row" onClick={() => navigate(projectPath(p.slug))}>
+            <span className="crumb-dot" style={{ background: p.color }} />
+            <span className="project-row-name truncate">{p.name}</span>
+            <span className="project-row-dots" aria-hidden>
+              {p.services.slice(0, MAX_DOTS).map((s) => (
+                <i key={s.id} data-tone={serviceTone[s.status as keyof typeof serviceTone] ?? 'idle'} title={`${s.name} · ${s.status}`} />
+              ))}
+              {p.services.length > MAX_DOTS && <span className="faint">+{p.services.length - MAX_DOTS}</span>}
+            </span>
+            <span className="project-row-count mono">{p.serviceCount === 0 ? 'empty' : `${p.running}/${p.serviceCount} online`}</span>
+            <span className="project-row-state">
+              {down > 0 && (
+                <span className="badge" data-tone="err">
+                  <span className="dot" />
+                  {down} down
+                </span>
+              )}
+            </span>
+            <span className="project-row-env faint">{p.environments > 0 ? `${p.environments + 1} envs` : ''}</span>
+            <Icon name="arrowRight" size={15} className="project-arrow" />
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 export function NewProjectModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [name, setName] = useState('');
@@ -309,6 +356,19 @@ export function Home() {
   const system = useStore((s) => s.system);
   const [open, setOpen] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [view, setViewState] = useState<ProjectsView | null>(savedView);
+  const [query, setQuery] = useState('');
+  const shown = view ?? (bases.length > 8 ? 'list' : 'grid');
+  const setView = (v: ProjectsView) => {
+    setViewState(v);
+    try {
+      localStorage.setItem(VIEW_KEY, v);
+    } catch {}
+  };
+  const q = query.trim().toLowerCase();
+  const matches = (p: ProjectListItem) => !q || p.name.toLowerCase().includes(q) || p.services.some((s) => s.name.toLowerCase().includes(q));
+  const visible = bases.filter(matches);
+  const listed = shown === 'list' ? [...visible].sort((a, b) => a.name.localeCompare(b.name)) : visible;
 
   return (
     <div className="home">
@@ -322,6 +382,24 @@ export function Home() {
           </div>
           <div className="spacer" />
           <div className="row">
+            {bases.length > 0 && (
+              <>
+                {bases.length > 6 && (
+                  <label className="project-filter">
+                    <Icon name="search" size={14} />
+                    <input placeholder="Filter projects" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter projects" />
+                  </label>
+                )}
+                <div className="seg-tabs" role="group" aria-label="Project layout">
+                  <button className={shown === 'grid' ? 'on' : ''} onClick={() => setView('grid')} title="Cards" aria-pressed={shown === 'grid'}>
+                    <Icon name="grid" size={14} />
+                  </button>
+                  <button className={shown === 'list' ? 'on' : ''} onClick={() => setView('list')} title="List" aria-pressed={shown === 'list'}>
+                    <Icon name="list" size={14} />
+                  </button>
+                </div>
+              </>
+            )}
             <Button icon="download" onClick={() => setImporting(true)}>
               Import
             </Button>
@@ -387,9 +465,13 @@ export function Home() {
               </div>
             </Empty>
           </div>
+        ) : q && visible.length === 0 ? (
+          <div className="home-empty faint rise-in">No project or service matches “{query.trim()}”.</div>
+        ) : shown === 'list' ? (
+          <ProjectList projects={listed} />
         ) : (
           <div className="project-grid">
-            {bases.map((p, i) => (
+            {listed.map((p, i) => (
               <button key={p.id} className="project-card rise-in" style={{ animationDelay: `${80 + i * 50}ms` }} onClick={() => navigate(projectPath(p.slug))}>
                 <MiniCanvas services={p.services} />
                 <div className="project-meta">
@@ -406,7 +488,7 @@ export function Home() {
                 </div>
               </button>
             ))}
-            <button className="project-card project-new rise-in" style={{ animationDelay: `${80 + bases.length * 50}ms` }} onClick={() => setOpen(true)}>
+            <button className="project-card project-new rise-in" style={{ animationDelay: `${80 + listed.length * 50}ms` }} onClick={() => setOpen(true)}>
               <Icon name="plus" size={20} />
               <span>New project</span>
             </button>

@@ -63,6 +63,7 @@ const P: Record<string, string> = {
   zoomIn: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4M11 8v6M8 11h6',
   zoomOut: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4M8 11h6',
   grid: 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z',
+  list: 'M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01',
   lock: 'M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3',
   logout: 'M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 16l-4-4 4-4M6 12h10',
   activity: 'M12 3a6 6 0 0 0-6 6c0 6-2.5 8-2.5 8h17S18 15 18 9a6 6 0 0 0-6-6zM10 20.5a2.2 2.2 0 0 0 4 0',
