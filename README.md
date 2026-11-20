@@ -19,8 +19,12 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Replicas + load balancing.** Turn the replica stepper and Servify starts more containers and balances across them — round-robin, least-connections, IP-hash or random — with active health checks, transparent retries, WebSocket support and an L4 TCP proxy for databases.
 - **Zero-downtime deploys.** New replicas start alongside the old ones, must pass health checks, then traffic switches and old replicas drain. A failed deploy never touches what's running. One-click rollback to any previous image.
 - **Self-healing.** A desired-state reconciler re-creates crashed or deleted replicas, backs off on crash loops, and re-adopts everything after a restart.
+- **Wire services visually.** Drag from a service's ⊕ port onto another to add a reference like `DATABASE_URL=${{ postgres.DATABASE_URL }}`; dashed edges show every dependency.
+- **Built-in test traffic.** Fire 10–150 req/s through the load balancer from the dashboard (or the `load_test` MCP tool) and watch it spread across replicas or trigger autoscaling.
+- **Console.** Run one-off commands (migrations, diagnostics) inside any replica.
+- **Infrastructure as code.** Export a project as `servify.json`, import it anywhere — or let an agent write one and create a whole stack in a single call.
 - **Autoscaling** on requests/s or CPU, **variable references** (`${{ postgres.DATABASE_URL }}`), persistent **volumes**, **custom domains**, resource limits, **git auto-deploy**, live **logs** across replicas, **metrics**, an **activity** audit trail.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 24 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 27 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -33,7 +37,7 @@ pnpm build
 pnpm start
 ```
 
-Open **http://localhost:7700**, choose an owner password, create a project and deploy something. Apps are served at
+Open **http://localhost:7700**, choose an owner password, and hit **Try the demo** for a ready-made stack (load-balanced web tier, an API built from a local folder, Redis and Postgres) — or create a project and deploy your own. Apps are served at
 `http://<service>.<project>.localhost:8080` — `*.localhost` resolves to your machine in every modern browser and in curl, so there's nothing to configure.
 
 ### Run it in Docker instead
@@ -57,6 +61,11 @@ The dashboard is a hand-built infinite canvas (no diagram library):
 | Right-click | Context menu |
 | <kbd>F</kbd> · <kbd>0</kbd> · <kbd>+</kbd>/<kbd>−</kbd> | Fit · 100% · zoom |
 | <kbd>Tab</kbd> / <kbd>⇧Tab</kbd> | Cycle through services |
+| <kbd>⇧</kbd> + drag / <kbd>⇧</kbd> + click | Multi-select, then drag to move together |
+| Drag a node's ⊕ port onto another | Connect: add a variable reference |
+| Double-click a service | Focus and open it |
+| <kbd>⌘Z</kbd> | Undo a move |
+| <kbd>?</kbd> | All shortcuts |
 | <kbd>⌘K</kbd> | Command palette |
 | <kbd>Esc</kbd> · <kbd>⌫</kbd> | Close panel · delete selected service |
 
@@ -81,7 +90,21 @@ claude mcp add --transport http servify http://localhost:7700/mcp --header "Auth
 { "mcpServers": { "servify": { "command": "node", "args": ["/path/to/servify/server/bin/servify.mjs", "mcp"], "env": { "SERVIFY_URL": "http://localhost:7700", "SERVIFY_TOKEN": "svf_…" } } } }
 ```
 
-Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`.
+Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `load_test`.
+
+Example — an agent can create a full stack in one call with `import_project`:
+
+```json
+{
+  "servify": 1,
+  "name": "shop",
+  "services": [
+    { "name": "db", "templateId": "postgres", "source": { "type": "image", "image": "postgres:17-alpine" } },
+    { "name": "api", "source": { "type": "git", "repo": "acme/shop-api" }, "replicas": 3,
+      "env": { "DATABASE_URL": "${{ db.DATABASE_URL }}" } }
+  ]
+}
+```
 
 A token can also be created from the terminal: `pnpm token my-agent` (add `--read` for read-only).
 
@@ -97,7 +120,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
   -d '{"replicas":5}' http://localhost:7700/api/services/<service>/scale
 ```
 
-Main routes: `/api/projects`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec}`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
+Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest}`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
 
 ## Configuration
 
