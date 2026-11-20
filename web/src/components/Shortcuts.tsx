@@ -11,7 +11,8 @@ export function Shortcuts() {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== '?' || (e.target as HTMLElement).closest('input, textarea, [contenteditable]')) return;
+      const isHelp = e.key === '?' || (e.key === '/' && e.shiftKey);
+      if (!isHelp || (e.target as HTMLElement).closest('input, textarea, [contenteditable]')) return;
       setOpen((v) => !v);
     };
     window.addEventListener('keydown', onKey);
