@@ -298,6 +298,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
   const edges: EdgeSpec[] = useMemo(() => {
     const out: EdgeSpec[] = [];
     for (const s of services) {
+      if (!s.activeDeploymentId && s.status === 'idle') continue; // never deployed: nothing to route yet
       if (s.protocol === 'http' && s.publicHttp) out.push({ id: `in-${s.id}`, from: INGRESS_ID, to: s.id, kind: 'ingress', active: s.status === 'running' });
       else if (s.publicTcpPort) out.push({ id: `in-${s.id}`, from: INGRESS_ID, to: s.id, kind: 'ingress', label: `tcp :${s.publicTcpPort}`, active: s.status === 'running' });
     }

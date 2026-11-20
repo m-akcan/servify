@@ -88,15 +88,16 @@ export function serviceMenu(s: ServiceView, opts: { open: (tab?: string) => void
     { label: 'Logs', icon: 'logs', onSelect: () => opts.open('logs') },
     { label: 'Metrics', icon: 'chart', onSelect: () => opts.open('metrics') },
   ];
-  if (s.url) items.push({ label: 'Open URL', icon: 'external', onSelect: () => window.open(s.url!, '_blank') });
+  const deployed = !!s.activeDeploymentId;
+  if (s.url && deployed) items.push({ label: 'Open URL', icon: 'external', onSelect: () => window.open(s.url!, '_blank') });
   items.push({ type: 'sep' });
-  items.push({ label: s.pendingChanges.length ? 'Deploy changes' : 'Redeploy', icon: 'rocket', onSelect: () => void deploy(s) });
+  items.push({ label: !deployed ? 'Deploy' : s.pendingChanges.length ? 'Deploy changes' : 'Redeploy', icon: 'rocket', onSelect: () => void deploy(s) });
   if (s.activeDeploymentId) items.push({ label: 'Restart', icon: 'refresh', onSelect: () => void restart(s) });
   if (!s.volumes.length && s.protocol !== 'none') {
     items.push({ label: 'Add replica', icon: 'layers', onSelect: () => void scale(s, s.replicas + 1) });
     if (s.replicas > 1) items.push({ label: 'Remove replica', icon: 'minus', onSelect: () => void scale(s, s.replicas - 1) });
   }
-  items.push(s.stopped ? { label: 'Start', icon: 'play', onSelect: () => void start(s) } : { label: 'Stop', icon: 'stop', onSelect: () => void stop(s) });
+  if (deployed) items.push(s.stopped ? { label: 'Start', icon: 'play', onSelect: () => void start(s) } : { label: 'Stop', icon: 'stop', onSelect: () => void stop(s) });
   items.push({ type: 'sep' });
   items.push({ label: 'Delete service', icon: 'trash', danger: true, kbd: '⌫', onSelect: () => void remove(s) });
   return items;

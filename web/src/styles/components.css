@@ -315,3 +315,16 @@
   font-size: var(--fs-12);
   color: var(--text-3);
 }
+:root[data-theme='light'] .glyph:not(.glyph-neutral) {
+  color: color-mix(in srgb, var(--hue) 50%, #10120a);
+  background:
+    radial-gradient(120% 120% at 0% 0%, color-mix(in srgb, var(--hue) 40%, transparent), transparent 70%),
+    color-mix(in srgb, var(--hue) 14%, #fff);
+}
+:root[data-theme='light'] .node-rps,
+:root[data-theme='light'] .ingress-stats b {
+  color: #5a7200;
+}
+:root[data-theme='light'] .spark-line {
+  stroke: #7a9a00;
+}
