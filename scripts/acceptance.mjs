@@ -286,6 +286,8 @@ try {
       return deps.some((d) => d.trigger === 'git' && d.status === 'active' && d.commitMessage === 'second');
     }, 150_000, 'git auto-deploy');
     check('new commit auto-deployed', auto);
+    const { rmSync } = await import('node:fs');
+    rmSync(root, { recursive: true, force: true });
   }
 } catch (e) {
   failures++;

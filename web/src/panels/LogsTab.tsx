@@ -38,6 +38,7 @@ export function LogsTab({ service: s }: { service: ServiceView }) {
         },
       },
       () => setConnected(true),
+      { pauseWhenHidden: true },
     );
     return () => {
       stop();

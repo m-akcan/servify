@@ -35,32 +35,54 @@ export const api = {
   del: <T>(p: string) => request<T>('DELETE', p),
 };
 
-/** Server-Sent Events with automatic reconnect and typed handlers. */
-export function sse(path: string, handlers: Record<string, (data: any) => void>, onOpen?: () => void, opts: { staleMs?: number; onDown?: () => void } = {}): () => void {
+/**
+ * Server-Sent Events with automatic reconnect and typed handlers.
+ * Exactly one EventSource and at most one pending retry exist at any time — browsers allow only
+ * ~6 connections per host, so leaked streams would stall every other request.
+ */
+export function sse(
+  path: string,
+  handlers: Record<string, (data: any) => void>,
+  onOpen?: () => void,
+  opts: { staleMs?: number; onDown?: () => void; pauseWhenHidden?: boolean } = {},
+): () => void {
   let es: EventSource | null = null;
+  let timer: number | null = null;
   let closed = false;
   let retry = 500;
   let lastSeen = Date.now();
-  // Watchdog: a proxy can keep a dead stream "open" forever. The server pings every 15s.
-  const staleMs = opts.staleMs ?? 35_000;
-  const watchdog = setInterval(() => {
-    if (closed || !es || Date.now() - lastSeen < staleMs) return;
-    opts.onDown?.();
-    es.close();
-    lastSeen = Date.now();
-    connect();
-  }, 2000);
+  const staleMs = opts.staleMs ?? 35_000; // the server pings every 15s
+
+  const drop = () => {
+    es?.close();
+    es = null;
+  };
+  const schedule = (delay: number) => {
+    if (timer !== null) clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      timer = null;
+      connect();
+    }, delay);
+  };
   const connect = () => {
     if (closed) return;
-    es = new EventSource(`/api${path}`, { withCredentials: true });
-    es.onopen = () => {
+    if (opts.pauseWhenHidden && document.hidden) return; // resumes on visibilitychange
+    drop();
+    const src = new EventSource(`/api${path}`, { withCredentials: true });
+    es = src;
+    lastSeen = Date.now();
+    src.onopen = () => {
+      if (es !== src) return;
       retry = 500;
       lastSeen = Date.now();
       onOpen?.();
     };
-    es.addEventListener('ping', () => (lastSeen = Date.now()));
+    src.addEventListener('ping', () => {
+      if (es === src) lastSeen = Date.now();
+    });
     for (const [event, fn] of Object.entries(handlers)) {
-      es.addEventListener(event, (e) => {
+      src.addEventListener(event, (e) => {
+        if (es !== src) return; // superseded stream
         lastSeen = Date.now();
         const raw = (e as MessageEvent).data;
         if (!raw) return;
@@ -71,18 +93,37 @@ export function sse(path: string, handlers: Record<string, (data: any) => void>,
         }
       });
     }
-    es.onerror = () => {
+    src.onerror = () => {
+      if (es !== src) return; // errors from an old stream are irrelevant
       opts.onDown?.();
-      es?.close();
+      drop();
       if (closed) return;
-      setTimeout(connect, retry);
+      schedule(retry);
       retry = Math.min(retry * 2, 8000);
     };
   };
+  // Watchdog: a proxy can keep a dead stream "open" forever.
+  const watchdog = window.setInterval(() => {
+    if (closed || !es || timer !== null || Date.now() - lastSeen < staleMs) return;
+    opts.onDown?.();
+    drop();
+    schedule(0);
+  }, 2000);
+  const onVisibility = () => {
+    if (!opts.pauseWhenHidden || closed) return;
+    if (document.hidden) {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      drop();
+    } else if (!es && timer === null) connect();
+  };
+  document.addEventListener('visibilitychange', onVisibility);
   connect();
   return () => {
     closed = true;
     clearInterval(watchdog);
-    es?.close();
+    if (timer !== null) clearTimeout(timer);
+    document.removeEventListener('visibilitychange', onVisibility);
+    drop();
   };
 }

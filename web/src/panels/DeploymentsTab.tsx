@@ -21,7 +21,7 @@ function DeployLog({ dep }: { dep: Deployment }) {
     const stop = sse(`/deployments/${dep.id}/logs/stream`, {
       backlog: (arr: { ts: number; text: string }[]) => setLines(arr.map((l) => ({ key: k.current++, ts: l.ts, text: l.text }))),
       line: (l: { ts: number; text: string }) => setLines((prev) => [...prev.slice(-3000), { key: k.current++, ts: l.ts, text: l.text }]),
-    });
+    }, undefined, { pauseWhenHidden: true });
     return stop;
   }, [dep.id]);
   return <LogView lines={lines} live={live} className="deploy-log" emptyText={live ? 'Starting…' : 'No log output.'} />;
