@@ -15,4 +15,4 @@ ENV SERVIFY_DATA_DIR=/data \
     SERVIFY_IN_CONTAINER=1
 VOLUME /data
 EXPOSE 7700 8080
-CMD ["node", "server/bin/servify.mjs", "start"]
+CMD ["node", "--disable-warning=ExperimentalWarning", "server/bin/servify.mjs", "start"]
