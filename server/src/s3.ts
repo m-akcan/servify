@@ -8,6 +8,7 @@ import https from 'node:https';
 import { createReadStream, statSync } from 'node:fs';
 import type { Readable } from 'node:stream';
 import type { Destination } from './settings.ts';
+import { sleep } from './util.ts';
 
 const hmac = (key: Buffer | string, data: string) => createHmac('sha256', key).update(data).digest();
 const sha256hex = (data: string) => createHash('sha256').update(data).digest('hex');
@@ -70,9 +71,19 @@ async function check(res: http.IncomingMessage, what: string) {
 }
 
 export async function s3Put(d: Destination, key: string, filePath: string) {
-  const res = await request(d, 'PUT', key, { path: filePath }, { 'content-type': 'application/octet-stream' });
-  await check(res, `upload of ${key}`);
-  res.resume();
+  // Object stores refuse the odd request (seen on Hetzner: one 403 AccessDenied between successful uploads
+  // with the same key). The file is still on disk, so try again before failing a backup.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await request(d, 'PUT', key, { path: filePath }, { 'content-type': 'application/octet-stream' });
+      await check(res, `upload of ${key}`);
+      res.resume();
+      return;
+    } catch (e) {
+      if (attempt >= 3) throw e;
+      await sleep(attempt * 3000);
+    }
+  }
 }
 
 export async function s3Get(d: Destination, key: string): Promise<Readable> {
