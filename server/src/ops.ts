@@ -203,6 +203,21 @@ function iconFor(input: CreateServiceInput): string {
   return 'box';
 }
 
+/** First free grid slot spiralling out from (ox, oy). */
+function placeNear(projectId: string, ox: number, oy: number): { x: number; y: number } {
+  const svcs = servicesTable.all('WHERE project_id = ?', projectId);
+  const W = 300;
+  const H = 220;
+  for (let ring = 1; ring < 12; ring++) {
+    for (const [gx, gy] of [[0, 1], [1, 0], [0, -1], [-1, 0], [1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+      const x = ox + gx * W * ring;
+      const y = oy + gy * H * ring;
+      if (svcs.every((s) => Math.abs(s.x - x) > W * 0.85 || Math.abs(s.y - y) > H * 0.8)) return { x, y };
+    }
+  }
+  return { x: ox + 40, y: oy + 40 };
+}
+
 function placeNew(projectId: string): { x: number; y: number } {
   const svcs = servicesTable.all('WHERE project_id = ?', projectId);
   if (!svcs.length) return { x: 0, y: 0 };
@@ -791,8 +806,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
     env: { ...src.env },
     startCommand: src.startCommand ?? undefined,
     buildCommand: src.buildCommand ?? undefined,
-    x: src.x + 40,
-    y: src.y + 220,
+    ...placeNear(src.projectId, src.x, src.y),
     deploy: false,
   };
   if (s.type === 'image') input.image = s.image;
