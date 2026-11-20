@@ -450,21 +450,33 @@ export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keep
   recordActivity(actor, 'volume.deleted', opts.keepData ? `Forgot volume ${v.name} (the Docker volume ${v.dockerName} and its data stay)` : `Deleted volume ${v.name} and its data`, v.projectId);
 }
 
-/** Can this Docker volume be taken over? (exists, not already a Servify volume, no outside container references it) */
-export async function adoptable(nodeId: string | null, dockerName: string) {
+/**
+ * Can this Docker volume be taken over? (exists, not already a Servify volume, no outside container references it)
+ * Looked up by name, else by Compose's labels (project + volume, or a volume name that only one project uses).
+ */
+export async function adoptable(nodeId: string | null, dockerName: string, compose?: { project: string; volume: string }) {
   const d = dockerFor(nodeId);
-  const exists = (await d.listVolumes()).some((v: any) => v.Name === dockerName);
-  if (!exists) return { exists: false as const, claimed: false, users: [] as string[] };
+  const all = await d.listVolumes();
+  if (!all.some((v: any) => v.Name === dockerName) && compose) {
+    const label = (v: any, k: string) => v.Labels?.[`com.docker.compose.${k}`];
+    const byBoth = all.filter((v: any) => label(v, 'project') === compose.project && label(v, 'volume') === compose.volume);
+    const byVolume = all.filter((v: any) => label(v, 'volume') === compose.volume);
+    const hit = byBoth.length === 1 ? byBoth[0] : byVolume.length === 1 ? byVolume[0] : null;
+    if (hit) dockerName = hit.Name;
+  }
+  const exists = all.some((v: any) => v.Name === dockerName);
+  if (!exists) return { exists: false as const, dockerName, claimed: false, users: [] as string[] };
   const claimed = volumesTable.all().some((v) => v.dockerName === dockerName && nodeOf(v) === (nodeId || 'local'));
   const users = (await foreignUsers(d, dockerName)).map((c) => `${c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12)} (${c.State})`);
-  return { exists: true as const, claimed, users };
+  return { exists: true as const, dockerName, claimed, users };
 }
 
 /** Docker volumes on a server that no Servify record claims (candidates for adopting). */
 export async function unmanagedDockerVolumes(nodeId: string | null) {
   const d = dockerFor(nodeId);
   const claimed = new Set(volumesTable.all().filter((v) => nodeOf(v) === (nodeId || 'local')).map((v) => v.dockerName));
-  const list = (await d.listVolumes().catch(() => [])).filter((v: any) => !claimed.has(v.Name) && v.Labels?.[LABEL.instance] !== INSTANCE_ID);
+  // Never another Servify's volumes (any instance label): those belong to that Servify.
+  const list = (await d.listVolumes().catch(() => [])).filter((v: any) => !claimed.has(v.Name) && !v.Labels?.[LABEL.instance]);
   const usage = await d.volumeUsage().catch(() => new Map<string, number>());
   const out = [];
   for (const v of list as any[]) {

@@ -596,6 +596,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     const a = { ...svc.autoscale, ...patch.autoscale };
     if (a.max < a.min) a.max = a.min;
     if (a.enabled && svc.volumes.length) throw new HttpError(400, 'autoscaling is not available for services with volumes');
+    if (a.enabled && svc.ports?.length) throw new HttpError(400, 'autoscaling is not available for services with published ports (they run as one replica)');
     set('autoscale', a, 'autoscaling');
   }
   if (patch.publicHttp !== undefined) set('publicHttp', patch.publicHttp, 'public networking');
@@ -1244,6 +1245,19 @@ export function planComposeImport(input: { yaml: string; env?: string; basePath?
   return planCompose(input);
 }
 
+/** For each named volume of a Compose plan: which existing Docker volume it would take over, and whether it can. */
+export async function adoptPlan(plan: ReturnType<typeof planCompose>) {
+  const out: { service: string; slug: string; mountPath: string; name: string; dockerName: string; status: 'ok' | 'missing' | 'claimed' | 'in use'; users: string[] }[] = [];
+  for (const cs of plan.services) {
+    for (const m of cs.volumes) {
+      if (!m.dockerName || m.hostPath) continue;
+      const a = await adoptable(null, m.dockerName, m.composeVolume ? { project: plan.composeProject, volume: m.composeVolume } : undefined);
+      out.push({ service: cs.name, slug: cs.slug, mountPath: m.mountPath, name: m.name, dockerName: a.dockerName, users: a.users, status: !a.exists ? 'missing' : a.claimed ? 'claimed' : a.users.length ? 'in use' : 'ok' });
+    }
+  }
+  return out;
+}
+
 export async function importCompose(actor: Actor, input: { yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean; adoptVolumes?: boolean }) {
   const plan = planCompose(input);
   // Take over the Docker volumes Compose already created, instead of starting empty. Checked up front, so a volume
@@ -1251,24 +1265,13 @@ export async function importCompose(actor: Actor, input: { yaml: string; env?: s
   const adopt: { slug: string; mountPath: string; dockerName: string; name: string }[] = [];
   if (input.adoptVolumes) {
     requireOwner(actor, 'Taking over existing Docker volumes');
-    const busyOnes: string[] = [];
-    for (const cs of plan.services) {
-      for (const m of cs.volumes) {
-        if (!m.dockerName || m.hostPath) continue;
-        const a = await adoptable(null, m.dockerName);
-        if (!a.exists) {
-          plan.warnings.push(`${cs.name}: no existing Docker volume ${m.dockerName} — it starts with a fresh one`);
-          continue;
-        }
-        if (a.claimed) {
-          plan.warnings.push(`${cs.name}: ${m.dockerName} already belongs to a Servify volume — it starts with a fresh one`);
-          continue;
-        }
-        if (a.users.length) busyOnes.push(`${m.dockerName} ← ${a.users.join(', ')}`);
-        adopt.push({ slug: cs.slug, mountPath: m.mountPath, dockerName: m.dockerName, name: m.name });
-      }
-    }
-    if (busyOnes.length) throw new HttpError(409, `these volumes are still referenced by Compose containers: ${busyOnes.join('; ')} — run \`docker compose down\` (without -v; the data stays), then import again`);
+    const check = await adoptPlan(plan);
+    const busyOnes = check.filter((c) => c.status === 'in use');
+    const missing = check.filter((c) => c.status === 'missing' || c.status === 'claimed');
+    if (busyOnes.length) throw new HttpError(409, `these volumes are still referenced by Compose containers: ${busyOnes.map((c) => `${c.dockerName} ← ${c.users.join(', ')}`).join('; ')} — run \`docker compose down\` (without -v; the data stays), then import again`);
+    // A miss would silently start that database empty: stop instead, the user decides.
+    if (missing.length) throw new HttpError(409, `no existing Docker volume found for ${missing.map((c) => `${c.service}:${c.mountPath} (looked for ${c.dockerName}${c.status === 'claimed' ? ', already a Servify volume' : ''})`).join('; ')} — check the base folder / compose project name, or import without taking over volumes`);
+    for (const c of check) adopt.push({ slug: c.slug, mountPath: c.mountPath, dockerName: c.dockerName, name: c.name });
   }
   const spec = planToSpec(plan);
   for (const sv of spec.services) sv.volumes = (sv.volumes ?? []).filter((m) => !adopt.some((a) => a.slug === sv.name && a.mountPath === m.mountPath));

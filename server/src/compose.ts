@@ -23,7 +23,7 @@ export type ComposeService = {
   port: number | null;
   publishedPort: number | null;
   /** UDP (and other non-routed) ports published straight on the server — owner only at import. */
-  published: { container: number; host: number; protocol: 'tcp' | 'udp' }[];
+  published: { container: number; host: number; protocol: 'tcp' | 'udp'; hostIp?: string }[];
   replicas: number;
   env: Record<string, string>;
   secretKeys: string[];
@@ -39,10 +39,14 @@ export type ComposeService = {
   y: number;
 };
 /** A volume (dockerName = the Docker volume Compose created for it, for taking it over) or a host folder. */
-export type ComposeMount = { name: string; mountPath: string; dockerName?: string; hostPath?: string; readOnly?: boolean; selinux?: 'z' | 'Z' | null; perReplica?: boolean };
+export type ComposeMount = { name: string; mountPath: string; dockerName?: string; composeVolume?: string; hostPath?: string; readOnly?: boolean; selinux?: 'z' | 'Z' | null; perReplica?: boolean };
 export type ComposePlan = { name: string; composeProject: string; services: ComposeService[]; warnings: string[] };
 
-const TCP_PORTS = new Set([5432, 3306, 6379, 27017, 9042, 5672, 1883, 11211, 9092, 2181, 4222, 26257, 8086, 9000]);
+const TCP_PORTS = new Set([
+  5432, 3306, 6379, 27017, 9042, 5672, 1883, 11211, 9092, 2181, 4222, 26257, 8086, 9000,
+  // game and voice servers: raw TCP, never HTTP
+  25565, 25575, 27015, 7777, 30033, 10011, 19132, 2456, 8211, 64738,
+]);
 
 /** ${VAR}, ${VAR:-default}, ${VAR-default}, ${VAR:?err}, $VAR and $$ — against .env and env_file values. */
 function interpolate(value: string, vars: Record<string, string>, missing: Set<string>): string {
@@ -132,18 +136,21 @@ const argv = (v: unknown): string[] | null => {
   return Array.isArray(v) ? v.map(String) : shellSplit(String(v));
 };
 
-function parsePort(p: unknown): { container: number; published: number | null; proto: string } | null {
-  if (typeof p === 'number') return { container: p, published: null, proto: 'tcp' };
+function parsePort(p: unknown): { container: number; published: number | null; proto: string; hostIp: string | null } | null {
+  if (typeof p === 'number') return { container: p, published: null, proto: 'tcp', hostIp: null };
   if (p && typeof p === 'object') {
     const o = p as any;
-    return o.target ? { container: Number(o.target), published: o.published ? Number(o.published) : null, proto: o.protocol ?? 'tcp' } : null;
+    return o.target ? { container: Number(o.target), published: o.published ? Number(o.published) : null, proto: o.protocol ?? 'tcp', hostIp: o.host_ip ?? null } : null;
   }
   const s = String(p);
   const [spec, proto = 'tcp'] = s.split('/');
-  const parts = spec.split(':');
-  const container = Number.parseInt(parts[parts.length - 1].split('-')[0], 10);
-  const published = parts.length >= 2 ? Number.parseInt(parts[parts.length - 2].split('-')[0], 10) : null;
-  return Number.isFinite(container) ? { container, published: Number.isFinite(published as number) ? published : null, proto } : null;
+  // [ip:]host:container — the ip may be IPv6 in brackets
+  const m = spec.match(/^(?:(\d+\.\d+\.\d+\.\d+|\[[0-9a-fA-F:]+\]):)?(?:(\d+)(?:-\d+)?:)?(\d+)(?:-\d+)?$/);
+  if (!m) return null;
+  const container = Number(m[3]);
+  const published = m[2] ? Number(m[2]) : null;
+  const ip = m[1]?.replace(/^\[|\]$/g, '') ?? null;
+  return Number.isFinite(container) ? { container, published, proto, hostIp: ip && ip !== '0.0.0.0' && ip !== '::' ? ip : null } : null;
 }
 
 function parseMemory(v: unknown): number | null {
@@ -195,7 +202,8 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
   if (missing.size) warnings.push(`Variables not set (left empty): ${[...missing].join(', ')}. Paste your .env to fill them in.`);
 
   // Compose's own project name: how its named volumes are called in Docker (<project>_<volume>).
-  const composeProject = String(input.name?.trim() || doc.name || (base ? base.split('/').pop() : '') || 'compose').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  // (`name:` in the file, else the folder — not the Servify project name you type, which can differ.)
+  const composeProject = String(doc.name || (base ? base.split('/').pop() : '') || input.name?.trim() || 'compose').toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const topVolumes = (doc.volumes && typeof doc.volumes === 'object' ? doc.volumes : {}) as Record<string, any>;
 
   const out: ComposeService[] = [];
@@ -262,13 +270,15 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     // ── ports
     const ports = (svc.ports ?? []).map(parsePort).filter(Boolean) as NonNullable<ReturnType<typeof parsePort>>[];
     const expose = (svc.expose ?? []).map((p: unknown) => Number.parseInt(String(p), 10)).filter(Number.isFinite);
-    const udp = ports.filter((p) => p.proto === 'udp' && p.published);
-    if (udp.length) w(`UDP ${udp.map((p) => `${p.published}:${p.container}`).join(', ')} → published straight on the server (only if you import as the owner)`);
     const tcpPorts = ports.filter((p) => p.proto !== 'udp');
     // Like Compose: no ports/expose → nothing is published or health-probed on a port (it's still reachable
     // by name on the project network). Probing a template's port would fail for e.g. a redis image running a script.
     const port = tcpPorts[0]?.container ?? expose[0] ?? null;
-    if (tcpPorts.length + expose.length > 1) w(`several ports — routing to ${port}; the others stay reachable inside the project network`);
+    // Everything Compose published besides the routed port keeps its host port (UDP, extra TCP like a query port):
+    // published straight on the server — only if the owner imports.
+    const udp = [...ports.filter((p) => p.proto === 'udp' && p.published), ...tcpPorts.slice(1).filter((p) => p.published)];
+    if (udp.length) w(`${udp.map((p) => `${p.hostIp ? `${p.hostIp}:` : ''}${p.published}:${p.container}/${p.proto}`).join(', ')} → published straight on the server (only if you import as the owner)`);
+    else if (tcpPorts.length + expose.length > 1) w(`several ports — routing to ${port}; the others stay reachable inside the project network`);
     let protocol: Protocol = port === null ? 'none' : tpl?.protocol ?? (TCP_PORTS.has(port) ? 'tcp' : 'http');
     if (svc.labels && JSON.stringify(svc.labels).includes('traefik.http')) protocol = 'http';
     const publishedPort = tcpPorts[0]?.published ?? null;
@@ -319,7 +329,7 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
       const vname = (src || target.split('/').filter(Boolean).join('-') || 'data').replace(/[^a-zA-Z0-9_.-]/g, '-');
       const top = src ? topVolumes[src] : null;
       const dockerName = src ? String(top?.name ?? (top?.external ? src : `${composeProject}_${src}`)) : undefined;
-      volumes.push({ name: vname, mountPath: target, ...(dockerName ? { dockerName } : {}), ...(readOnly ? { readOnly } : {}) });
+      volumes.push({ name: vname, mountPath: target, ...(dockerName ? { dockerName, composeVolume: src } : {}), ...(readOnly ? { readOnly } : {}) });
     }
     if (tpl && !volumes.length && tpl.volumes.length) volumes.push(...tpl.volumes);
 
@@ -355,7 +365,7 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     const dependsOn = Array.isArray(svc.depends_on) ? svc.depends_on.map(String) : Object.keys(svc.depends_on ?? {});
     const secretKeys = Object.keys(env).filter((k) => /SECRET|PASSWORD|TOKEN|KEY|PASS$/i.test(k));
 
-    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: 'udp' as const })), replicas, env, secretKeys, volumes, cmd, entrypoint, healthPath, resources, dependsOn, x: 0, y: 0 });
+    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: (p.proto === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp', ...(p.hostIp ? { hostIp: p.hostIp } : {}) })), replicas, env, secretKeys, volumes, cmd, entrypoint, healthPath, resources, dependsOn, x: 0, y: 0 });
   }
   if (!out.length) throw new HttpError(400, 'no importable services in this compose file');
 

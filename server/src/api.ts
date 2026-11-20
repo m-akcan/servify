@@ -193,7 +193,12 @@ api.post('/projects/import', async (c) => {
 api.post('/projects/import-compose', async (c) => {
   const body = await jsonBody<{ yaml: string; env?: string; basePath?: string; name?: string; deploy?: boolean; dryRun?: boolean; adoptVolumes?: boolean }>(c);
   if (!body.yaml?.trim()) throw new HttpError(400, 'paste the contents of your docker-compose.yml');
-  if (body.dryRun) return c.json(ops.planComposeImport(body));
+  if (body.dryRun) {
+    const plan = ops.planComposeImport(body);
+    if (!body.adoptVolumes) return c.json(plan);
+    ops.requireOwner(actor(c), 'Taking over existing Docker volumes');
+    return c.json({ ...plan, adopt: await ops.adoptPlan(plan) });
+  }
   return c.json(await ops.importCompose(actor(c), body), 201);
 });
 api.get('/projects/:id/volumes', (c) => c.json(listVolumes(ops.getProjectOrThrow(c.req.param('id')).id)));
