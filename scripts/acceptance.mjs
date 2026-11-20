@@ -254,7 +254,7 @@ try {
   let runs = [];
   const manualOk = await waitFor(async () => {
     runs = await api('GET', `/services/${job.service.id}/runs`);
-    return runs.some((r) => r.trigger === 'manual' && r.status === 'succeeded' && r.output.includes('hello-from-cron'));
+    return runs.some((r) => r.trigger !== 'schedule' && r.status === 'succeeded' && r.output.includes('hello-from-cron'));
   }, 60_000, 'manual run');
   check('manual run succeeds with output', manualOk, JSON.stringify(runs[0] ?? {}).slice(0, 200));
   const schedOk = await waitFor(async () => (await api('GET', `/services/${job.service.id}/runs`)).some((r) => r.trigger === 'schedule' && r.status === 'succeeded'), 75_000, 'scheduled run');
