@@ -795,7 +795,7 @@ export type ProjectSpec = {
   servify: 1;
   name: string;
   color?: string;
-  services: Array<Partial<Service> & { name: string; source: Source }>;
+  services: Array<Partial<Service> & { name: string; source?: Source }>;
 };
 
 const SPEC_KEYS = [
@@ -828,34 +828,39 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   const tpls = new Map(templates.map((t) => [t.id, t]));
   const created: Service[] = [];
   for (const raw of spec.services) {
-    const src = raw.source;
+    const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
+    const src = raw.source ?? (tpl ? { type: 'image' as const, image: tpl.image } : undefined);
     assert(src && ['image', 'git', 'local'].includes(src.type), 400, `service ${raw.name}: invalid source`);
-    const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y, protocol: raw.protocol, port: raw.port ?? undefined, env: raw.env };
-    if (src.type === 'image') input.image = src.image;
+    // Start from the template (all its variables, volumes, port…) when there is one; the spec overrides.
+    const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y };
+    if (tpl) input.templateId = tpl.id;
+    else if (src.type === 'image') input.image = src.image;
     else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile });
     else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
+    if (raw.protocol) input.protocol = raw.protocol;
+    if (raw.port) input.port = raw.port;
     const r = await createService(actor, project.id, input);
     const svc = servicesTable.get(r.service.id)!;
-    // Regenerate empty secrets from templates so imports without secrets still boot.
-    const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
-    const env = { ...(raw.env ?? {}) };
-    if (tpl) for (const [k, v] of Object.entries(tpl.env)) if (!env[k] && v.includes('{{secret}}')) env[k] = v.replace(/\{\{secret\}\}/g, () => secret(18));
+    if (tpl && src.type === 'image' && src.image !== tpl.image) svc.source = { type: 'image', image: src.image };
+    // Spec values win, except blanked secrets (exports strip them): keep the freshly generated ones.
+    const env = { ...svc.env };
+    for (const [k, v] of Object.entries(raw.env ?? {})) if (v !== '' || !(k in env)) env[k] = v;
+    const def = <T,>(v: T | undefined | null, fallback: T): T => (v === undefined || v === null ? fallback : v);
     Object.assign(svc, {
-      icon: raw.icon ?? svc.icon,
-      templateId: raw.templateId ?? null,
-      replicas: raw.replicas ?? svc.replicas,
-      strategy: raw.strategy ?? svc.strategy,
+      icon: def(raw.icon, svc.icon),
+      replicas: tpl?.singleton ? 1 : def(raw.replicas, svc.replicas),
+      strategy: def(raw.strategy, svc.strategy),
       healthcheck: { ...svc.healthcheck, ...(raw.healthcheck ?? {}) },
       autoscale: { ...svc.autoscale, ...(raw.autoscale ?? {}) },
-      publicHttp: raw.publicHttp ?? svc.publicHttp,
+      publicHttp: def(raw.publicHttp, svc.publicHttp),
       domains: [],
-      volumes: raw.volumes ?? [],
+      volumes: def(raw.volumes, svc.volumes),
       env,
-      secretKeys: raw.secretKeys ?? svc.secretKeys,
-      startCommand: raw.startCommand ?? null,
-      buildCommand: raw.buildCommand ?? null,
+      secretKeys: [...new Set([...svc.secretKeys, ...(raw.secretKeys ?? [])])],
+      startCommand: raw.startCommand === undefined ? svc.startCommand : raw.startCommand,
+      buildCommand: raw.buildCommand === undefined ? svc.buildCommand : raw.buildCommand,
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
-      autoDeploy: raw.autoDeploy ?? svc.autoDeploy,
+      autoDeploy: def(raw.autoDeploy, svc.autoDeploy),
     } satisfies Partial<Service>);
     if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
     servicesTable.put(svc);
