@@ -146,7 +146,8 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     if (!existsSync(repoDir) || !statSync(repoDir).isDirectory()) throw new Error(`local path not found: ${repoDir}`);
     mkdirSync(workDir, { recursive: true });
     log(`▸ Building from local folder ${repoDir}`);
-    const g = await run('git', ['-C', repoDir, 'log', '-1', '--format=%H%n%s']).catch(() => null);
+    // Last commit that touched this folder (it may live inside a larger repository).
+    const g = await run('git', ['-C', repoDir, 'log', '-1', '--format=%H%n%s', '--', '.']).catch(() => null);
     if (g && g.code === 0) [commitSha, commitMessage] = g.out.trim().split('\n');
   } else {
     throw new Error('image sources are not built');

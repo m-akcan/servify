@@ -229,9 +229,9 @@ export function OverviewTab({ service: s, onTab }: { service: ServiceView; onTab
             </span>
             <span className="mono grow truncate">
               {s.slug}
-              {s.port ? `:${s.port}` : ''}
+              {(s.port ?? s.detectedPort) ? `:${s.port ?? s.detectedPort}` : ''}
             </span>
-            <CopyButton text={`${s.slug}${s.port ? `:${s.port}` : ''}`} />
+            <CopyButton text={`${s.slug}${(s.port ?? s.detectedPort) ? `:${s.port ?? s.detectedPort}` : ''}`} />
           </div>
         </section>
       )}
