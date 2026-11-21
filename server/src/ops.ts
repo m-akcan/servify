@@ -3,7 +3,7 @@
  * so every capability is available to humans and agents alike, with the same validation.
  */
 import { z } from 'zod';
-import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable } from './db.ts';
+import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db } from './db.ts';
 import type { Project, Service, Deployment, Source, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { id, slugify, secret, HttpError, assert } from './util.ts';
@@ -104,16 +104,28 @@ export function pendingChanges(s: Service): string[] {
 
 export function listProjects() {
   const all = projectsTable.all('ORDER BY created_at ASC');
+  const lastDeploy = new Map((db.prepare('SELECT project_id AS p, MAX(created_at) AS t FROM deployments GROUP BY project_id').all() as { p: string; t: number }[]).map((r) => [r.p, r.t]));
   return all.map((p) => {
     const svcs = servicesTable.all('WHERE project_id = ?', p.id);
+    const serverIds = [...new Set(svcs.map((s) => nodeOf(s)))];
     return {
       ...p,
       environments: p.parentId ? 0 : all.filter((x) => x.parentId === p.id).length,
       serviceCount: svcs.length,
       running: svcs.filter((s) => s.status === 'running').length,
-      services: svcs.map((s) => ({ id: s.id, name: s.name, icon: s.icon, status: s.status })),
+      lastDeployAt: lastDeploy.get(p.id) ?? null,
+      servers: serverIds.map((id) => ({ id, name: id === LOCAL ? 'This machine' : nodeName(id) })),
+      services: svcs.map((s) => ({ id: s.id, name: s.name, icon: s.icon, status: s.status, server: nodeOf(s) })),
     };
   });
+}
+
+/** 'i:<line icon>', 'b:<brand logo>' or 'e:<emoji>'; empty clears it. */
+function projectIcon(raw: unknown): string | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const v = String(raw).trim();
+  assert(v.length <= 40 && /^(i:[a-zA-Z]{1,32}|b:[a-z0-9-]{1,32}|e:\S.{0,15})$/u.test(v), 400, 'icon must be i:<icon>, b:<logo> or e:<emoji>');
+  return v;
 }
 
 export function getProjectOrThrow(projectId: string): Project {
@@ -161,10 +173,11 @@ export function createProject(actor: Actor, input: { name: string; color?: strin
   return p;
 }
 
-export function updateProject(actor: Actor, projectId: string, patch: { name?: string; color?: string }) {
+export function updateProject(actor: Actor, projectId: string, patch: { name?: string; color?: string; icon?: string | null }) {
   const p = getProjectOrThrow(projectId);
   if (patch.name?.trim()) p.name = patch.name.trim();
   if (patch.color) p.color = patch.color;
+  if (patch.icon !== undefined) p.icon = projectIcon(patch.icon);
   p.updatedAt = Date.now();
   projectsTable.put(p);
   bus.publish({ type: 'project.updated', project: p });

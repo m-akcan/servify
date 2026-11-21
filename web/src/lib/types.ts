@@ -54,7 +54,11 @@ export type ProjectListItem = Project & {
   serviceCount: number;
   environments: number;
   running: number;
-  services: { id: string; name: string; icon: string; status: Service['status'] }[];
+  /** When any service of the project was last deployed. */
+  lastDeployAt?: number | null;
+  /** The servers its services run on ('local' = this machine). */
+  servers?: { id: string; name: string }[];
+  services: { id: string; name: string; icon: string; status: Service['status']; server?: string }[];
 };
 
 export type Snapshot = {

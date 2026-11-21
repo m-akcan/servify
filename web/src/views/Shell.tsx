@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { ProjectMark } from '../components/ProjectMark.tsx';
 import { useStore } from '../lib/store.ts';
 import { navigate, useRoute, projectPath } from '../lib/router.ts';
 import { Icon } from '../components/Icon.tsx';
@@ -75,7 +76,7 @@ export function Shell({ children }: { children: ReactNode }) {
         {current && base ? (
           <>
             <button className="crumb" onClick={(e) => switchProject(e.currentTarget)}>
-              <span className="crumb-dot" style={{ background: base.color }} />
+              <ProjectMark project={base} size={18} />
               {base.name}
               <Icon name="chevronDown" size={14} />
             </button>

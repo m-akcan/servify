@@ -4,7 +4,8 @@ import { api } from '../lib/api.ts';
 import { navigate, projectPath } from '../lib/router.ts';
 import { Button, Modal, toastError, toast, Empty, Switch, Field } from '../components/ui.tsx';
 import { Icon, BrandMark, ServiceGlyph } from '../components/Icon.tsx';
-import { serviceTone } from '../lib/format.ts';
+import { serviceTone, timeAgo } from '../lib/format.ts';
+import { ProjectMark } from '../components/ProjectMark.tsx';
 import type { Project, ProjectListItem } from '../lib/types.ts';
 
 type ProjectsView = 'grid' | 'list';
@@ -21,6 +22,48 @@ function savedView(): ProjectsView | null {
 const DOWN = new Set(['crashed', 'failed', 'degraded']);
 const MAX_DOTS = 14;
 
+type StatusFilter = 'all' | 'attention' | 'running' | 'stopped' | 'empty';
+const STATUS_FILTERS: [StatusFilter, string][] = [
+  ['all', 'All'],
+  ['attention', 'Needs attention'],
+  ['running', 'Running'],
+  ['stopped', 'Stopped'],
+  ['empty', 'Empty'],
+];
+/** One state per project: anything down wins, then empty, then running vs. all stopped. */
+function statusOf(p: ProjectListItem): Exclude<StatusFilter, 'all'> {
+  if (p.services.some((s) => DOWN.has(s.status))) return 'attention';
+  if (p.serviceCount === 0) return 'empty';
+  return p.running > 0 ? 'running' : 'stopped';
+}
+
+type SortKey = 'name' | 'recent' | 'services' | 'newest';
+const SORTS: [SortKey, string][] = [
+  ['name', 'Name'],
+  ['recent', 'Recently deployed'],
+  ['services', 'Most services'],
+  ['newest', 'Newest'],
+];
+const SORT_KEY = 'servify.projects.sort';
+function savedSort(): SortKey {
+  try {
+    const v = localStorage.getItem(SORT_KEY);
+    return SORTS.some(([k]) => k === v) ? (v as SortKey) : 'name';
+  } catch {
+    return 'name';
+  }
+}
+const byName = (a: ProjectListItem, b: ProjectListItem) => a.name.localeCompare(b.name);
+const SORTERS: Record<SortKey, (a: ProjectListItem, b: ProjectListItem) => number> = {
+  name: byName,
+  recent: (a, b) => (b.lastDeployAt ?? 0) - (a.lastDeployAt ?? 0) || byName(a, b),
+  services: (a, b) => b.serviceCount - a.serviceCount || byName(a, b),
+  newest: (a, b) => b.createdAt - a.createdAt,
+};
+
+/** Servers other than this machine that a project runs on. */
+const remoteServers = (p: ProjectListItem) => (p.servers ?? []).filter((s) => s.id !== 'local');
+
 function ProjectList({ projects }: { projects: ProjectListItem[] }) {
   return (
     <div className="project-list rise-in" style={{ animationDelay: '80ms' }}>
@@ -28,8 +71,16 @@ function ProjectList({ projects }: { projects: ProjectListItem[] }) {
         const down = p.services.filter((s) => DOWN.has(s.status)).length;
         return (
           <button key={p.id} className="project-row" onClick={() => navigate(projectPath(p.slug))}>
-            <span className="crumb-dot" style={{ background: p.color }} />
-            <span className="project-row-name truncate">{p.name}</span>
+            <ProjectMark project={p} size={18} />
+            <span className="project-row-title">
+              <span className="project-row-name truncate">{p.name}</span>
+              {remoteServers(p).map((s) => (
+                <span key={s.id} className="project-row-server" title={`Runs on ${s.name}`}>
+                  <Icon name="server" size={11} />
+                  {s.name}
+                </span>
+              ))}
+            </span>
             <span className="project-row-dots" aria-hidden>
               {p.services.slice(0, MAX_DOTS).map((s) => (
                 <i key={s.id} data-tone={serviceTone[s.status as keyof typeof serviceTone] ?? 'idle'} title={`${s.name} · ${s.status}`} />
@@ -46,6 +97,9 @@ function ProjectList({ projects }: { projects: ProjectListItem[] }) {
               )}
             </span>
             <span className="project-row-env faint">{p.environments > 0 ? `${p.environments + 1} envs` : ''}</span>
+            <span className="project-row-deployed faint" title={p.lastDeployAt ? new Date(p.lastDeployAt).toLocaleString() : 'Never deployed'}>
+              {p.lastDeployAt ? timeAgo(p.lastDeployAt) : '—'}
+            </span>
             <Icon name="arrowRight" size={15} className="project-arrow" />
           </button>
         );
@@ -358,6 +412,9 @@ export function Home() {
   const [importing, setImporting] = useState(false);
   const [view, setViewState] = useState<ProjectsView | null>(savedView);
   const [query, setQuery] = useState('');
+  const [status, setStatus] = useState<StatusFilter>('all');
+  const [server, setServer] = useState('all');
+  const [sort, setSortState] = useState<SortKey>(savedSort);
   const shown = view ?? (bases.length > 8 ? 'list' : 'grid');
   const setView = (v: ProjectsView) => {
     setViewState(v);
@@ -365,10 +422,29 @@ export function Home() {
       localStorage.setItem(VIEW_KEY, v);
     } catch {}
   };
+  const setSort = (v: SortKey) => {
+    setSortState(v);
+    try {
+      localStorage.setItem(SORT_KEY, v);
+    } catch {}
+  };
+  const showTools = bases.length > 6;
+  const servers = [...new Map(bases.flatMap((p) => p.servers ?? []).map((s) => [s.id, s])).values()].sort((a, b) => (a.id === 'local' ? -1 : b.id === 'local' ? 1 : a.name.localeCompare(b.name)));
   const q = query.trim().toLowerCase();
-  const matches = (p: ProjectListItem) => !q || p.name.toLowerCase().includes(q) || p.services.some((s) => s.name.toLowerCase().includes(q));
-  const visible = bases.filter(matches);
-  const listed = shown === 'list' ? [...visible].sort((a, b) => a.name.localeCompare(b.name)) : visible;
+  const matchesText = (p: ProjectListItem) => !q || p.name.toLowerCase().includes(q) || p.services.some((s) => s.name.toLowerCase().includes(q));
+  const matchesServer = (p: ProjectListItem) => server === 'all' || (p.servers ?? []).some((s) => s.id === server);
+  // Status counts follow the text and server filters, so they always add up to what "All" shows.
+  const narrowed = bases.filter((p) => matchesText(p) && matchesServer(p));
+  const counts = { all: narrowed.length, attention: 0, running: 0, stopped: 0, empty: 0 } as Record<StatusFilter, number>;
+  for (const p of narrowed) counts[statusOf(p)]++;
+  const visible = narrowed.filter((p) => status === 'all' || statusOf(p) === status);
+  const listed = [...visible].sort(SORTERS[sort]);
+  const filtering = !!q || status !== 'all' || server !== 'all';
+  const clearFilters = () => {
+    setQuery('');
+    setStatus('all');
+    setServer('all');
+  };
 
   return (
     <div className="home">
@@ -384,12 +460,6 @@ export function Home() {
           <div className="row">
             {bases.length > 0 && (
               <>
-                {bases.length > 6 && (
-                  <label className="project-filter">
-                    <Icon name="search" size={14} />
-                    <input placeholder="Filter projects" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter projects" />
-                  </label>
-                )}
                 <div className="seg-tabs" role="group" aria-label="Project layout">
                   <button className={shown === 'grid' ? 'on' : ''} onClick={() => setView('grid')} title="Cards" aria-pressed={shown === 'grid'}>
                     <Icon name="grid" size={14} />
@@ -440,6 +510,42 @@ export function Home() {
           </div>
         )}
 
+        {showTools && (
+          <div className="project-tools rise-in" style={{ animationDelay: '70ms' }}>
+            <label className="project-filter">
+              <Icon name="search" size={14} />
+              <input placeholder="Search projects" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter projects and services" />
+            </label>
+            <div className="project-status-filter" role="group" aria-label="Filter by status">
+              {STATUS_FILTERS.map(([k, label]) => (
+                <button key={k} className={`status-pill ${status === k ? 'on' : ''}`} data-kind={k} onClick={() => setStatus(k)} aria-pressed={status === k} disabled={k !== 'all' && counts[k] === 0 && status !== k}>
+                  {k !== 'all' && <span className="status-pill-dot" />}
+                  {label}
+                  <span className="status-pill-count">{counts[k]}</span>
+                </button>
+              ))}
+            </div>
+            <div className="spacer" />
+            {servers.length > 1 && (
+              <select className="select project-tool-select" value={server} onChange={(e) => setServer(e.target.value)} aria-label="Filter by server">
+                <option value="all">All servers</option>
+                {servers.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <select className="select project-tool-select" value={sort} onChange={(e) => setSort(e.target.value as SortKey)} aria-label="Sort projects">
+              {SORTS.map(([k, label]) => (
+                <option key={k} value={k}>
+                  Sort: {label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
         {loaded && projects.length === 0 ? (
           <div className="home-empty rise-in" style={{ animationDelay: '120ms' }}>
             <Empty icon="sparkle" title="Nothing here yet" body="Create a project, then drop in services from GitHub, Docker images, a local folder or a template.">
@@ -465,8 +571,13 @@ export function Home() {
               </div>
             </Empty>
           </div>
-        ) : q && visible.length === 0 ? (
-          <div className="home-empty faint rise-in">No project or service matches “{query.trim()}”.</div>
+        ) : filtering && visible.length === 0 ? (
+          <div className="home-empty project-no-match rise-in">
+            <span className="faint">{q ? `No project or service matches “${query.trim()}”` : 'No project matches these filters'}{status !== 'all' || server !== 'all' ? ' with the current filters' : ''}.</span>
+            <Button size="sm" onClick={clearFilters}>
+              Clear filters
+            </Button>
+          </div>
         ) : shown === 'list' ? (
           <ProjectList projects={listed} />
         ) : (
@@ -475,13 +586,14 @@ export function Home() {
               <button key={p.id} className="project-card rise-in" style={{ animationDelay: `${80 + i * 50}ms` }} onClick={() => navigate(projectPath(p.slug))}>
                 <MiniCanvas services={p.services} />
                 <div className="project-meta">
-                  <span className="crumb-dot" style={{ background: p.color }} />
+                  <ProjectMark project={p} size={22} />
                   <div className="grow">
                     <div className="project-name truncate">{p.name}</div>
                     <div className="faint" style={{ fontSize: 12 }}>
                       {p.serviceCount} service{p.serviceCount === 1 ? '' : 's'}
                       {p.serviceCount > 0 && ` · ${p.running} online`}
                       {p.environments > 0 && ` · ${p.environments + 1} environments`}
+                      {remoteServers(p).length > 0 && ` · on ${remoteServers(p).map((s) => s.name).join(', ')}`}
                     </div>
                   </div>
                   <Icon name="arrowRight" size={16} className="project-arrow" />

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ProjectMark } from '../components/ProjectMark.tsx';
 import { useStore, loadProject, store } from '../lib/store.ts';
 import { navigate, projectPath } from '../lib/router.ts';
 import { api } from '../lib/api.ts';
@@ -306,7 +307,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
 
       <div className="canvas-topleft">
         <div className="project-chip glass">
-          <span className="crumb-dot" style={{ background: state.project.color }} />
+          <ProjectMark project={state.project} size={18} />
           <span className="project-chip-name">{state.project.name}</span>
           <span className="faint mono" style={{ fontSize: 11 }}>
             {services.length} svc

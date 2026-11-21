@@ -219,6 +219,8 @@ export interface Project {
   name: string;
   slug: string;
   color: string;
+  /** Optional icon shown with the color: 'i:<line icon>', 'b:<brand logo>' or 'e:<emoji>'. */
+  icon?: string | null;
   /** Set on environments: the base ("production") project this one belongs to. */
   parentId?: string | null;
   /** Environment name; the base project is "production". */
