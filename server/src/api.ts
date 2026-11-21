@@ -23,7 +23,7 @@ import { HttpError } from './util.ts';
 import { config } from './config.ts';
 import { docker, dockerTarget } from './docker.ts';
 import { autostartStatus, enableAutostart, disableAutostart } from './autostart.ts';
-import { dockerForContainer, listServers, addServer, renameServer, rotateServerToken, removeServer } from './nodes.ts';
+import { dockerForContainer, listServers, addServer, renameServer, rotateServerToken, upgradeAgent, removeServer } from './nodes.ts';
 import { readDeploymentLog } from './deployer.ts';
 import type { ServerEvent } from './types.ts';
 import { Readable } from 'node:stream';
@@ -343,6 +343,7 @@ api.patch('/servers/:id', async (c) => {
   return c.json(renameServer(actor(c), c.req.param('id'), name ?? ''));
 });
 api.post('/servers/:id/token', async (c) => c.json(await rotateServerToken(actor(c), c.req.param('id'))));
+api.post('/servers/:id/agent/upgrade', async (c) => c.json(await upgradeAgent(actor(c), c.req.param('id'))));
 api.delete('/servers/:id', async (c) => {
   await removeServer(actor(c), c.req.param('id'));
   return c.json({ ok: true });

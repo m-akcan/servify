@@ -35,6 +35,8 @@ const STREAM_TIMEOUT_MS = 10_000;
 const DEAD_AFTER_MS = 35_000;
 const OFFLINE_NOTICE_AFTER_MS = 60_000;
 export const AGENT_SCRIPT = resolve(import.meta.dirname, '../bin/agent.mjs');
+/** The agent version this Servify ships (agents report theirs in hello). */
+export const AGENT_VERSION = /const VERSION = '([^']+)'/.exec(readFileSync(AGENT_SCRIPT, 'utf8'))?.[1] ?? '0';
 
 type Pending = { resolve: (s: Duplex) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
 type Forward = { server: net.Server; port: number };
@@ -481,11 +483,54 @@ export function publicServer(n: ServerNode | null): PublicServer {
     replicas,
     // Remote figures older than a minute are stale (an old agent, or a dropped connection).
     stats: !n ? localHostStats() : c?.ready && c.stats && Date.now() - c.stats.at < 60_000 ? c.stats : null,
+    agentOutdated: !!n && !!n.info?.agentVersion && n.info.agentVersion !== AGENT_VERSION,
   };
 }
 
 export function listServers(): PublicServer[] {
   return [publicServer(null), ...nodesTable.all().sort((a, b) => a.createdAt - b.createdAt).map(publicServer)];
+}
+
+/**
+ * Update a server's agent in place, through that server's own Docker: write the verified current script into the
+ * agent's container and restart it (the container keeps the file, its start command runs whatever /agent.mjs holds).
+ * Only agents started with the join command's `docker run` can be updated this way.
+ */
+export async function upgradeAgent(actor: Actor, nodeId: string) {
+  const node = nodesTable.get(nodeId);
+  assert(node, 404, 'server not found');
+  const c = conns.get(nodeId);
+  assert(c?.ready && c.client, 409, `${node.name} is offline`);
+  const from = node.info?.agentVersion || 'unknown';
+  if (from === AGENT_VERSION) return { server: publicServer(node), upgraded: false, version: AGENT_VERSION };
+  const d = c.client;
+  const running = (await d.listContainers([], false)).filter((x) => x.State === 'running');
+  let agent = running.find((x) => x.Names.includes('/servify-agent'));
+  if (!agent) {
+    for (const x of running) {
+      const cmd = ((await d.inspectContainer(x.Id).catch(() => null))?.Config?.Cmd ?? []).join(' ');
+      if (cmd.includes('/agent.mjs') && cmd.includes('--join')) {
+        agent = x;
+        break;
+      }
+    }
+  }
+  assert(agent, 409, `no agent container on ${node.name}: this agent runs outside Docker — update it by running the join command again`);
+  const url = `https://${guessAddress()}:${config.agentPort}`;
+  const hash = hashBytes(readFileSync(AGENT_SCRIPT));
+  const r = await d.exec(agent.Id, ['sh', '-c', `wget -q --no-check-certificate -O /tmp/agent.new ${url}/agent.mjs && echo "${hash}  /tmp/agent.new" | sha256sum -c -s && mv /tmp/agent.new /agent.mjs && echo installed`], 60_000);
+  assert(r.exitCode === 0 && r.output.includes('installed'), 502, `could not install the new agent on ${node.name}: ${r.output.trim().slice(-200) || `exit ${r.exitCode}`}`);
+  // The restart cuts this very connection, so its answer never arrives; Docker carries it out regardless.
+  await d.restartContainer(agent.Id, 2).catch(() => {});
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((res) => setTimeout(res, 1000));
+    if (conns.get(nodeId)?.ready && nodesTable.get(nodeId)?.info?.agentVersion === AGENT_VERSION) {
+      recordActivity(actor, 'server.agent', `Updated the agent on ${node.name} from ${from} to ${AGENT_VERSION}`);
+      return { server: publicServer(nodesTable.get(nodeId)!), upgraded: true, version: AGENT_VERSION };
+    }
+  }
+  throw new HttpError(504, `the new agent is installed on ${node.name} but hasn't reconnected within a minute — check the servify-agent container there`);
 }
 
 export async function addServer(actor: Actor, name: string) {

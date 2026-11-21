@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { upgradeAgent } from '../lib/agent.ts';
 import { api } from '../lib/api.ts';
 import type { PublicServer, ServerCreated } from '../lib/types.ts';
 import { Button, Badge, Modal, Segmented, CopyButton, toast, toastError, confirmDialog, openMenuAt } from '../components/ui.tsx';
@@ -60,6 +61,13 @@ export function ServersView() {
     }
   };
 
+  const [upgrading, setUpgrading] = useState<string | null>(null);
+  const upgrade = async (s: PublicServer) => {
+    setUpgrading(s.id);
+    await upgradeAgent(s);
+    setUpgrading(null);
+    void load();
+  };
   const rotate = async (s: PublicServer) => {
     const yes = await confirmDialog({ title: `New token for ${s.name}?`, body: 'The current token stops working and the agent disconnects. Run the new command on the server to reconnect it.', confirm: 'New token' });
     if (!yes) return;
@@ -136,7 +144,7 @@ export function ServersView() {
                   {s.local
                     ? 'Servify itself runs here'
                     : s.info
-                      ? [s.info.hostname, s.info.address, `docker ${s.info.dockerVersion}`, s.info.cpus ? `${s.info.cpus} CPU` : '', s.info.memBytes ? bytes(s.info.memBytes) : ''].filter(Boolean).join('  ·  ')
+                      ? [s.info.hostname, s.info.address, `docker ${s.info.dockerVersion}`, s.info.cpus ? `${s.info.cpus} CPU` : '', s.info.memBytes ? bytes(s.info.memBytes) : '', s.info.agentVersion ? `agent ${s.info.agentVersion}` : ''].filter(Boolean).join('  ·  ')
                       : 'Run the join command on the server'}
                   {!s.local && s.status === 'offline' && s.lastSeenAt ? `  ·  last seen ${timeAgo(s.lastSeenAt)}` : ''}
                   {!s.local && s.status === 'online' && s.connectedAt ? `  ·  connected ${timeAgo(s.connectedAt)}` : ''}
@@ -150,6 +158,11 @@ export function ServersView() {
                   <b>{s.replicas}</b> container{s.replicas === 1 ? '' : 's'}
                 </span>
               </div>
+              {!s.local && s.agentOutdated && s.status === 'online' && (
+                <Button size="sm" icon="refresh" loading={upgrading === s.id} onClick={() => void upgrade(s)}>
+                  Update agent
+                </Button>
+              )}
               {!s.local && (
                 <button
                   className="btn btn-ghost btn-sm btn-icon"
@@ -159,6 +172,7 @@ export function ServersView() {
                       e.currentTarget,
                       [
                         { label: 'Rename', icon: 'edit', onSelect: () => (setNewName(s.name), setRenaming(s)) },
+                        ...(s.agentOutdated && s.status === 'online' ? [{ label: 'Update agent', icon: 'refresh', onSelect: () => void upgrade(s) }] : []),
                         { label: 'New token & join command', icon: 'key', onSelect: () => void rotate(s) },
                         { type: 'sep' },
                         { label: 'Remove server', icon: 'trash', danger: true, onSelect: () => void remove(s) },

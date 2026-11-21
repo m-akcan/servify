@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { api } from '../lib/api.ts';
 import { mem } from '../lib/format.ts';
 import { Icon } from './Icon.tsx';
+import { Button } from './ui.tsx';
+import { upgradeAgent } from '../lib/agent.ts';
 import type { Overview, SystemInfo } from '../lib/types.ts';
 
 const GB = 1024 ** 3;
@@ -30,6 +32,8 @@ function Meter({ label, pct, value, hint }: { label: string; pct: number | null;
 /** Live usage of every server and of Servify itself, refreshed every 10 s while the page is visible. */
 export function OverviewPanel({ system }: { system: SystemInfo | null }) {
   const [data, setData] = useState<Overview | null>(null);
+  const [upgrading, setUpgrading] = useState<string | null>(null);
+  const refresh = () => api.get<Overview>('/overview').then(setData).catch(() => {});
   useEffect(() => {
     let alive = true;
     const load = () => {
@@ -74,7 +78,28 @@ export function OverviewPanel({ system }: { system: SystemInfo | null }) {
               </div>
             ) : (
               <div className="ov-note faint">
-                {srv.status !== 'online' ? 'Offline — no live figures.' : 'No live figures yet: this agent is older than 0.2. To update it: Servers → ⋯ → New token & join command, then on that server run docker rm -f servify-agent and the new command.'}
+                {srv.status !== 'online' ? (
+                  'Offline — no live figures.'
+                ) : srv.agentOutdated ? (
+                  <>
+                    <span>No live figures: its agent ({srv.info?.agentVersion}) is older than this Servify's.</span>
+                    <Button
+                      size="sm"
+                      icon="refresh"
+                      loading={upgrading === srv.id}
+                      onClick={async () => {
+                        setUpgrading(srv.id);
+                        await upgradeAgent(srv);
+                        setUpgrading(null);
+                        void refresh();
+                      }}
+                    >
+                      Update agent
+                    </Button>
+                  </>
+                ) : (
+                  'Waiting for the first figures…'
+                )}
               </div>
             )}
             <div className="ov-foot faint">

@@ -440,6 +440,8 @@ export interface PublicServer {
   replicas: number;
   /** Live usage, when the server reports it (this machine always; agents from 0.2.0). */
   stats?: HostStats | null;
+  /** Its agent is older than the one this Servify ships (it can be updated in place). */
+  agentOutdated?: boolean;
 }
 
 /** Live usage of a machine. */
