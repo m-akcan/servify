@@ -19,6 +19,8 @@ export type {
   Protocol,
   PublicServer,
   ServerInfo,
+  HostStats,
+  Overview,
 } from '../../../server/src/types.ts';
 
 import type { Service, Project, Deployment, Replica, VolumeRecord, PublicServer } from '../../../server/src/types.ts';

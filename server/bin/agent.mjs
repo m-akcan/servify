@@ -14,9 +14,34 @@
 import tls from 'node:tls';
 import net from 'node:net';
 import os from 'node:os';
+import { readFileSync, statfsSync } from 'node:fs';
 import http from 'node:http';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
+
+// Live usage of this machine for Servify's overview (same fields as server/src/hoststats.ts). Inside the agent's
+// container /proc/meminfo and the CPU counters are the host's; the disk is the one Docker stores containers on.
+const cpuTimes = () => os.cpus().reduce((a, c) => ({ idle: a.idle + c.times.idle, total: a.total + c.times.user + c.times.nice + c.times.sys + c.times.idle + c.times.irq }), { idle: 0, total: 0 });
+let prevCpu = cpuTimes();
+function hostStats() {
+  const cpu = cpuTimes();
+  const dTotal = cpu.total - prevCpu.total;
+  const cpuPct = dTotal > 0 ? Math.round((1 - (cpu.idle - prevCpu.idle) / dTotal) * 1000) / 10 : null;
+  prevCpu = cpu;
+  let memAvailable = os.freemem();
+  try {
+    const m = /^MemAvailable:\s+(\d+)\s+kB/m.exec(readFileSync('/proc/meminfo', 'utf8'));
+    if (m) memAvailable = Number(m[1]) * 1024;
+  } catch {}
+  let diskTotal = null;
+  let diskFree = null;
+  try {
+    const s = statfsSync('/');
+    diskTotal = s.blocks * s.bsize;
+    diskFree = s.bavail * s.bsize;
+  } catch {}
+  return { cpuPct, load: os.loadavg().map((n) => Math.round(n * 100) / 100), memTotal: os.totalmem(), memAvailable, diskTotal, diskFree, uptimeSec: Math.round(os.uptime()) };
+}
 const args = process.argv.slice(2);
 const opt = (name, env) => {
   const i = args.indexOf(`--${name}`);
@@ -174,6 +199,9 @@ async function run() {
         control.on('end', () => control.destroy());
         let last = Date.now();
         control.on('data', () => (last = Date.now()));
+        const stats = setInterval(() => control.write(JSON.stringify({ t: 'stats', stats: hostStats() }) + '\n'), 15_000);
+        setTimeout(() => control.writable && control.write(JSON.stringify({ t: 'stats', stats: hostStats() }) + '\n'), 2000);
+        control.on('close', () => clearInterval(stats));
         const watchdog = setInterval(() => {
           if (Date.now() - last > 40_000) control.destroy();
         }, 5000);

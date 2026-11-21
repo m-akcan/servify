@@ -438,4 +438,43 @@ export interface PublicServer {
   info: ServerInfo | null;
   services: number;
   replicas: number;
+  /** Live usage, when the server reports it (this machine always; agents from 0.2.0). */
+  stats?: HostStats | null;
+}
+
+/** Live usage of a machine. */
+export interface HostStats {
+  /** Busy share of all CPUs since the previous sample, 0–100 (null until two samples exist). */
+  cpuPct: number | null;
+  load: [number, number, number];
+  memTotal: number;
+  memAvailable: number;
+  diskTotal: number | null;
+  diskFree: number | null;
+  uptimeSec: number;
+  at: number;
+}
+
+/** The projects page's overview: every server's usage and Servify's own. */
+export interface Overview {
+  servers: (PublicServer & {
+    containers: { running: number; total: number } | null;
+    /** What Servify's own containers on this server use right now. */
+    managed: { cpuPct: number; memMb: number };
+    os: string | null;
+    dockerVersion: string | null;
+  })[];
+  servify: {
+    version: string;
+    uptimeSec: number;
+    cpuPct: number;
+    rssBytes: number;
+    projects: number;
+    services: number;
+    replicas: number;
+    rps: number;
+    errorsPerSec: number;
+    certificates: { total: number; expiringSoon: number };
+    backups24h: { succeeded: number; failed: number };
+  };
 }

@@ -27,7 +27,8 @@ import { config } from './config.ts';
 import { recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
 import { id as newId, secret, sha256, now, HttpError, assert, sleep } from './util.ts';
-import type { ServerNode, ServerInfo, PublicServer } from './types.ts';
+import type { ServerNode, ServerInfo, PublicServer, HostStats } from './types.ts';
+import { localHostStats } from './hoststats.ts';
 
 export const LOCAL = 'local';
 const STREAM_TIMEOUT_MS = 10_000;
@@ -48,6 +49,8 @@ type Conn = {
   sockServer: net.Server | null;
   client: DockerClient | null;
   forwards: Map<number, Promise<Forward>>;
+  /** Live usage the agent reports every 15 s (agents from 0.2.0). */
+  stats?: HostStats;
 };
 
 const conns = new Map<string, Conn>();
@@ -255,6 +258,7 @@ function attachControl(node: ServerNode, socket: Duplex, address: string | null)
         continue;
       }
       if (msg.t === 'hello') void onHello(c, msg.info ?? {}, address);
+      else if (msg.t === 'stats' && msg.stats && typeof msg.stats === 'object') c.stats = cleanStats(msg.stats);
       else if (msg.t === 'fail' && typeof msg.id === 'string') {
         const p = c.pending.get(msg.id);
         if (p) {
@@ -452,6 +456,13 @@ async function joinCommand(token: string) {
 
 const hashBytes = (b: Buffer) => createHash('sha256').update(b).digest('hex');
 
+const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+/** Agent-reported numbers, kept only if they are numbers. */
+function cleanStats(raw: any): HostStats {
+  const load = Array.isArray(raw.load) ? raw.load.slice(0, 3).map((v: unknown) => num(v) ?? 0) : [0, 0, 0];
+  return { cpuPct: num(raw.cpuPct), load: [load[0] ?? 0, load[1] ?? 0, load[2] ?? 0], memTotal: num(raw.memTotal) ?? 0, memAvailable: num(raw.memAvailable) ?? 0, diskTotal: num(raw.diskTotal), diskFree: num(raw.diskFree), uptimeSec: num(raw.uptimeSec) ?? 0, at: Date.now() };
+}
+
 export function publicServer(n: ServerNode | null): PublicServer {
   const nodeId = n?.id ?? LOCAL;
   const services = servicesTable.all().filter((s) => nodeOf(s) === nodeId).length;
@@ -468,6 +479,8 @@ export function publicServer(n: ServerNode | null): PublicServer {
     info: n?.info ?? null,
     services,
     replicas,
+    // Remote figures older than a minute are stale (an old agent, or a dropped connection).
+    stats: !n ? localHostStats() : c?.ready && c.stats && Date.now() - c.stats.at < 60_000 ? c.stats : null,
   };
 }
 

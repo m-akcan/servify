@@ -1,4 +1,5 @@
 import { Hono, type Context } from 'hono';
+import { overview } from './overview.ts';
 import { streamSSE } from 'hono/streaming';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { ZodError } from 'zod';
@@ -332,6 +333,7 @@ api.get('/backups/:id/download', async (c) => {
 });
 // ─── servers ───
 api.get('/servers', (c) => c.json(listServers()));
+api.get('/overview', async (c) => c.json(await overview()));
 api.post('/servers', async (c) => {
   const { name } = await jsonBody<{ name: string }>(c);
   return c.json(await addServer(actor(c), name ?? ''), 201);

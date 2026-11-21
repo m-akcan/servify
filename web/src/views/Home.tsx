@@ -6,6 +6,7 @@ import { Button, Modal, toastError, toast, Empty, Switch, Field } from '../compo
 import { Icon, BrandMark, ServiceGlyph } from '../components/Icon.tsx';
 import { serviceTone, timeAgo } from '../lib/format.ts';
 import { ProjectMark } from '../components/ProjectMark.tsx';
+import { OverviewPanel } from '../components/Overview.tsx';
 import type { Project, ProjectListItem } from '../lib/types.ts';
 
 type ProjectsView = 'grid' | 'list';
@@ -479,36 +480,7 @@ export function Home() {
           </div>
         </div>
 
-        {system && (
-          <div className="sys-strip rise-in" style={{ animationDelay: '60ms' }}>
-            <div className="sys-item">
-              <span className={`sys-dot ${system.docker.ok ? 'ok' : 'err'}`} />
-              <span className="label">Docker</span>
-              <span className="mono">{system.docker.ok ? `${system.docker.version} · ${system.docker.os}` : 'unreachable'}</span>
-            </div>
-            {system.docker.ok && (
-              <>
-                <div className="sys-item">
-                  <Icon name="cpu" size={13} />
-                  <span className="mono">{system.docker.cpus} CPU</span>
-                </div>
-                <div className="sys-item">
-                  <Icon name="memory" size={13} />
-                  <span className="mono">{system.docker.memGb} GB</span>
-                </div>
-              </>
-            )}
-            <div className="sys-item">
-              <Icon name="globe" size={13} />
-              <span className="mono">*.{system.proxy.baseDomain}:{system.proxy.port}</span>
-            </div>
-            <div className="spacer" />
-            <div className="sys-item faint">
-              <Icon name="lock" size={12} />
-              <span>Local-only · {system.api.host}</span>
-            </div>
-          </div>
-        )}
+        <OverviewPanel system={system} />
 
         {showTools && (
           <div className="project-tools rise-in" style={{ animationDelay: '70ms' }}>

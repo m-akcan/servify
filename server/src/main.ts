@@ -1,4 +1,5 @@
 import { serve } from '@hono/node-server';
+import { startHostStats } from './hoststats.ts';
 import { Hono } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { readFile, stat } from 'node:fs/promises';
@@ -125,6 +126,7 @@ async function main() {
   const proxyPort = await startProxy();
   await startEngine();
   startMetrics();
+  startHostStats();
   startBackgroundJobs();
   startScheduler();
   startCertificates();
