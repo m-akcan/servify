@@ -951,6 +951,65 @@ export async function updateServiceImage(actor: Actor, serviceId: string, tag?: 
 }
 
 /**
+ * The variables a service gets to use another one: the template's connection variables (DATABASE_URL for Postgres,
+ * AMQP_URL for RabbitMQ…), else the provider's own *_URL variables. Names the consumer already uses get the
+ * provider's name as a prefix (POSTGRES_DATABASE_URL), so nothing is overwritten.
+ */
+export function connectionVariables(provider: Service, consumerEnv: Record<string, string>): Record<string, string> {
+  const tpl = provider.templateId ? getTemplate(provider.templateId) : null;
+  const ref = (k: string) => `\${{ ${provider.slug}.${k} }}`;
+  const pairs: [string, string][] = tpl?.connect
+    ? Object.entries(tpl.connect).map(([k, v]) => [k, v.includes('${{') ? v.replaceAll('{svc}', provider.slug) : ref(v)])
+    : Object.keys(provider.env)
+        .filter((k) => /_URL$/.test(k) && !/PUBLIC/.test(k))
+        .map((k) => [k, ref(k)]);
+  const prefix = provider.slug.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  if (!pairs.length) pairs.push([`${prefix}_HOST`, ref('SERVIFY_PRIVATE_DOMAIN')]); // nothing better known: its private name
+  const out: Record<string, string> = {};
+  for (const [k, v] of pairs) out[k in consumerEnv && consumerEnv[k] !== v ? `${prefix}_${k}` : k] = v;
+  return out;
+}
+
+/**
+ * Create a service from a template next to an app and connect the app to it (a drop of the app's ⊕ on empty canvas):
+ * the app gets the connection variables, and once the new service runs the app is redeployed to pick them up.
+ */
+export async function addAndConnect(actor: Actor, fromId: string, raw: { templateId?: string; x?: number; y?: number }) {
+  const from = getServiceOrThrow(fromId);
+  const tpl = raw.templateId ? getTemplate(raw.templateId) : null;
+  assert(tpl?.connect, 400, 'pick a template that apps can connect to (a database, cache, queue or storage)');
+  assert(from.source.type !== 'external' && from.source.type !== 'redirect', 400, `${from.name} doesn't run anything that could use it`);
+  const made = await createService(actor, from.projectId, { templateId: tpl!.id, x: raw.x, y: raw.y });
+  const provider = servicesTable.get(made.service.id)!;
+  const vars = connectionVariables(provider, getServiceOrThrow(from.id).env);
+  setVariables(actor, from.id, vars);
+  const redeploy = !!from.activeDeploymentId && !from.stopped;
+  if (redeploy) {
+    // Deploy the app once the new service is up, so it doesn't start against a database that isn't there yet.
+    const done = (why?: string) => {
+      off();
+      clearTimeout(timer);
+      if (why) {
+        recordActivity(actor, 'service.updated', `${provider.name} isn't running (${why}): deploy ${from.name} yourself to use it`, from.projectId, from.id);
+        return;
+      }
+      const fresh = servicesTable.get(from.id);
+      if (fresh && !fresh.stopped) queueDeployment(fresh, 'config', actor);
+    };
+    const off = bus.subscribe((ev) => {
+      if (ev.type === 'service.updated' && ev.service.id === provider.id) {
+        if (ev.service.status === 'running') done();
+        else if (ev.service.status === 'failed' || ev.service.status === 'crashed') done(ev.service.status);
+      }
+    });
+    const timer = setTimeout(() => done('it took longer than 10 minutes'), 10 * 60_000);
+    timer.unref?.();
+  }
+  recordActivity(actor, 'service.updated', `Added ${provider.name} and connected ${from.name} to it (${Object.keys(vars).join(', ')})`, from.projectId, from.id);
+  return { service: serializeService(provider), deployment: made.deployment, variables: vars, redeploys: redeploy };
+}
+
+/**
  * Point a service at a registry image without redeploying: for a copy that runs under a local name (a pinned or
  * migrated image), so update checks can follow the registry. Allowed only when the running image provably came from
  * that repository (Docker recorded its digest when it was pulled) and the tag resolves to exactly that image. With

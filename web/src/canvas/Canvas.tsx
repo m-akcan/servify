@@ -9,7 +9,8 @@ import { DetachedVolumeNode } from './VolumeNodes.tsx';
 import { groupVolumes, type VolumeGroup } from '../lib/volumes.tsx';
 import type { VolumeRecord } from '../lib/types.ts';
 import type { ProjectState } from '../lib/store.ts';
-import { latestDeployment } from '../lib/store.ts';
+import { latestDeployment, useStore } from '../lib/store.ts';
+import { connectHint } from '../lib/connect.ts';
 import { Icon } from '../components/Icon.tsx';
 import { Tooltip } from '../components/ui.tsx';
 
@@ -31,11 +32,13 @@ type Props = {
   onCanvasMenu: (world: Pt, x: number, y: number) => void;
   onMoved: (id: string, x: number, y: number, fromX: number, fromY: number) => void;
   onConnect: (from: string, to: string, x: number, y: number) => void;
+  /** A ⊕ dropped on empty canvas: offer what fits there (see lib/connect.ts). */
+  onConnectEmpty?: (from: string, world: Pt, x: number, y: number) => void;
 };
 
 const camKey = (pid: string) => `servify.cam.${pid}`;
 
-export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, selectedId, panelWidth, onSelect, onCreateAt, onNodeMenu, onCanvasMenu, onMoved, onConnect }, handle) {
+export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, selectedId, panelWidth, onSelect, onCreateAt, onNodeMenu, onCanvasMenu, onMoved, onConnect, onConnectEmpty }, handle) {
   const rootRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -359,13 +362,17 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
     const up = (ev: PointerEvent) => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
-      const target = hit(toWorld(ev.clientX, ev.clientY));
+      const p = toWorld(ev.clientX, ev.clientY);
+      const target = hit(p);
       setDraft(null);
       if (target) onConnect(id, target, ev.clientX, ev.clientY);
+      // On empty canvas, away from the start (a click on the ⊕ isn't a drop).
+      else if (onConnectEmpty && Math.hypot(p.x - start.x, p.y - start.y) > 40) onConnectEmpty(id, p, ev.clientX, ev.clientY);
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
-  }, [onConnect]);
+  }, [onConnect, onConnectEmpty]);
+  const templates = useStore((s) => s.templates);
   const focusNode = useCallback((id: string) => {
     const r = registry.rects.get(id);
     if (!r) return;
@@ -446,6 +453,11 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas({ state, s
       <Particles edges={edges} getCamera={getCamera} subscribeCamera={subscribeCamera} />
       <div className="world" ref={worldRef}>
         <EdgesLayer edges={edges} highlight={selectedId} draft={draft} />
+        {draft && state.services[draft.from] && (
+          <div className="connect-hint" style={{ transform: `translate3d(${draft.x + 16}px, ${draft.y + 14}px, 0)` }}>
+            {connectHint(state.services[draft.from], draft.over ? state.services[draft.over] ?? null : null, templates)}
+          </div>
+        )}
         <IngressNode services={services} proxyPort={state.proxyPort} visible={hasIngress} />
         {ghosts.map((s) => (
           <div key={`ghost-${s.id}`} className="node-ghost" style={{ transform: `translate3d(${s.x}px, ${s.y}px, 0)` }}>

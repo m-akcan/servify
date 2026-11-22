@@ -5,8 +5,12 @@ import { navigate, projectPath } from '../lib/router.ts';
 import { api } from '../lib/api.ts';
 import { Canvas, type CanvasHandle } from '../canvas/Canvas.tsx';
 import { ServicePanel } from '../panels/ServicePanel.tsx';
-import { NewServiceModal } from './NewService.tsx';
-import { Button, openMenu, toastError, Tooltip, Kbd, Empty } from '../components/ui.tsx';
+import { NewServiceModal, type Kind } from './NewService.tsx';
+import { isProvider, connectableTemplates, connectionVariables } from '../lib/connect.ts';
+import { loadTemplates } from '../lib/store.ts';
+import type { IconName } from '../components/Icon.tsx';
+import type { Template } from '../lib/types.ts';
+import { Button, openMenu, toastError, toast, Tooltip, Kbd, Empty } from '../components/ui.tsx';
 import { VolumeDialogHost, openVolumeDialog } from '../lib/volumes.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { serviceMenu, deploy, remove, connectServices } from '../lib/actions.ts';
@@ -22,7 +26,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
   const current = useStore((s) => s.current);
   const loading = useStore((s) => s.loadingProject);
   const [error, setError] = useState<string | null>(null);
-  const [creating, setCreating] = useState<{ at: Pt | null } | null>(null);
+  const [creating, setCreating] = useState<{ at: Pt | null; kind?: Kind | null; uses?: { name: string; env: Record<string, string> } } | null>(null);
   const [activityOpen, setActivityOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const canvasRef = useRef<CanvasHandle>(null);
@@ -98,27 +102,98 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
     [select],
   );
 
+  const templatesNow = async () => {
+    if (!store.get().templates.length) await loadTemplates().catch(() => {});
+    return store.get().templates;
+  };
+
+  // A ⊕ dropped on another service: "from uses to". The best match first, connected and deployed in one click.
   const onConnect = useCallback((fromId: string, toId: string, x: number, y: number) => {
-    const st = store.get().current;
-    const from = st?.services[fromId];
-    const to = st?.services[toId];
-    if (!from || !to) return;
-    const keys = Object.keys(to.env).filter((k) => !to.secretKeys.includes(k) || /URL$/.test(k));
-    const urlKeys = Object.keys(to.env).filter((k) => /URL$/.test(k));
-    const ordered = [...new Set([...urlKeys, ...keys])].slice(0, 8);
-    const prefix = to.slug.toUpperCase().replace(/[^A-Z0-9]/g, '_');
-    const ref = (k: string) => `\${{ ${to.slug}.${k} }}`;
-    openMenu(x, y, [
-      { type: 'label', label: `Reference ${to.name} from ${from.name}` },
-      ...ordered.map((k) => ({
-        label: k,
-        icon: (/URL$/.test(k) ? 'link' : 'braces') as any,
-        onSelect: () => void connectServices(from, to, k in from.env ? `${prefix}_${k}` : k, ref(k)),
-      })),
-      ...(ordered.length ? [{ type: 'sep' as const }] : []),
-      { label: 'Private hostname', icon: 'shield', onSelect: () => void connectServices(from, to, `${prefix}_HOST`, ref('SERVIFY_PRIVATE_DOMAIN')) },
-      ...(to.protocol === 'http' ? [{ label: 'Internal URL', icon: 'globe' as const, onSelect: () => void connectServices(from, to, `${prefix}_URL`, `http://${ref('SERVIFY_PRIVATE_DOMAIN')}:${ref('PORT')}`) }] : []),
-    ]);
+    void (async () => {
+      const templates = await templatesNow();
+      const st = store.get().current;
+      const from = st?.services[fromId];
+      const to = st?.services[toId];
+      if (!from || !to) return;
+      const best = connectionVariables(to, templates, from.env);
+      const bestKeys = Object.keys(best);
+      const keys = Object.keys(to.env).filter((k) => !to.secretKeys.includes(k) || /URL$/.test(k));
+      const urlKeys = Object.keys(to.env).filter((k) => /URL$/.test(k));
+      const ordered = [...new Set([...urlKeys, ...keys])].filter((k) => !bestKeys.includes(k)).slice(0, 8);
+      const prefix = to.slug.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+      const ref = (k: string) => `\${{ ${to.slug}.${k} }}`;
+      const connectAll = async (andDeploy: boolean) => {
+        try {
+          await api.put(`/services/${from.id}/variables`, { variables: best });
+          if (andDeploy) {
+            await api.post(`/services/${from.id}/deploy`);
+            toast({ title: `Connected ${from.name} → ${to.name}`, body: `${bestKeys.join(', ')} · deploying ${from.name}`, tone: 'build' });
+          } else toast({ title: `Connected ${from.name} → ${to.name}`, body: bestKeys.join(', '), tone: 'ok' });
+        } catch (e) {
+          toastError(e, 'Could not connect');
+        }
+      };
+      const deployed = !!from.activeDeploymentId;
+      openMenu(x, y, [
+        { type: 'label', label: `${from.name} uses ${to.name}` },
+        { label: deployed ? `${bestKeys.join(', ')} · and deploy` : bestKeys.join(', '), icon: 'link', onSelect: () => void connectAll(deployed) },
+        ...(ordered.length ? [{ type: 'sep' as const }, { type: 'label' as const, label: 'Or just one variable' }] : []),
+        ...ordered.map((k) => ({
+          label: k,
+          icon: (/URL$/.test(k) ? 'link' : 'braces') as IconName,
+          onSelect: () => void connectServices(from, to, k in from.env ? `${prefix}_${k}` : k, ref(k)),
+        })),
+        { type: 'sep' },
+        { label: 'Private hostname', icon: 'shield', onSelect: () => void connectServices(from, to, `${prefix}_HOST`, ref('SERVIFY_PRIVATE_DOMAIN')) },
+        ...(to.protocol === 'http' ? [{ label: 'Internal URL', icon: 'globe' as const, onSelect: () => void connectServices(from, to, `${prefix}_URL`, `http://${ref('SERVIFY_PRIVATE_DOMAIN')}:${ref('PORT')}`) }] : []),
+      ]);
+    })();
+  }, []);
+
+  // A ⊕ dropped on empty canvas: from an app, add a database/cache/queue it uses; from one of those, add a service that uses it.
+  const onConnectEmpty = useCallback((fromId: string, world: Pt, x: number, y: number) => {
+    void (async () => {
+      const templates = await templatesNow();
+      const from = store.get().current?.services[fromId];
+      if (!from) return;
+      const at = { x: world.x - 120, y: world.y - 40 };
+      if (isProvider(from, templates)) {
+        const uses = { name: from.name, env: connectionVariables(from, templates) };
+        const open = (kind: Kind | null) => setCreating({ at, kind, uses });
+        openMenu(x, y, [
+          { type: 'label', label: `New service that uses ${from.name}` },
+          { label: 'From a Git repository…', icon: 'github', onSelect: () => open('git') },
+          { label: 'From a Docker image…', icon: 'box', onSelect: () => open('image') },
+          { label: 'From a local folder…', icon: 'folder', onSelect: () => open('local') },
+          { label: 'From a template…', icon: 'template', onSelect: () => open('template') },
+        ]);
+        return;
+      }
+      const add = async (t: Template) => {
+        try {
+          const r = await api.post<{ service: { id: string; name: string }; variables: Record<string, string>; redeploys: boolean }>(`/services/${from.id}/add-connected`, {
+            templateId: t.id,
+            x: Math.round(at.x / 20) * 20,
+            y: Math.round(at.y / 20) * 20,
+          });
+          toast({
+            title: `Added ${r.service.name} for ${from.name}`,
+            body: `${from.name} gets ${Object.keys(r.variables).join(', ')}${r.redeploys ? ` and redeploys once ${r.service.name} is up` : ''}`,
+            tone: 'build',
+          });
+          setTimeout(() => canvasRef.current?.focus(r.service.id), 150);
+        } catch (e) {
+          toastError(e, `Could not add ${t.name}`);
+        }
+      };
+      const glyph = (t: Template): IconName => (['postgres', 'redis', 'mysql', 'mongo', 'bucket', 'spark'].includes(t.icon) ? (t.icon as IconName) : t.category === 'queue' ? 'send' : 'database');
+      openMenu(x, y, [
+        { type: 'label', label: `Add something ${from.name} uses` },
+        ...connectableTemplates(templates).map((t) => ({ label: t.name, icon: glyph(t), onSelect: () => void add(t) })),
+        { type: 'sep' },
+        { label: 'Another service…', icon: 'plus', onSelect: () => setCreating({ at }) },
+      ]);
+    })();
   }, []);
 
   const onCanvasMenu = useCallback((world: Pt, x: number, y: number) => {
@@ -267,6 +342,7 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         onCanvasMenu={onCanvasMenu}
         onMoved={onMoved}
         onConnect={onConnect}
+        onConnectEmpty={onConnectEmpty}
       />
 
       {empty && (
@@ -369,6 +445,8 @@ export function ProjectView({ slug, serviceSlug, tab }: { slug: string; serviceS
         onClose={() => setCreating(null)}
         projectId={state.project.id}
         at={creating?.at ?? null}
+        initialKind={creating?.kind ?? null}
+        uses={creating?.uses ?? null}
         getCenter={() => canvasRef.current?.centerWorld() ?? { x: 0, y: 0 }}
         onCreated={(id) => {
           setCreating(null);

@@ -367,6 +367,10 @@ api.post('/services/:id/upload', async (c) => {
   return c.json({ source: r.source, deployment: r.deployment ? ops.serializeDeployment(r.deployment) : null, skipped: r.skipped }, 201);
 });
 api.post('/services/:id/image-check', async (c) => c.json(await ops.checkServiceImage(c.req.param('id'))));
+api.post('/services/:id/add-connected', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(await ops.addAndConnect(actor(c), c.req.param('id'), { templateId: body?.templateId, x: typeof body?.x === 'number' ? body.x : undefined, y: typeof body?.y === 'number' ? body.y : undefined }), 201);
+});
 api.post('/services/:id/track-image', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   return c.json(await ops.trackServiceImage(actor(c), c.req.param('id'), body?.image, { allowMoved: body?.allowMoved === true }));

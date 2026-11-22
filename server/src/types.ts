@@ -394,6 +394,11 @@ export interface Template {
   /** Seconds a fresh replica may take to become healthy (a standby clone can take a while). */
   graceSec?: number;
   cluster?: Omit<import('./types.ts').ClusterConfig, 'primary'>;
+  /**
+   * What an app gets when it connects to a service made from this template: app variable → this template's variable
+   * (referenced as ${{ <service>.VAR }}), or a value with {svc} standing in for the service's name.
+   */
+  connect?: Record<string, string>;
 }
 
 export interface JobRun {

@@ -29,7 +29,7 @@ function freeSlotNear(c: Pt): Pt {
   return { x: ox, y: oy };
 }
 
-type Kind = 'git' | 'image' | 'local' | 'template' | 'external' | 'redirect';
+export type Kind = 'git' | 'image' | 'local' | 'template' | 'external' | 'redirect';
 
 const SOURCES: { kind: Kind; title: string; desc: string; icon: IconName }[] = [
   { kind: 'git', title: 'Git repository', desc: 'GitHub or any git URL. Dockerfile or zero-config build.', icon: 'github' },
@@ -49,6 +49,8 @@ export function NewServiceModal({
   at,
   getCenter,
   onCreated,
+  initialKind = null,
+  uses = null,
 }: {
   open: boolean;
   onClose: () => void;
@@ -56,6 +58,10 @@ export function NewServiceModal({
   at: Pt | null;
   getCenter: () => Pt;
   onCreated: (id: string) => void;
+  /** Open straight on a source (from a ⊕ dropped on the canvas). */
+  initialKind?: Kind | null;
+  /** The new service uses this one: these variables are set on it (see lib/connect.ts). */
+  uses?: { name: string; env: Record<string, string> } | null;
 }) {
   const [kind, setKind] = useState<Kind | null>(null);
   const [busy, setBusy] = useState(false);
@@ -73,7 +79,7 @@ export function NewServiceModal({
         .get<PublicServer[]>('/servers')
         .then(setServers)
         .catch(() => setServers([]));
-      setKind(null);
+      setKind(initialKind);
       setForm({ repo: '', branch: '', rootDir: '', image: '', path: '', name: '', port: '', replicas: 1, token: '', dockerfile: '', advanced: false, external: '', tcp: false, udp: false, redirect: '', keepPath: true });
     }
   }, [open]);
@@ -84,8 +90,9 @@ export function NewServiceModal({
     setBusy(true);
     try {
       const pos = at ?? freeSlotNear(getCenter());
-      const r = await api.post<{ service: { id: string; name: string } }>(`/projects/${projectId}/services`, { ...body, ...(server !== 'local' ? { server } : {}), x: Math.round(pos.x / 20) * 20, y: Math.round(pos.y / 20) * 20 });
-      toast({ title: `${r.service.name} created`, body: 'First deploy started', tone: 'build' });
+      const env = uses ? { ...((body.env as Record<string, string> | undefined) ?? {}), ...uses.env } : body.env;
+      const r = await api.post<{ service: { id: string; name: string } }>(`/projects/${projectId}/services`, { ...body, ...(env ? { env } : {}), ...(server !== 'local' ? { server } : {}), x: Math.round(pos.x / 20) * 20, y: Math.round(pos.y / 20) * 20 });
+      toast({ title: `${r.service.name} created`, body: uses ? `Connected to ${uses.name} · first deploy started` : 'First deploy started', tone: 'build' });
       onCreated(r.service.id);
     } catch (e) {
       toastError(e, 'Could not create service');
@@ -126,6 +133,14 @@ export function NewServiceModal({
           <Icon name="x" size={16} />
         </button>
       </div>
+      {uses && kind !== 'external' && kind !== 'redirect' && (
+        <div className="ns-uses row faint">
+          <Icon name="link" size={13} />
+          <span>
+            Uses <b>{uses.name}</b>: gets <code className="inline-code">{Object.keys(uses.env).join(', ')}</code>
+          </span>
+        </div>
+      )}
       {servers.length > 1 && kind !== 'external' && kind !== 'redirect' && (
         <div className="ns-server row">
           <Icon name="server" size={14} />

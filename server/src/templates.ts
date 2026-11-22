@@ -22,6 +22,7 @@ export const templates: Template[] = [
     },
     secretKeys: ['POSTGRES_PASSWORD', 'DATABASE_URL', 'DATABASE_PUBLIC_URL'],
     singleton: true,
+    connect: { DATABASE_URL: 'DATABASE_URL' },
   },
   {
     id: 'postgres-cluster',
@@ -61,6 +62,7 @@ export const templates: Template[] = [
       'fi',
       'exec docker-entrypoint.sh postgres -c listen_addresses="*" -c wal_keep_size=1GB -c max_wal_senders=16 -c hot_standby=on -c wal_log_hints=on',
     ].join('\n'),
+    connect: { DATABASE_URL: 'DATABASE_URL', DATABASE_READ_URL: 'DATABASE_READ_URL' },
   },
   {
     id: 'redis',
@@ -80,6 +82,7 @@ export const templates: Template[] = [
     secretKeys: ['REDIS_PASSWORD', 'REDIS_URL', 'REDIS_PUBLIC_URL'],
     singleton: true,
     startCommand: 'exec redis-server --requirepass "$REDIS_PASSWORD" --appendonly yes',
+    connect: { REDIS_URL: 'REDIS_URL' },
   },
   {
     id: 'mysql',
@@ -98,6 +101,7 @@ export const templates: Template[] = [
     },
     secretKeys: ['MYSQL_ROOT_PASSWORD', 'MYSQL_URL'],
     singleton: true,
+    connect: { DATABASE_URL: 'MYSQL_URL' },
   },
   {
     id: 'mongo',
@@ -116,6 +120,7 @@ export const templates: Template[] = [
     },
     secretKeys: ['MONGO_INITDB_ROOT_PASSWORD', 'MONGO_URL'],
     singleton: true,
+    connect: { MONGO_URL: 'MONGO_URL' },
   },
   {
     id: 'rabbitmq',
@@ -141,6 +146,7 @@ export const templates: Template[] = [
     },
     secretKeys: ['RABBITMQ_DEFAULT_PASS', 'AMQP_URL'],
     singleton: true,
+    connect: { AMQP_URL: 'AMQP_URL' },
   },
   {
     id: 'minio',
@@ -161,6 +167,7 @@ export const templates: Template[] = [
     singleton: true,
     startCommand: 'exec minio server /data --console-address :9001',
     healthPath: '/minio/health/live',
+    connect: { S3_ENDPOINT: 'S3_ENDPOINT', S3_ACCESS_KEY_ID: 'MINIO_ROOT_USER', S3_SECRET_ACCESS_KEY: 'MINIO_ROOT_PASSWORD' },
   },
   {
     id: 'whoami',
@@ -245,6 +252,7 @@ export const templates: Template[] = [
     env: {},
     secretKeys: [],
     singleton: true,
+    connect: { OLLAMA_URL: 'http://${{ {svc}.SERVIFY_PRIVATE_DOMAIN }}:11434' },
   },
 ];
 

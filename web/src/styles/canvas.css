@@ -788,3 +788,21 @@
     filter: blur(4px);
   }
 }
+
+/* What a dragged ⊕ will do, next to the pointer. */
+.connect-hint {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 30;
+  pointer-events: none;
+  white-space: nowrap;
+  padding: 5px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--signal-line);
+  background: var(--bg-2);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  animation: fade-in 160ms var(--ease-out);
+}
