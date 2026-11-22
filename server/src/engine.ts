@@ -465,6 +465,27 @@ function tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolea
   });
 }
 
+/** Any HTTP response to `GET /` counts (redirects, 401, 404, even 500): the server is up and speaking HTTP. */
+function httpAnswers(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    const req = http.get({ host, port, path: '/', timeout: timeoutMs, headers: { 'User-Agent': 'servify-health/1', Connection: 'close' } }, (res) => {
+      done(typeof res.statusCode === 'number');
+      res.destroy();
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      done(false);
+    });
+    req.on('error', () => done(false));
+  });
+}
+
 function httpProbe(host: string, port: number, path: string, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const req = http.get({ host, port, path, timeout: timeoutMs, headers: { 'User-Agent': 'servify-health/1' } }, (res) => {
@@ -489,6 +510,10 @@ async function probe(r: Runtime, svc: Service) {
       ok = !!r.startedAt && Date.now() - r.startedAt > 2500;
     } else if (protocol === 'http' && svc.healthcheck.path) {
       ok = await httpProbe(r.host, r.port, svc.healthcheck.path, svc.healthcheck.timeoutSec * 1000);
+    } else if (protocol === 'http') {
+      // No health path: the app must answer HTTP at all (any status). An open port isn't enough — during an
+      // upgrade (Nextcloud) or a slow start, something can accept connections before the app serves.
+      ok = await httpAnswers(r.host, r.port, Math.max(svc.healthcheck.timeoutSec * 1000, 10_000));
     } else {
       ok = await tcpProbe(r.host, r.port, svc.healthcheck.timeoutSec * 1000);
     }
