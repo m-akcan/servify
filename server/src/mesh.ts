@@ -14,12 +14,12 @@ import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { kv, projects as projectsTable, services as servicesTable } from './db.ts';
 import { dockerFor, isOnline, nodeOf, onlineNodes, onNodeChange, hubAddress } from './nodes.ts';
-import { networkName, LABEL, INSTANCE_ID } from './engine.ts';
+import { networkName, LABEL, INSTANCE_ID, noteConn } from './engine.ts';
 import { agentTlsMaterial } from './certs.ts';
 import { config } from './config.ts';
 import { open, seal } from './crypto.ts';
 import { pickUpstream } from './proxy.ts';
-import { wake } from './sleep.ts';
+import { touch, wake } from './sleep.ts';
 import type { Service } from './types.ts';
 
 const IMAGE = 'node:22-alpine'; // what agents run, so servers already have it
@@ -79,6 +79,7 @@ export function handleMeshUpgrade(req: IncomingMessage, socket: Duplex, head: Bu
     return true;
   }
   socket.pause();
+  touch(svc.id);
   void (async () => {
     if (svc.sleeping) await wake(svc.id, 'a connection from another server');
     let up = pickUpstream(servicesTable.get(svc.id) ?? svc, '');
@@ -91,6 +92,14 @@ export function handleMeshUpgrade(req: IncomingMessage, socket: Duplex, head: Bu
     target.once('error', () => deny('502 Bad Gateway'));
     target.once('connect', () => {
       target.removeAllListeners('error');
+      noteConn(up!.containerId, 1); // counts for least-connections, draining and sleeping, like router traffic
+      let done = false;
+      target.once('close', () => {
+        if (done) return;
+        done = true;
+        noteConn(up!.containerId, -1);
+        touch(svc.id);
+      });
       socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: servify-mesh\r\nConnection: Upgrade\r\n\r\n');
       if (head.length) target.write(head);
       for (const [a, b] of [

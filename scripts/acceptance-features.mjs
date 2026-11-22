@@ -362,6 +362,14 @@ async function main() {
     await api('POST', `/services/${upd.id}/image-check`);
     await sleep(2000);
     check('and only once', (await deps()) === n0 + 1, `${n0} → ${await deps()}`);
+    // With data, a tag switch takes a safety backup first.
+    await api('PATCH', `/services/${upd.id}`, { imageAutoUpdate: false });
+    const withVol = await api('POST', `/projects/${P.id}/volumes`, { name: 'updater-data', serviceId: upd.id, mountPath: '/data' });
+    await waitFor(async () => (await api('GET', `/services/${upd.id}`)).activeDeploymentId === withVol.deployment?.id && (await api('GET', `/services/${upd.id}`)).status === 'running', 120_000, 'updater with a volume');
+    const backupsBefore = (await api('GET', `/services/${upd.id}/backups`)).length;
+    await api('POST', `/services/${upd.id}/update-image`, { tag: '2.0' });
+    const bks = await api('GET', `/services/${upd.id}/backups`);
+    check('a tag switch on a service with data backs it up first', bks.length === backupsBefore + 1 && bks[0].status === 'succeeded' && (await api('GET', `/services/${upd.id}`)).source.image === `${reg}:2.0`, JSON.stringify(bks[0] ?? null).slice(0, 200));
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -447,7 +455,8 @@ async function main() {
       check('read-only tokens cannot read database contents', r.status === 403);
     }
     // MariaDB
-    await waitFor(async () => (await exec(my.id, 'mariadb-admin ping -uroot -ppw --silent').catch(() => null))?.exitCode === 0, 180_000, 'mariadb ready');
+    // `mariadb-admin ping` already succeeds while the image is still initialising; wait for a real login.
+    await waitFor(async () => (await exec(my.id, `mariadb -uroot -ppw -e 'select 1' shop`).catch(() => null))?.exitCode === 0, 180_000, 'mariadb ready');
     await q(my.id, `CREATE TABLE items (id int PRIMARY KEY, title varchar(50), note text); INSERT INTO items VALUES (1, 'pen', NULL), (2, 'tab\there', 'line1\nline2')`, { db: 'shop', write: true });
     const minfo = await api('GET', `/services/${my.id}/db`);
     check('MySQL: lists its databases', minfo.kind === 'mysql' && minfo.databases.includes('shop') && !minfo.databases.includes('mysql'), JSON.stringify(minfo));
@@ -513,6 +522,8 @@ async function main() {
     check('`deploy` rebuilds the last upload', dp.code === 0 && /Deployed/.test(dp.out), dp.out.slice(-300));
     const bad = cli('status', { env: { SERVIFY_TOKEN: 'svf_nope' } });
     check('a bad token fails clearly', bad.code === 1 && /rejected/.test(bad.out), bad.out);
+    const guarded = cli(`up --project ${P.id} --service web`);
+    check('`up` won’t replace an image service’s source without --replace', guarded.code === 1 && /--replace/.test(guarded.out) && (await svcOf(P.id, 'web')).source.type === 'image', guarded.out);
     const elsewhere = cli('status', { cwd: home });
     check('an unlinked folder says how to link', elsewhere.code === 1 && /servify link/.test(elsewhere.out), elsewhere.out);
     // Unsafe archive entries never leave the upload folder.
@@ -549,6 +560,20 @@ async function main() {
     check('a request wakes it and gets the answer', woke.status === 200 && /nginx/i.test(woke.body), `${woke.status} after ${Date.now() - t0} ms`);
     console.log(`    (woke in ${Date.now() - t0} ms)`);
     check('it is running again', (await waitFor(async () => (await api('GET', `/services/${sl.id}`)).status === 'running', 15_000, 'running')) === true);
+    // A long download (or WebSocket) that's still open counts as activity.
+    await exec(sl.id, 'dd if=/dev/zero of=/usr/share/nginx/html/big bs=1M count=200 2>/dev/null');
+    const slow = await new Promise((resolve) => {
+      const req = http.get({ host: '127.0.0.1', port: PROXY, path: '/big', headers: { host }, agent: false }, (res) => {
+        res.once('data', () => {
+          res.pause();
+          resolve(req);
+        });
+      });
+      req.on('error', () => resolve(null));
+    });
+    await sleep(7000); // three and a half idle "minutes"
+    check('an open download keeps it awake', !!slow && (await api('GET', `/services/${sl.id}`)).status === 'running');
+    slow?.destroy();
     await waitFor(async () => (await api('GET', `/services/${sl.id}`)).status === 'sleeping', 30_000, 'asleep again');
     const before = (await api('GET', `/services/${sl.id}`)).activeDeploymentId;
     await api('POST', `/services/${sl.id}/deploy`);

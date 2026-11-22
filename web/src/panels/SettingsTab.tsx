@@ -470,10 +470,20 @@ function ImageUpdates({ service: s }: { service: ServiceView }) {
       setChecking(false);
     }
   };
+  // Databases and services with volumes may upgrade their data in place: an old image might not start on it again.
+  const stateful = !!s.backupMethod;
   const update = async (tag: string | null, major = false) => {
-    if (major && !(await confirmDialog({ title: `Update ${s.name} to ${base}:${tag}?`, body: 'A new major version can change behaviour or data formats. Check its release notes and make a backup first.', confirm: 'Update' }))) return;
+    if (tag && stateful) {
+      const ok = await confirmDialog({
+        title: `Switch ${s.name} to ${base}:${tag}?`,
+        body: `${major ? 'A new major version' : 'A newer version'} may upgrade ${s.name}’s data in place, and going back to the old image may not work afterwards. Servify backs it up first and only switches if the backup succeeds.`,
+        confirm: 'Back up and switch',
+      });
+      if (!ok) return;
+    } else if (major && !(await confirmDialog({ title: `Update ${s.name} to ${base}:${tag}?`, body: 'A new major version can change behaviour. Check its release notes first.', confirm: 'Update' }))) return;
     setUpdating(tag ?? 'same');
     try {
+      if (tag && stateful) toast({ title: `Backing up ${s.name} before switching…`, tone: 'build' });
       await api.post(`/services/${s.id}/update-image`, tag ? { tag } : {});
       toast({ title: tag ? `Updating ${s.name} to ${tag}` : `Pulling ${s.source.type === 'image' ? s.source.image : ''} again`, tone: 'build' });
     } catch (e) {

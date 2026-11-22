@@ -933,6 +933,11 @@ export async function updateServiceImage(actor: Actor, serviceId: string, tag?: 
   if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run a registry image`);
   if (tag) {
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag)) throw new HttpError(400, 'not a valid tag');
+    // A newer version may upgrade the data in place, after which the old image may not start on it: back up first.
+    if (backupMethod(svc)) {
+      const b = await backupService(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
+      if (b.status !== 'succeeded') throw new HttpError(409, `the safety backup ${b.status}${b.error ? ` (${b.error})` : ''} — ${svc.name} was not switched`);
+    }
     const [image] = splitImageRef(normalizeImageRef(svc.source.image));
     await updateService(actor, svc.id, { image: `${image}:${tag}` }, { quiet: true });
     recordActivity(actor, 'service.updated', `Updating ${svc.name} to ${image}:${tag}`, svc.projectId, svc.id);

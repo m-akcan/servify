@@ -26,6 +26,7 @@ export function touch(serviceId: string) {
 /** Why a service can't sleep, or null when it can. */
 export function cannotSleep(svc: Service): string | null {
   if (svc.protocol !== 'http') return 'only HTTP services can sleep (other traffic doesn’t pass the router)';
+  if (svc.ports?.length) return 'it publishes ports on the server, and that traffic doesn’t pass the router';
   if (svc.cluster) return 'clusters can’t sleep';
   if (svc.source.type === 'external' || svc.source.type === 'redirect') return 'routes don’t run anything';
   const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
@@ -83,6 +84,11 @@ function check() {
   for (const svc of servicesTable.all()) {
     if (!svc.sleepAfterMinutes || svc.sleeping || svc.stopped || svc.status !== 'running' || busy.has(svc.id)) continue;
     if (cannotSleep(svc)) continue;
+    // An open WebSocket, stream or slow download is activity too: idle time starts when the last one closes.
+    if (replicasOf(svc.id).some((r) => r.activeConns > 0)) {
+      touch(svc.id);
+      continue;
+    }
     const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
     // Idle since the last request, the deploy that started it, or Servify's own start — whichever is latest.
     const since = Math.max(lastHit.get(svc.id) ?? 0, dep?.finishedAt ?? 0, startedAt);

@@ -3,7 +3,7 @@
  *
  *   servify login [url]          save the URL and a token (Servify → Agents → API tokens, or `servify token`)
  *   servify link [project] [service]   remember which project/service this folder deploys to
- *   servify up [--service name] [--detach]   upload this folder, build and deploy it, follow the build
+ *   servify up [--service name] [--detach] [--replace]   upload this folder, build and deploy it, follow the build
  *   servify deploy               redeploy the linked service
  *   servify logs [-f] [--build] [--tail n]   runtime logs (or the latest build log)
  *   servify run <command…>       run a command here with the service's variables
@@ -302,6 +302,7 @@ async function link(args: string[]) {
 
 async function up(args: string[]) {
   const detach = !!flag(args, 'detach', 'd');
+  const replace = !!flag(args, 'replace');
   const t = await target(args, { needService: false });
   let service = t.service;
   if (!service) {
@@ -309,8 +310,13 @@ async function up(args: string[]) {
     service = (await api<any>('POST', `/projects/${t.project.id}/services`, { name: t.serviceRef, upload: true, deploy: false })).service;
     console.log(`${c.green('+')} Created ${service.name} in ${t.project.name}`);
   }
-  if (service.source.type !== 'upload' && service.source.type !== 'local') {
-    console.log(c.dim(`${service.name} builds from ${service.source.type === 'git' ? service.source.repo : service.source.image} today; this upload replaces that source.`));
+  if (service.source.type !== 'upload' && !replace) {
+    // A wrong --service name must not rebuild a database (or anything else) from this folder.
+    const from = service.source.type === 'git' ? service.source.repo : service.source.type === 'image' ? service.source.image : service.source.type === 'local' ? service.source.path : service.source.type;
+    const msg = `${service.name} runs ${from} today; uploading replaces that source.`;
+    if (!process.stdin.isTTY) fail(`${msg} Pass --replace if that's what you want.`);
+    const a = await ask(`${msg} Continue? [y/N] `);
+    if (!/^y(es)?$/i.test(a)) fail('Nothing uploaded.');
   }
   const root = process.cwd();
   const g = gitInfo(root);
