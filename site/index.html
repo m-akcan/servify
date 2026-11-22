@@ -56,6 +56,7 @@
         <symbol id="i-up" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16.5v-9M8 11.5l4-4 4 4"/></g></symbol>
         <symbol id="i-play" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="m10 9 5 3-5 3V9Z"/></g></symbol>
         <symbol id="i-server" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7.5 7.25h.01M7.5 16.75h.01"/></g></symbol>
+        <symbol id="i-power" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M12 3v8M7.05 6.05a7.5 7.5 0 1 0 9.9 0"/></symbol>
         <symbol id="i-search" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></g></symbol>
       </defs>
     </svg>
@@ -268,7 +269,7 @@
           <div class="section-head reveal">
             <span class="mono-label">04 — Ready for real traffic</span>
             <h2>The boring parts, done properly. <em>So you don’t have to.</em></h2>
-            <p class="lede">Everything you’d otherwise bolt on with five more tools: certificates, alerts, backups, previews.</p>
+            <p class="lede">Everything you’d otherwise bolt on with five more tools: certificates, alerts, backups, previews, failover and more machines.</p>
           </div>
           <div class="prod-grid">
             <article class="card prod reveal">
@@ -304,8 +305,26 @@
             <article class="card prod reveal" style="--d: 120ms">
               <div class="prod-ico" data-brand="docker"><svg><use href="#i-box" /></svg></div>
               <h3>Bring your compose file</h3>
-              <p>Paste a docker-compose.yml: services, variables, volumes and replicas carry over, and they still reach each other by name.</p>
+              <p>Paste a docker-compose.yml: services, variables, volumes and replicas carry over, and they still reach each other by name. Take over the existing Docker volumes, so nothing is copied.</p>
               <div class="prod-demo"><span class="mono faint">docker-compose.yml</span><span class="arrow">→</span><span class="pill-s ok">4 services</span></div>
+            </article>
+            <article class="card prod reveal">
+              <div class="prod-ico" data-brand="postgres"><svg><use href="#i-disk" /></svg></div>
+              <h3>PostgreSQL clusters</h3>
+              <p>A primary and two standbys with synchronous replication, plus a read-only address for the standbys. If the primary stops answering, Servify promotes the most up-to-date standby.</p>
+              <div class="prod-demo"><span class="pill-s ok">primary</span><span class="pill-s">standby</span><span class="pill-s">standby</span><span class="mono faint">sync</span></div>
+            </article>
+            <article class="card prod reveal" style="--d: 60ms">
+              <div class="prod-ico"><svg><use href="#i-server" /></svg></div>
+              <h3>More than one server</h3>
+              <p>Add a machine with one command; it only needs Docker and dials out, so no ports to open. Place or move services there, and they still reach each other by name.</p>
+              <div class="prod-demo"><span class="dot ok"></span><span class="mono">home-server</span><span class="arrow">↔</span><span class="dot ok"></span><span class="mono">laptop</span></div>
+            </article>
+            <article class="card prod reveal" style="--d: 120ms">
+              <div class="prod-ico"><svg><use href="#i-globe" /></svg></div>
+              <h3>Not just web apps</h3>
+              <p>Publish TCP or UDP ports for game servers and voice chat. Put a domain with HTTPS in front of a NAS or VM, or redirect an old domain to the new one.</p>
+              <div class="prod-demo"><span class="mono">:25565</span><span class="arrow">→</span><span class="pill-s">minecraft</span><span class="pill-s build">UDP</span></div>
             </article>
           </div>
           <div class="prod-strip reveal">
@@ -330,7 +349,7 @@
             <div class="cell reveal"><svg class="ci"><use href="#i-link" /></svg><h3>Variable references</h3><p>Point one service at another and it stays in sync. Drag between nodes to wire it up.</p><code>${{ postgres.DATABASE_URL }}</code></div>
             <div class="cell reveal" style="--d: 60ms"><svg class="ci"><use href="#i-undo" /></svg><h3>One-click rollback</h3><p>Go back to any previous deploy, with a diff of what changed in its config.</p></div>
             <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-clock" /></svg><h3>Cron jobs</h3><p>Give a service a schedule and it runs on time, with history, exit codes and output.</p><code>0 9 * * 1-5 → Weekdays at 09:00</code></div>
-            <div class="cell reveal"><svg class="ci"><use href="#i-disk" /></svg><h3>Volumes and backups</h3><p>Persistent volumes for your databases. Download any volume as a tarball.</p></div>
+            <div class="cell reveal"><svg class="ci"><use href="#i-disk" /></svg><h3>Volumes you can move</h3><p>Detach a volume and drag it onto another service; the data stays. Mount host folders for media, or give each replica its own volume.</p></div>
             <div class="cell reveal" style="--d: 60ms"><svg class="ci"><use href="#i-file" /></svg><h3>Projects as code</h3><p>Export a whole project to one file and import it anywhere.</p><code>servify.json</code></div>
             <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-bolt" /></svg><h3>Built-in load tester</h3><p>Send real traffic through the balancer and watch replicas and autoscaling react.</p></div>
             <div class="cell reveal"><svg class="ci"><use href="#i-table" /></svg><h3>Database browser</h3><p>Browse tables and rows in Postgres and MySQL, and run SQL that stays read-only until you allow writes. Nothing extra to install or expose.</p></div>
@@ -338,7 +357,7 @@
             <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-key" /></svg><h3>Shared variables</h3><p>Set a value once per project or environment and use it in every service. Secrets stay masked.</p><code>${{ shared.STRIPE_KEY }}</code></div>
             <div class="cell reveal"><svg class="ci"><use href="#i-up" /></svg><h3>Image updates</h3><p>See when a newer image or version is out and update in one click, or automatically. Moving a database to a new version takes a backup first.</p></div>
             <div class="cell reveal" style="--d: 60ms"><svg class="ci"><use href="#i-moon" /></svg><h3>App sleeping</h3><p>Idle web apps stop after a while and wake on the next request, in about a second. Open connections keep them awake.</p></div>
-            <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-server" /></svg><h3>Several servers, one network</h3><p>Add a machine with one command and place services on it. They still reach each other by name, with no ports opened between servers.</p></div>
+            <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-power" /></svg><h3>Starts with your machine</h3><p>Turn on “Start at login” and Servify runs in the background, comes back after a crash and picks up every service where it left off.</p></div>
           </div>
         </div>
       </section>
@@ -451,6 +470,7 @@
               <div class="ans">
                 Yes. Point your domain at the machine, let ports 80 and 443 reach Servify, and turn on automatic HTTPS: certificates come from Let’s Encrypt and renew on their own.
                 Servify itself stays private by default — it only listens on your machine until you say otherwise.
+                Already have a proxy in front, like Nginx Proxy Manager or a cloud load balancer? Tell Servify to trust it and your apps still see HTTPS.
               </div>
             </details>
             <details class="reveal">
