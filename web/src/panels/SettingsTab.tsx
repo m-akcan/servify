@@ -7,7 +7,7 @@ import { openVolumeDialog, detachVolume, bytes } from '../lib/volumes.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { remove, stop, start } from '../lib/actions.ts';
 import { useStore } from '../lib/store.ts';
-import { describeCron } from '../lib/format.ts';
+import { describeCron, timeAgo } from '../lib/format.ts';
 
 async function patch(id: string, body: Record<string, unknown>, quiet = false) {
   try {
@@ -453,6 +453,86 @@ function tlsLabel(info?: ServiceView['domainInfo'][number]) {
   return 'HTTP only — turn on HTTPS in Settings';
 }
 
+function ImageUpdates({ service: s }: { service: ServiceView }) {
+  const [checking, setChecking] = useState(false);
+  const [updating, setUpdating] = useState<string | null>(null);
+  if (s.source.type !== 'image' || s.source.image.includes('@')) return null;
+  const u = s.imageUpdate ?? null;
+  const base = s.source.image.trim().replace(/:[^:/]+$/, '');
+  const check = async () => {
+    setChecking(true);
+    try {
+      const r = await api.post<{ status: string; reason?: string } | null>(`/services/${s.id}/image-check`);
+      if (r?.status === 'unknown') toast({ title: 'Could not check for updates', body: r.reason, tone: 'warn' });
+    } catch (e) {
+      toastError(e, 'Check failed');
+    } finally {
+      setChecking(false);
+    }
+  };
+  const update = async (tag: string | null, major = false) => {
+    if (major && !(await confirmDialog({ title: `Update ${s.name} to ${base}:${tag}?`, body: 'A new major version can change behaviour or data formats. Check its release notes and make a backup first.', confirm: 'Update' }))) return;
+    setUpdating(tag ?? 'same');
+    try {
+      await api.post(`/services/${s.id}/update-image`, tag ? { tag } : {});
+      toast({ title: tag ? `Updating ${s.name} to ${tag}` : `Pulling ${s.source.type === 'image' ? s.source.image : ''} again`, tone: 'build' });
+    } catch (e) {
+      toastError(e, 'Update failed');
+    } finally {
+      setUpdating(null);
+    }
+  };
+  const status = !u
+    ? 'Not checked yet.'
+    : u.status === 'unknown'
+      ? `Can't tell: ${u.reason ?? 'unknown'}.`
+      : u.status === 'changed'
+        ? `A newer image was published as ${u.ref}.`
+        : u.newerTag || u.newerMajor
+          ? `${u.ref} is the newest image for its tag.`
+          : 'Up to date.';
+  return (
+    <div className="image-updates">
+      <div className="row" style={{ gap: 8 }}>
+        <Icon name={u?.status === 'changed' || u?.newerTag || u?.newerMajor ? 'arrowUp' : u?.status === 'current' ? 'check' : 'refresh'} size={13} />
+        <span className="grow">
+          {status}
+          {u && <span className="faint"> Checked {timeAgo(u.checkedAt)}.</span>}
+        </span>
+        <Button size="sm" variant="ghost" icon="refresh" loading={checking} onClick={() => void check()}>
+          Check now
+        </Button>
+      </div>
+      {(u?.status === 'changed' || u?.newerTag || u?.newerMajor) && (
+        <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+          {u.status === 'changed' && (
+            <Button size="sm" variant="primary" icon="download" loading={updating === 'same'} onClick={() => void update(null)}>
+              Update {u.ref.replace(/^.*\//, '')}
+            </Button>
+          )}
+          {u.newerTag && (
+            <Button size="sm" variant={u.status === 'changed' ? 'secondary' : 'primary'} loading={updating === u.newerTag} onClick={() => void update(u.newerTag!)}>
+              Switch to {u.newerTag}
+            </Button>
+          )}
+          {u.newerMajor && (
+            <Button size="sm" variant="ghost" loading={updating === u.newerMajor} onClick={() => void update(u.newerMajor!, true)}>
+              {u.newerMajor} (new major)
+            </Button>
+          )}
+        </div>
+      )}
+      <div className="setting-row">
+        <div className="grow">
+          <div className="title">Update automatically</div>
+          <div className="desc">Redeploy when a new image is published under the same tag. Never for databases, clusters or new tags.</div>
+        </div>
+        <Switch checked={!!s.imageAutoUpdate} onChange={(v) => void patch(s.id, { imageAutoUpdate: v })} />
+      </div>
+    </div>
+  );
+}
+
 function DeployHook({ serviceId }: { serviceId: string }) {
   const [path, setPath] = useState<string | null>(null);
   const system = useStore((st) => st.system);
@@ -518,6 +598,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             <CommitInput mono value={src.image} onCommit={(v) => void patch(id, { image: v })} />
           </Field>
         )}
+        {src.type === 'image' && <ImageUpdates service={s} />}
         {src.type === 'git' && (
           <>
             <Field label="Repository">

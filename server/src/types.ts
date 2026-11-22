@@ -134,6 +134,8 @@ export interface Service {
   buildTarget?: string | null;
   /** Git deploys only when a push changes files matching these globs; a leading ! excludes (see watchpaths.ts). */
   watchPaths?: string[] | null;
+  /** Image services: redeploy automatically when a new image is published under the same tag. */
+  imageAutoUpdate?: boolean;
   /** Docker-style overrides (e.g. from Compose): replace only CMD / only ENTRYPOINT. Ignored when startCommand is set. */
   cmd?: string[] | null;
   entrypoint?: string[] | null;
@@ -169,7 +171,7 @@ export type DeploymentStatus =
   | 'cancelled'
   | 'removed';
 
-export type DeployTrigger = 'create' | 'manual' | 'agent' | 'git' | 'rollback' | 'config' | 'restart';
+export type DeployTrigger = 'create' | 'manual' | 'agent' | 'git' | 'rollback' | 'config' | 'restart' | 'update';
 
 export interface DeploymentConfig {
   env: Record<string, string>;
@@ -206,6 +208,8 @@ export interface Deployment {
   image: string | null;
   /** The database engine in the image (null = none; missing = not detected yet, from before detection existed). */
   database?: DatabaseKind | null;
+  /** Registry digests of a pulled image (repo@sha256:…), recorded at deploy time — Docker's own list follows the tags. */
+  repoDigests?: string[] | null;
   /** The server it was rolled out on (null = this machine). */
   nodeId?: string | null;
   /** Detected/used port for this image. */

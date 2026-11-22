@@ -23,6 +23,7 @@ export const NOTIFY_EVENTS = [
   'cert.failed',
   'preview.ready',
   'server.usage',
+  'image.update',
 ] as const;
 export type NotifyEvent = (typeof NOTIFY_EVENTS)[number];
 

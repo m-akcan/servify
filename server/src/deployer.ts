@@ -183,6 +183,7 @@ export function queueDeployment(
     commitSha: base?.commitSha ?? null,
     commitMessage: base?.commitMessage ?? null,
     builder: base?.builder ?? null,
+    repoDigests: base?.repoDigests ?? null,
     trigger,
     actor: actor.name,
     config: base
@@ -267,15 +268,16 @@ async function runDeployment(depId: string, actor: Actor) {
       if (src.type === 'image') {
         const ref = normalizeImageRef(src.image);
         const local = await d.inspectImage(ref);
-        if (!local || ref.endsWith(':latest')) {
-          log(`▸ Pulling ${ref}`);
+        const update = dep.trigger === 'update';
+        if (!local || ref.endsWith(':latest') || update) {
+          log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`);
           try {
             await d.pullImage(ref, (l) => log(l));
           } catch (e) {
             // The Engine API doesn't see `docker login` credentials; the CLI does (private registries).
             const viaCli = await cliPull(d, ref, log);
             if (!viaCli) {
-              if (!local) throw e;
+              if (!local || update) throw e;
               log(`! pull failed (${(e as Error).message}); using cached image`);
             }
           }
@@ -290,6 +292,7 @@ async function runDeployment(depId: string, actor: Actor) {
         const pinned = await d.inspectImage(ref);
         const project = projectsTable.get(svc.projectId);
         if (!project) throw new Error('the project was deleted');
+        dep.repoDigests = pinned?.RepoDigests?.length ? pinned.RepoDigests : null;
         if (pinned?.Id) {
           const tag = imageTag(project, svc, dep);
           await d.tagImage(pinned.Id, tag);

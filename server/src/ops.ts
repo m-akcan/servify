@@ -3,6 +3,7 @@
  * so every capability is available to humans and agents alike, with the same validation.
  */
 import { z } from 'zod';
+import { imageUpdateOf, checkService } from './imageupdates.ts';
 import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
 import type { Project, Service, Deployment, Source, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
@@ -10,7 +11,7 @@ import { id, slugify, secret, HttpError, assert } from './util.ts';
 import { getTemplate, templates } from './templates.ts';
 import { queueDeployment, readDeploymentLog, isDeploying } from './deployer.ts';
 import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, deployedSchedule } from './engine.ts';
-import { demuxLines } from './docker.ts';
+import { demuxLines, normalizeImageRef, splitImageRef } from './docker.ts';
 import { dockerFor, dockerForContainer, nodeOf, nodeName, onlineNodes, isOnline, LOCAL } from './nodes.ts';
 import { nodesTable } from './db.ts';
 import { referencedServices, publicUrl, resolveEnv, hostUrl } from './vars.ts';
@@ -44,6 +45,8 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.url = project && s.protocol === 'http' && s.publicHttp ? publicUrl(s, project) : null;
   out.tcpAddress = s.publicTcpPort ? `${config.proxyHost === '0.0.0.0' ? 'localhost' : config.proxyHost}:${s.publicTcpPort}` : null;
   out.pendingChanges = pendingChanges(s);
+  const iu = imageUpdateOf(s.id);
+  out.imageUpdate = iu && s.source.type === 'image' && iu.ref === normalizeImageRef(s.source.image) ? iu : null; // stale once the image changes
   const httpsOn = getSettings().https.enabled;
   out.domainInfo = s.domains.map((d) => {
     const c = certsTable.get(d);
@@ -552,6 +555,7 @@ export const updateServiceInput = z.object({
   buildCommand: z.string().nullable().optional(),
   buildArgs: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'build arg names are letters, digits and _'), z.string()).nullable().optional().describe('Docker build arguments; values may use ${VAR} from the service variables'),
   buildTarget: z.string().max(64).nullable().optional().describe('Multi-stage build target'),
+  imageAutoUpdate: z.boolean().optional().describe('Image services: redeploy automatically when a new image is published under the same tag (not for databases or clusters)'),
   watchPaths: z.array(z.string().min(1).max(200)).max(50).nullable().optional().describe('Git: deploy only when a push changes files matching these globs (e.g. apps/web/**, !**/*.md)'),
   preDeployCommand: z.string().max(2000).nullable().optional().describe('Runs once per new deploy (e.g. migrations) in a one-off container from the new image; a failure stops the deploy'),
   resources: z.object({ cpus: z.number().positive().max(64).nullable().optional(), memoryMb: z.number().int().min(16).nullable().optional() }).optional(),
@@ -692,6 +696,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.buildCommand !== undefined) set('buildCommand', patch.buildCommand?.trim() || null, 'build command');
   if (patch.buildArgs !== undefined) set('buildArgs', patch.buildArgs && Object.keys(patch.buildArgs).length ? patch.buildArgs : null, 'build arguments');
   if (patch.buildTarget !== undefined) set('buildTarget', patch.buildTarget?.trim() || null, 'build target');
+  if (patch.imageAutoUpdate !== undefined) set('imageAutoUpdate', patch.imageAutoUpdate, 'image auto-update');
   if (patch.watchPaths !== undefined) set('watchPaths', patch.watchPaths?.map((p) => p.trim()).filter(Boolean).length ? patch.watchPaths.map((p) => p.trim()).filter(Boolean) : null, 'watch paths');
   if (patch.preDeployCommand !== undefined) set('preDeployCommand', patch.preDeployCommand?.trim() || null, 'pre-deploy command');
   if (patch.resources) set('resources', { ...svc.resources, ...patch.resources } as Service['resources'], 'resources');
@@ -891,6 +896,34 @@ export function deployService(actor: Actor, serviceId: string, trigger: 'manual'
     servicesTable.put(svc);
   }
   return serializeDeployment(queueDeployment(svc, trigger, actor));
+}
+
+/**
+ * Update an image service: pull its image again (a new image under the same tag) or switch to another tag first,
+ * then deploy. Unlike a normal deploy, a failed pull fails the deployment instead of falling back to the cache.
+ */
+export async function updateServiceImage(actor: Actor, serviceId: string, tag?: string | null) {
+  const svc = getServiceOrThrow(serviceId);
+  notExternal(svc, 'update');
+  if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run a registry image`);
+  if (tag) {
+    if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag)) throw new HttpError(400, 'not a valid tag');
+    const [image] = splitImageRef(normalizeImageRef(svc.source.image));
+    await updateService(actor, svc.id, { image: `${image}:${tag}` }, { quiet: true });
+    recordActivity(actor, 'service.updated', `Updating ${svc.name} to ${image}:${tag}`, svc.projectId, svc.id);
+  } else recordActivity(actor, 'service.updated', `Updating ${svc.name}: pulling ${svc.source.image} again`, svc.projectId, svc.id);
+  const fresh = getServiceOrThrow(serviceId);
+  if (fresh.stopped) {
+    fresh.stopped = false;
+    servicesTable.put(fresh);
+  }
+  return serializeDeployment(queueDeployment(fresh, 'update', actor));
+}
+
+export async function checkServiceImage(serviceId: string) {
+  const svc = getServiceOrThrow(serviceId);
+  if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run a registry image`);
+  return checkService(svc.id);
 }
 
 /** Zero-downtime restart: roll the current image onto fresh replicas. */
@@ -1226,7 +1259,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'redirect') Object.assign(input, { redirect: s.to, redirectCode: s.code, keepPath: s.keepPath });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -1248,7 +1281,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1319,6 +1352,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       buildArgs: raw.buildArgs ?? null,
       buildTarget: raw.buildTarget ?? null,
       watchPaths: raw.watchPaths ?? null,
+      imageAutoUpdate: raw.imageAutoUpdate ?? false,
       preDeployCommand: raw.preDeployCommand ?? null,
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),

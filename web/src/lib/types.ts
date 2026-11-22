@@ -25,12 +25,15 @@ export type {
 
 import type { Service, Project, Deployment, Replica, VolumeRecord, PublicServer } from '../../../server/src/types.ts';
 
+export type ImageUpdate = { ref: string; checkedAt: number; status: 'current' | 'changed' | 'unknown'; reason?: string; newerTag?: string | null; newerMajor?: string | null };
+
 export type DomainInfo = { domain: string; url: string; tls: 'issued' | 'pending' | 'failed' | 'off' | 'local'; expiresAt: number | null; error: string | null };
 
 export type ServiceView = Service & {
   url: string | null;
   tcpAddress: string | null;
   pendingChanges: string[];
+  imageUpdate?: ImageUpdate | null;
   nextRunAt?: number | null;
   jobRunning?: boolean;
   deployedSchedule?: string | null;

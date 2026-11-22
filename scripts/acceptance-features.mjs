@@ -301,6 +301,67 @@ async function main() {
     await api('POST', `/services/${mover.id}/restart`);
     await waitFor(async () => (await api('GET', `/services/${mover.id}`)).activeDeploymentId !== v3, 120_000, 'restart');
     check('a restart keeps the rolled-back image', (await runningImage()) === v1Image);
+    check('a local-only image is "unknown", never "update available"', (await api('POST', `/services/${mover.id}/image-check`))?.status === 'unknown');
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ image update checks');
+  {
+    const REG_PORT = 15055;
+    const reg = `localhost:${REG_PORT}/acc/app`;
+    const sh = (c) => execSync(c, { stdio: 'pipe' }).toString().trim();
+    sh(`docker rm -f servify-acc-registry 2>/dev/null || true`);
+    sh(`docker run -d --name servify-acc-registry -p ${REG_PORT}:5000 registry:2`);
+    cleanups.push(async () => execSync(`docker rm -f servify-acc-registry; docker rmi ${reg}:1.0 ${reg}:1.1 ${reg}:2.0 || true`, { stdio: "ignore" }));
+    await waitFor(async () => (await fetch(`http://localhost:${REG_PORT}/v2/`).catch(() => null))?.ok, 30_000, 'registry');
+    const push = (from, tag) => sh(`docker tag ${from} ${reg}:${tag} && docker push -q ${reg}:${tag}`);
+    sh('docker pull -q busybox:1.36');
+    push('alpine:3.20', '1.0');
+    sh(`docker rmi ${reg}:1.0`); // Servify pulls it from the registry, so Docker records its registry digest
+    await api('POST', '/settings/notifications/channels', { ...ch, events: ['deploy.succeeded', 'deploy.failed', 'server.usage', 'image.update'] });
+    const upd = (await api('POST', `/projects/${P.id}/services`, { image: `${reg}:1.0`, name: 'updater', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'updater');
+    // Image ids change on a registry round-trip (containerd store), so look at what actually runs.
+    const imageOf = async () => (await exec(upd.id, 'test -f /etc/alpine-release && echo alpine || echo busybox').catch(() => null))?.output?.trim() ?? null;
+    const idOf = (ref) => (ref.startsWith('busybox') ? 'busybox' : 'alpine');
+    let st = await api('POST', `/services/${upd.id}/image-check`);
+    check('a freshly pulled image is up to date', st?.status === 'current' && !st.newerTag && !st.newerMajor, JSON.stringify(st));
+    push('busybox:1.36', '1.0');
+    push('alpine:3.20', '1.1');
+    push('alpine:3.20', '2.0');
+    const notes = () => received.map((r) => JSON.parse(r.body)).filter((b) => b.event === 'image.update' && b.serviceId === upd.id);
+    st = await api('POST', `/services/${upd.id}/image-check`);
+    check('a new image under the same tag is found', st?.status === 'changed', JSON.stringify(st));
+    check('newer tags are found (same major and next major)', st?.newerTag === '1.1' && st?.newerMajor === '2.0', JSON.stringify(st));
+    check('the service shows the update', (await api('GET', `/services/${upd.id}`)).imageUpdate?.status === 'changed');
+    await waitFor(() => notes().length > 0, 10_000, 'update notification');
+    await api('POST', `/services/${upd.id}/image-check`);
+    await sleep(1000);
+    check('notified once, not on every check', notes().length === 1, String(notes().length));
+    const before = (await api('GET', `/services/${upd.id}`)).activeDeploymentId;
+    await api('POST', `/services/${upd.id}/update-image`, {});
+    await waitFor(async () => (await api('GET', `/services/${upd.id}`)).activeDeploymentId !== before, 120_000, 'update deploy');
+    check('updating pulls the new image under the same tag', !!(await waitFor(async () => (await imageOf()) === idOf('busybox:1.36'), 60_000, 'new image')));
+    st = await waitFor(async () => {
+      const x = (await api('GET', `/services/${upd.id}`)).imageUpdate;
+      return x?.status === 'current' ? x : null;
+    }, 30_000, 'recheck after the update');
+    check('after the update it is up to date again', st?.status === 'current');
+    await api('POST', `/services/${upd.id}/update-image`, { tag: '1.1' });
+    check('switching to a newer tag deploys it', !!(await waitFor(async () => (await api('GET', `/services/${upd.id}`)).source.image === `${reg}:1.1` && (await imageOf()) === idOf('alpine:3.20'), 120_000, 'tag switch')));
+    check('a bad tag is refused', (await api('POST', `/services/${upd.id}/update-image`, { tag: '../x' }).then(() => 'ok', (e) => String(e.message))).includes('→ 400'));
+    // Automatic: a new image under the same tag deploys by itself, once.
+    await api('PATCH', `/services/${upd.id}`, { imageAutoUpdate: true });
+    await waitFor(async () => (await api('GET', `/services/${upd.id}`)).imageUpdate?.ref === `${reg}:1.1`, 30_000, 'recheck of 1.1');
+    push('busybox:1.36', '1.1');
+    const deps = async () => (await api('GET', `/services/${upd.id}/deployments`)).filter((d) => d.trigger === 'update').length;
+    const n0 = await deps();
+    await api('POST', `/services/${upd.id}/image-check`);
+    check('auto-update deploys the new image', !!(await waitFor(async () => (await imageOf()) === idOf('busybox:1.36'), 120_000, 'auto-update')));
+    await sleep(3000);
+    await api('POST', `/services/${upd.id}/image-check`);
+    await sleep(2000);
+    check('and only once', (await deps()) === n0 + 1, `${n0} → ${await deps()}`);
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -500,7 +561,7 @@ services:
 main()
   .catch((e) => {
     failures++;
-    console.error('\n✗', e.message);
+    console.error('\n✗', e.message, e.cause ?? '', (e.stack ?? '').split('\n').slice(1, 4).join(' | '));
   })
   .finally(async () => {
     if (!process.env.KEEP) {

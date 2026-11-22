@@ -348,6 +348,11 @@ api.delete('/servers/:id', async (c) => {
   await removeServer(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
+api.post('/services/:id/image-check', async (c) => c.json(await ops.checkServiceImage(c.req.param('id'))));
+api.post('/services/:id/update-image', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(await ops.updateServiceImage(actor(c), c.req.param('id'), typeof body?.tag === 'string' ? body.tag : null), 202);
+});
 api.post('/services/:id/move-project', async (c) => {
   const { project } = await jsonBody<{ project: string }>(c);
   return c.json(ops.moveServiceToProject(actor(c), c.req.param('id'), project ?? ''));

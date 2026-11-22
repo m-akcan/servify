@@ -1,4 +1,5 @@
 import { serve } from '@hono/node-server';
+import { startImageChecks } from './imageupdates.ts';
 import { startUsageAlerts } from './alerts.ts';
 import { startHostStats } from './hoststats.ts';
 import { Hono } from 'hono';
@@ -129,6 +130,7 @@ async function main() {
   startMetrics();
   startHostStats();
   startUsageAlerts();
+  startImageChecks();
   startBackgroundJobs();
   startScheduler();
   startCertificates();

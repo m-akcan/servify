@@ -20,6 +20,7 @@ const EVENTS = [
   ['cert.failed', 'Certificate failed'],
   ['preview.ready', 'Preview ready'],
   ['server.usage', 'Server disk, memory or CPU high'],
+  ['image.update', 'Image update available'],
 ] as const;
 type EventKey = (typeof EVENTS)[number][0];
 

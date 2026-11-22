@@ -18,6 +18,7 @@ const P: Record<string, string> = {
   chevronUp: 'M6 15l6-6 6 6',
   chevronRight: 'M9 6l6 6-6 6',
   chevronLeft: 'M15 6l-6 6 6 6',
+  arrowUp: 'M12 19V5M6 11l6-6 6 6',
   arrowRight: 'M5 12h14M13 6l6 6-6 6',
   arrowUpRight: 'M7 17L17 7M8 7h9v9',
   search: 'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4',

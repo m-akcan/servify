@@ -323,6 +323,11 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
             <span className="dot" />
             {statusText}
           </span>
+          {!busy && s.imageUpdate && (s.imageUpdate.status === 'changed' || s.imageUpdate.newerTag) && (
+            <span className="node-pending node-update" title={s.imageUpdate.status === 'changed' ? `A newer ${s.imageUpdate.ref} image was published` : `${s.imageUpdate.newerTag} is available`}>
+              <Icon name="arrowUp" size={10} /> update
+            </span>
+          )}
           {s.pendingChanges.length > 0 && !busy && (
             <span className="node-pending" title={`Undeployed changes: ${s.pendingChanges.join(', ')}`}>
               <Icon name="dot" size={10} /> changes
