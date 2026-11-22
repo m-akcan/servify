@@ -22,6 +22,7 @@ export const NOTIFY_EVENTS = [
   'backup.failed',
   'cert.failed',
   'preview.ready',
+  'server.usage',
 ] as const;
 export type NotifyEvent = (typeof NOTIFY_EVENTS)[number];
 
@@ -30,7 +31,7 @@ const channelSchema = z.object({
   name: z.string().min(1).max(60),
   type: z.enum(['webhook', 'slack', 'discord', 'telegram', 'ntfy', 'email']),
   enabled: z.boolean().default(true),
-  events: z.array(z.enum(NOTIFY_EVENTS)).default(['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed']),
+  events: z.array(z.enum(NOTIFY_EVENTS)).default(['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed', 'server.usage']),
   /** webhook / slack / discord: endpoint URL. ntfy: server URL (default https://ntfy.sh). */
   url: z.string().optional(),
   /** webhook: HMAC-SHA256 signing secret (X-Servify-Signature). ntfy: access token. */
@@ -88,7 +89,18 @@ export type Settings = {
   notifications: { channels: Channel[] };
   backups: { destinations: Destination[] };
   webhooks: { secret: string };
+  /** Notify (event server.usage) when a server's disk, memory or CPU stays above these percentages. */
+  alerts: z.infer<typeof alertsSchema>;
+  /** Channels subscribed to failures got server.usage added once, when it was introduced. */
+  usageEventAdded?: boolean;
 };
+
+const alertsSchema = z.object({
+  enabled: z.boolean(),
+  diskPct: z.number().int().min(50).max(99),
+  memPct: z.number().int().min(50).max(99),
+  cpuPct: z.number().int().min(50).max(100),
+});
 
 export const LOCAL_DESTINATION: Destination = { id: 'local', name: 'This machine', type: 'local', path: join(config.dataDir, 'backups') };
 
@@ -99,6 +111,7 @@ function defaults(): Settings {
     notifications: { channels: [] },
     backups: { destinations: [] },
     webhooks: { secret: secret(24) },
+    alerts: { enabled: true, diskPct: 90, memPct: 90, cpuPct: 95 },
   };
 }
 
@@ -117,8 +130,15 @@ export function getSettings(): Settings {
     notifications: { channels: stored.notifications?.channels ?? [] },
     backups: { destinations: stored.backups?.destinations ?? [] },
     webhooks: { secret: stored.webhooks?.secret || base.webhooks.secret },
+    alerts: { ...base.alerts, ...(stored.alerts ?? {}) },
   };
   if (!raw || !stored.webhooks?.secret) save(cache);
+  // server.usage arrived later: channels that already get failure alerts get it once.
+  if (!cache.usageEventAdded) {
+    for (const ch of cache.notifications.channels) if (ch.events.includes('service.crashed') && !ch.events.includes('server.usage')) ch.events.push('server.usage');
+    cache.usageEventAdded = true;
+    save(cache);
+  }
   return cache;
 }
 
@@ -165,6 +185,7 @@ export function publicSettings(reveal: boolean) {
     notifications: { channels: s.notifications.channels.map(maskChannel) },
     backups: { destinations: [LOCAL_DESTINATION, ...s.backups.destinations.map(maskDestination)] },
     webhooks: { secret: reveal ? s.webhooks.secret : MASK },
+    alerts: s.alerts,
   };
 }
 
@@ -186,6 +207,14 @@ export function updateGeneral(actor: Actor, patch: { dashboardUrl?: string | nul
   }
   save(s);
   recordActivity(actor, 'settings.updated', 'Updated general settings');
+}
+
+export function updateAlerts(actor: Actor, patch: Partial<z.infer<typeof alertsSchema>>) {
+  const s = structuredClone(getSettings());
+  s.alerts = alertsSchema.parse({ ...s.alerts, ...patch });
+  save(s);
+  recordActivity(actor, 'settings.updated', `Usage alerts ${s.alerts.enabled ? `at disk ${s.alerts.diskPct}%, memory ${s.alerts.memPct}%, CPU ${s.alerts.cpuPct}%` : 'off'}`);
+  return s.alerts;
 }
 
 export function updateHttps(actor: Actor, patch: Partial<z.infer<typeof httpsSchema>>) {

@@ -4,7 +4,7 @@
  */
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
-import { databaseOf, normalizeImageRef, type DockerClient } from './docker.ts';
+import { databaseOf, demuxLines, normalizeImageRef, type DockerClient } from './docker.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
 import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable } from './db.ts';
@@ -25,11 +25,13 @@ import {
   refreshServiceStatus,
   LABEL,
   converging,
+  networkName,
+  INSTANCE_ID,
 } from './engine.ts';
 import { buildSource, imageTag } from './builder.ts';
 import { nextRun } from './cron.ts';
 import { notify } from './notify.ts';
-import { hasSharedVolume } from './volumes.ts';
+import { hasSharedVolume, mountsFor, hostMountsFor } from './volumes.ts';
 
 /** Order to roll per-replica services in (clusters override: standbys first, primary last). */
 let rollingOrderHook: ((svc: Service, want: number) => number[] | null) | null = null;
@@ -112,6 +114,49 @@ function sourceLabel(svc: Service): string {
 }
 
 /** Queue a deployment for the service. Returns immediately; the pipeline runs in the background. */
+const PRE_DEPLOY_MAX_MS = Number(process.env.SERVIFY_PRE_DEPLOY_MAX_SECONDS ?? 900) * 1000;
+
+/** Run the pre-deploy command in a one-off container from the new image (same variables, network, volumes). */
+async function runPreDeploy(svc: Service, dep: Deployment, env: Record<string, string>, command: string, log: (l: string) => void) {
+  log(`▸ Pre-deploy: ${command}`);
+  const d = dockerFor(nodeOf(svc));
+  const network = networkName(svc.projectId);
+  await d.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: svc.projectId });
+  const host = await hostMountsFor(svc, dep.config.volumes, d);
+  const spec: any = {
+    Image: dep.image,
+    Env: Object.entries({ ...env, SERVIFY_PRE_DEPLOY: '1' }).map(([k, v]) => `${k}=${v}`),
+    Entrypoint: ['/bin/sh', '-c'],
+    Cmd: [command],
+    Labels: { 'servify.predeploy': 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: svc.projectId, [LABEL.service]: svc.id, [LABEL.deployment]: dep.id },
+    HostConfig: {
+      Mounts: [...mountsFor(svc.id, dep.config.volumes, 0), ...host.mounts],
+      ...(host.binds.length ? { Binds: host.binds } : {}),
+      NanoCpus: dep.config.resources.cpus ? Math.round(dep.config.resources.cpus * 1e9) : undefined,
+      Memory: dep.config.resources.memoryMb ? dep.config.resources.memoryMb * 1024 * 1024 : undefined,
+      Init: true,
+    },
+    NetworkingConfig: { EndpointsConfig: { [network]: { Aliases: [] } } },
+  };
+  const cid = await d.createContainer(`svf-predeploy-${svc.slug}-${dep.id.slice(-6)}`, spec);
+  try {
+    await d.startContainer(cid);
+    let timedOut = false;
+    const killer = setTimeout(() => {
+      timedOut = true;
+      void d.killContainer(cid).catch(() => {});
+    }, PRE_DEPLOY_MAX_MS);
+    const exitCode = await d.waitContainer(cid).finally(() => clearTimeout(killer));
+    const res = await d.logs(cid, { tail: 400, timestamps: false });
+    for await (const f of demuxLines(res)) log(`  │ ${f.text}`);
+    if (timedOut) throw new Error(`pre-deploy command killed after ${Math.round(PRE_DEPLOY_MAX_MS / 1000)}s — the running version is untouched`);
+    if (exitCode !== 0) throw new Error(`pre-deploy command failed (exit ${exitCode}) — the running version is untouched`);
+    log('✓ Pre-deploy finished');
+  } finally {
+    await d.removeContainer(cid, true).catch(() => {});
+  }
+}
+
 export function queueDeployment(
   svc: Service,
   trigger: DeployTrigger,
@@ -148,6 +193,7 @@ export function queueDeployment(
           port: svc.port,
           protocol: svc.protocol,
           startCommand: svc.startCommand,
+          preDeployCommand: svc.preDeployCommand ?? null,
           cmd: svc.cmd ?? null,
           entrypoint: svc.entrypoint ?? null,
           volumes: structuredClone(svc.volumes),
@@ -287,6 +333,10 @@ async function runDeployment(depId: string, actor: Actor) {
     const { env, unresolved } = resolveEnv(svc, dep.config.env, project, siblings, dep.port);
     if (unresolved.length) log(`! unresolved variable references: ${unresolved.join(', ')}`);
     (dep as any).resolvedEnv = env;
+
+    // ─── pre-deploy: once per new version (not on restarts, rollbacks or variable-only changes) ───
+    const preDeploy = dep.config.preDeployCommand;
+    if (preDeploy && !['restart', 'rollback', 'config'].includes(dep.trigger)) await runPreDeploy(svc, dep, env, preDeploy, log);
 
     // ─── scheduled job: nothing long-lived to start, the image is simply armed ───
     const schedule = ((dep.config as any).schedule as string | null) ?? null;

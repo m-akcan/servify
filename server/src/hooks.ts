@@ -6,6 +6,7 @@
  * (including through a tunnel). Every request is authenticated by HMAC/token, never by session.
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { changedFiles, touchesWatchPaths } from './watchpaths.ts';
 import { services as servicesTable } from './db.ts';
 import { getSettings } from './settings.ts';
 import { recordActivity, type Actor } from './events.ts';
@@ -59,7 +60,7 @@ export function onPullRequest(fn: PrHandler) {
   prHandler = fn;
 }
 
-type Push = { repo: string | null; branch: string | null; defaultBranch: string | null; sha: string | null; deleted: boolean; message: string | null };
+type Push = { repo: string | null; branch: string | null; defaultBranch: string | null; sha: string | null; deleted: boolean; message: string | null; files: string[] | null };
 
 export async function handleGitWebhook(headers: Record<string, string | string[] | undefined>, raw: Buffer): Promise<HookResult> {
   const h = (k: string) => {
@@ -137,6 +138,7 @@ function parsePush(provider: string, p: any): Push {
       sha: p.checkout_sha ?? p.after ?? null,
       deleted: !p.checkout_sha && /^0+$/.test(p.after ?? ''),
       message: p.commits?.at(-1)?.message ?? null,
+      files: changedFiles(provider, p),
     };
   }
   return {
@@ -146,6 +148,7 @@ function parsePush(provider: string, p: any): Push {
     sha: p.after ?? null,
     deleted: !!p.deleted || /^0+$/.test(p.after ?? ''),
     message: p.head_commit?.message ?? null,
+    files: changedFiles(provider, p),
   };
 }
 
@@ -206,6 +209,10 @@ function handlePush(provider: string, event: string, push: Push): HookResult {
     if (want && want !== push.branch) continue;
     if (!svc.autoDeploy || svc.stopped) {
       skipped.push(`${svc.name} (auto-deploy off)`);
+      continue;
+    }
+    if (!touchesWatchPaths(push.files, svc.watchPaths)) {
+      skipped.push(`${svc.name} (nothing changed under its watch paths)`);
       continue;
     }
     recordActivity(GIT, 'git.push', `Push to ${push.branch}${push.sha ? ` (${push.sha.slice(0, 7)})` : ''}${push.message ? `: ${push.message.split('\n')[0].slice(0, 60)}` : ''} — deploying ${svc.name}`, svc.projectId, svc.id);

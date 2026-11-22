@@ -78,10 +78,21 @@ export function imageTag(project: Project, svc: Service, dep: Deployment) {
 
 let cliBuildAvailable: boolean | null = null;
 
-async function cliBuild(d: DockerClient, ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log): Promise<boolean> {
+type BuildOpts = { args: Record<string, string>; target: string | null };
+
+/** The service's build arguments with ${VAR} filled in from its own variables. */
+function buildArgsFor(svc: Service): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(svc.buildArgs ?? {})) out[k] = String(v).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, name) => svc.env[name] ?? '');
+  return out;
+}
+
+async function cliBuild(d: DockerClient, ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log, opts: BuildOpts): Promise<boolean> {
   if (cliBuildAvailable === false) return false;
   const args = ['build', '--progress=plain', '-t', tag, '-f', dockerfile];
   for (const [k, v] of Object.entries(labels)) args.push('--label', `${k}=${v}`);
+  for (const [k, v] of Object.entries(opts.args)) args.push('--build-arg', `${k}=${v}`);
+  if (opts.target) args.push('--target', opts.target);
   args.push(ctx);
   let missingBuildx = false;
   const r = await run('docker', args, {
@@ -106,7 +117,7 @@ async function cliBuild(d: DockerClient, ctx: string, dockerfile: string, tag: s
   return true;
 }
 
-async function apiBuild(d: DockerClient, ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log) {
+async function apiBuild(d: DockerClient, ctx: string, dockerfile: string, tag: string, labels: Record<string, string>, log: Log, opts: BuildOpts) {
   // Dockerfile may live outside the context: tar both into a single stream.
   const relDf = relative(ctx, dockerfile);
   const inside = !relDf.startsWith('..') && !isAbsolute(relDf);
@@ -118,7 +129,7 @@ async function apiBuild(d: DockerClient, ctx: string, dockerfile: string, tag: s
     args.push('-C', dir, dfName);
   }
   const tar = spawn('tar', args, { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, COPYFILE_DISABLE: '1' } });
-  await d.buildFromTar(tar.stdout, tag, dfName, log, labels);
+  await d.buildFromTar(tar.stdout, tag, dfName, log, labels, opts);
 }
 
 export async function buildSource(svc: Service, project: Project, dep: Deployment, log: Log): Promise<BuildResult> {
@@ -180,8 +191,11 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     const t0 = Date.now();
     // Builds run on the service's server (the context is streamed to its Docker).
     const d = dockerFor(nodeOf(svc));
-    const usedCli = await cliBuild(d, ctx, dockerfile, tag, labels, log);
-    if (!usedCli) await apiBuild(d, ctx, dockerfile, tag, labels, log);
+    const opts: BuildOpts = { args: buildArgsFor(svc), target: svc.buildTarget ?? null };
+    if (Object.keys(opts.args).length) log(`▸ Build arguments: ${Object.keys(opts.args).join(', ')}`);
+    if (opts.target) log(`▸ Build target: ${opts.target}`);
+    const usedCli = await cliBuild(d, ctx, dockerfile, tag, labels, log, opts);
+    if (!usedCli) await apiBuild(d, ctx, dockerfile, tag, labels, log, opts);
     log(`✓ Built in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     return { image: tag, commitSha, commitMessage, builder: usedCli ? `${builder} · buildkit` : builder };
   } finally {

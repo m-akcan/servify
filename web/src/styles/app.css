@@ -496,6 +496,20 @@ body.resizing * {
 .project-mark-emoji {
   line-height: 1;
 }
+.shared-vars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.shared-var-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.4fr) auto auto;
+  gap: 6px;
+  align-items: center;
+}
+.shared-var-row .btn.on {
+  color: var(--signal);
+}
 .icon-picker {
   display: flex;
   flex-direction: column;
@@ -2404,3 +2418,5 @@ button.chip {
 :root[data-theme='light'] .prompt-row svg {
   color: #5a7200;
 }
+
+.alert-thresholds { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }

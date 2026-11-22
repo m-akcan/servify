@@ -126,6 +126,14 @@ export interface Service {
   env: Record<string, string>;
   secretKeys: string[];
   startCommand: string | null;
+  /** Runs once per new deploy in a one-off container from the new image (e.g. migrations); a failure stops the deploy. */
+  preDeployCommand?: string | null;
+  /** Docker build arguments (`--build-arg`); values may use ${VAR} from the service's variables. */
+  buildArgs?: Record<string, string> | null;
+  /** Multi-stage build target (`--target`). */
+  buildTarget?: string | null;
+  /** Git deploys only when a push changes files matching these globs; a leading ! excludes (see watchpaths.ts). */
+  watchPaths?: string[] | null;
   /** Docker-style overrides (e.g. from Compose): replace only CMD / only ENTRYPOINT. Ignored when startCommand is set. */
   cmd?: string[] | null;
   entrypoint?: string[] | null;
@@ -168,6 +176,7 @@ export interface DeploymentConfig {
   port: number | null;
   protocol: Protocol;
   startCommand: string | null;
+  preDeployCommand?: string | null;
   cmd?: string[] | null;
   entrypoint?: string[] | null;
   volumes: Volume[];
@@ -221,6 +230,10 @@ export interface Project {
   color: string;
   /** Optional icon shown with the color: 'i:<line icon>', 'b:<brand logo>' or 'e:<emoji>'. */
   icon?: string | null;
+  /** Shared variables services reference as ${{shared.NAME}}; an environment's own override its base project's. */
+  variables?: Record<string, string> | null;
+  /** Which shared variables are secrets (masked for read-only access). */
+  secretKeys?: string[] | null;
   /** Set on environments: the base ("production") project this one belongs to. */
   parentId?: string | null;
   /** Environment name; the base project is "production". */

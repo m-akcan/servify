@@ -21,6 +21,51 @@ async function patch(id: string, body: Record<string, unknown>, quiet = false) {
 }
 
 /** Text input that commits on blur / Enter and resyncs from the server. */
+/** One entry per line, committed on blur. */
+function CommitLines({ value, onCommit, placeholder }: { value: string[]; onCommit: (v: string[]) => void; placeholder?: string }) {
+  const text = value.join('\n');
+  const [v, setV] = useState(text);
+  useEffect(() => setV(text), [text]);
+  return (
+    <textarea
+      className="textarea mono"
+      style={{ minHeight: 64 }}
+      value={v}
+      placeholder={placeholder}
+      spellCheck={false}
+      onChange={(e) => setV(e.target.value)}
+      onBlur={() => v !== text && onCommit(v.split('\n').map((l) => l.trim()).filter(Boolean))}
+    />
+  );
+}
+
+/** KEY=VALUE lines, committed on blur. */
+function CommitKeyValues({ value, onCommit, placeholder }: { value: Record<string, string> | null | undefined; onCommit: (v: Record<string, string> | null) => void; placeholder?: string }) {
+  const text = Object.entries(value ?? {}).map(([k, v]) => `${k}=${v}`).join('\n');
+  const [v, setV] = useState(text);
+  useEffect(() => setV(text), [text]);
+  return (
+    <textarea
+      className="textarea mono"
+      style={{ minHeight: 64 }}
+      value={v}
+      placeholder={placeholder}
+      spellCheck={false}
+      onChange={(e) => setV(e.target.value)}
+      onBlur={() => {
+        if (v === text) return;
+        const out: Record<string, string> = {};
+        for (const line of v.split('\n')) {
+          const i = line.indexOf('=');
+          const k = (i < 0 ? line : line.slice(0, i)).trim();
+          if (k) out[k] = i < 0 ? '' : line.slice(i + 1).trim();
+        }
+        onCommit(Object.keys(out).length ? out : null);
+      }}
+    />
+  );
+}
+
 function CommitInput({ value, onCommit, placeholder, mono, type = 'text', disabled }: { value: string; onCommit: (v: string) => void; placeholder?: string; mono?: boolean; type?: string; disabled?: boolean }) {
   const [v, setV] = useState(value);
   useEffect(() => setV(value), [value]);
@@ -92,6 +137,56 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
   );
 }
 const id = (s: ServiceView) => s.id;
+
+/** Which project the service belongs to; moving takes its volumes and history along. */
+function ServiceProject({ service: s }: { service: ServiceView }) {
+  const projects = useStore((st) => st.projects);
+  const others = projects.filter((p) => p.id !== s.projectId);
+  const [target, setTarget] = useState('');
+  const [busy, setBusy] = useState(false);
+  if (!others.length) return null;
+  const move = async () => {
+    const to = others.find((p) => p.id === target);
+    if (!to) return;
+    const yes = await confirmDialog({
+      title: `Move ${s.name} to ${to.parentId ? `${projects.find((p) => p.id === to.parentId)?.name ?? ''} · ${to.envName ?? to.name}` : to.name}?`,
+      body: `Its volumes, deploy history and backups go along, and its containers restart on that project's private network (a few seconds). Domains and ports stay the same.`,
+      confirm: 'Move',
+    });
+    if (!yes) return;
+    setBusy(true);
+    try {
+      await api.post(`/services/${s.id}/move-project`, { project: target });
+      toast({ title: `Moved ${s.name} to ${to.name}`, tone: 'ok' });
+      navigate(`/p/${to.slug}`);
+    } catch (e) {
+      toastError(e, 'Could not move the service');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="setting-row">
+      <div className="grow">
+        <div className="title">Project</div>
+        <div className="desc">Move it to another project. Services that use its variables (or whose variables it uses) have to change those references first.</div>
+      </div>
+      <div className="row" style={{ gap: 6 }}>
+        <select className="select" value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Target project">
+          <option value="">Choose a project…</option>
+          {others.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.parentId ? `${projects.find((x) => x.id === p.parentId)?.name ?? ''} · ${p.envName ?? p.name}` : p.name}
+            </option>
+          ))}
+        </select>
+        <Button icon="arrowRight" loading={busy} disabled={!target} onClick={() => void move()}>
+          Move
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 /** Which machine runs the service; moving redeploys it there. */
 function ServiceServer({ service: s }: { service: ServiceView }) {
@@ -469,6 +564,24 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             <CommitInput mono value={s.buildCommand ?? ''} placeholder="auto" onCommit={(v) => void patch(id, { buildCommand: v || null })} />
           </Field>
         )}
+        {src.type !== 'image' && (
+          <div className="ns-grid">
+            <Field label="Build target" hint="Multi-stage Dockerfile stage to build (--target)">
+              <CommitInput mono value={s.buildTarget ?? ''} placeholder="last stage" onCommit={(v) => void patch(id, { buildTarget: v || null })} />
+            </Field>
+            <Field label="Build arguments" hint="KEY=value per line (--build-arg); ${VAR} uses this service's variables. Kept in the image's history — no secrets.">
+              <CommitKeyValues value={s.buildArgs} placeholder={'NODE_ENV=production\nVITE_API_BASE=${API_URL}'} onCommit={(v) => void patch(id, { buildArgs: v })} />
+            </Field>
+          </div>
+        )}
+        {src.type === 'git' && (
+          <Field label="Watch paths" hint="Deploy on push only when files matching these globs change — one per line, ! excludes (e.g. apps/web/**, !**/*.md). Empty: every push deploys.">
+            <CommitLines value={s.watchPaths ?? []} placeholder={'apps/web/**\npackages/shared/**\n!**/*.md'} onCommit={(v) => void patch(id, { watchPaths: v.length ? v : null })} />
+          </Field>
+        )}
+        <Field label="Pre-deploy command" hint="Runs once per new deploy in a one-off container from the new image — e.g. migrations. If it fails, the deploy stops and the running version stays.">
+          <CommitInput mono value={s.preDeployCommand ?? ''} placeholder="e.g. pnpm prisma migrate deploy" onCommit={(v) => void patch(id, { preDeployCommand: v || null })} />
+        </Field>
         <Field label="Start command" hint="Runs via /bin/sh -c, replacing the image's default command">
           <CommitInput mono value={s.startCommand ?? ''} placeholder="image default" onCommit={(v) => void patch(id, { startCommand: v || null })} />
         </Field>
@@ -652,6 +765,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
 
       <Section title="Server" icon="server" desc="The machine this service runs on.">
         <ServiceServer service={s} />
+        <ServiceProject service={s} />
       </Section>
 
       <Section title="Volumes" icon="database" desc="Persistent storage that survives deploys and can move between services. A service with a volume runs as one replica.">

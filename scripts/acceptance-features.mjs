@@ -128,6 +128,31 @@ async function main() {
   const signed = received.find((r) => r.body.includes(web.id));
   check('notification is HMAC-signed', !!signed && signed.headers['x-servify-signature'] === `sha256=${createHmac('sha256', 'sig-secret').update(signed.body).digest('hex')}`);
 
+  console.log('\n▸ usage alerts');
+  const alertsBefore = (await api('GET', '/settings')).alerts;
+  check('usage alerts on by default', alertsBefore?.enabled === true && alertsBefore.diskPct === 90, JSON.stringify(alertsBefore));
+  check('alert thresholds are validated', (await api('PATCH', '/settings/alerts', { diskPct: 20 }).then(() => 'ok', (e) => String(e.message))).includes('→ 400'));
+  cleanups.push(() => api('PATCH', '/settings/alerts', alertsBefore).catch(() => {}));
+  await api('POST', '/settings/notifications/channels', { ...ch, events: ['deploy.succeeded', 'deploy.failed', 'server.usage'] });
+  const localSrv = (await api('GET', '/overview')).servers.find((s) => s.local);
+  const st = localSrv?.stats;
+  const diskPct = st?.diskTotal ? ((st.diskTotal - st.diskFree) / st.diskTotal) * 100 : 0;
+  if (process.env.SERVIFY_ALERTS_INTERVAL_MS && diskPct >= 51 && diskPct < 95.9) {
+    // Start from a clean state: the disk may already have been over the default line when Servify started.
+    await api('PATCH', '/settings/alerts', { diskPct: 99 });
+    await sleep(5000);
+    const seen = received.length;
+    await api('PATCH', '/settings/alerts', { diskPct: Math.max(50, Math.floor(diskPct) - 1) });
+    const usage = () => received.slice(seen).map((r) => JSON.parse(r.body)).filter((b) => b.event === 'server.usage');
+    const alert = await waitFor(() => usage().find((b) => b.level === 'error'), 20_000, 'disk alert');
+    check('disk over the threshold is notified', /disk at \d+%/.test(alert?.title ?? ''), alert?.title);
+    await sleep(3000);
+    check('alerted only once while it stays over', usage().filter((b) => b.level === 'error').length === 1);
+    await api('PATCH', '/settings/alerts', { diskPct: 99 });
+    const back = await waitFor(() => usage().find((b) => b.level === 'success'), 20_000, 'recovery');
+    check('recovery is notified', /back to \d+%/.test(back?.title ?? ''), back?.title);
+  } else console.log(`  – skipped the live alert (disk at ${Math.round(diskPct)}%, or SERVIFY_ALERTS_INTERVAL_MS unset)`);
+
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ git webhooks');
   const tmp = mkdtempSync(join(tmpdir(), 'servify-hooks-'));
@@ -158,6 +183,21 @@ async function main() {
   check('push deployed exactly that commit', !!deployed);
   const hook = await api('GET', `/services/${app.id}/deploy-hook`);
   check('deploy hook triggers a deploy', (await post(PROXY, hook.path, {}, '')).status === 202);
+  // Watch paths: a push that changes nothing under them is skipped, one that does deploys.
+  await waitFor(async () => !(await api('GET', `/services/${app.id}/deployments?limit=5`)).some((d) => ['queued', 'building', 'deploying'].includes(d.status)), 120_000, 'deploys settle');
+  await api('PATCH', `/services/${app.id}`, { watchPaths: ['web/**', '!**/*.md'] });
+  const deployCount = async () => (await api('GET', `/services/${app.id}/deployments?limit=50`)).length;
+  const before = await deployCount();
+  const pushWith = (files) => JSON.stringify({ ref: 'refs/heads/main', after: sha, repository: { clone_url: repo, default_branch: 'main' }, head_commit: { message: 'change' }, commits: [{ id: sha, added: [], modified: files, removed: [] }] });
+  const unrelated = pushWith(['README.md', 'web/NOTES.md', 'api/server.js']);
+  const r1 = await post(PROXY, '/_servify/hooks/git', { 'x-github-event': 'push', 'x-hub-signature-256': sig(unrelated) }, unrelated);
+  await sleep(1500);
+  check('a push outside the watch paths is skipped', r1.status === 202 && r1.body.includes('watch paths') && (await deployCount()) === before, r1.body);
+  const related = pushWith(['web/index.js']);
+  const r2 = await post(PROXY, '/_servify/hooks/git', { 'x-github-event': 'push', 'x-hub-signature-256': sig(related) }, related);
+  check('a push touching the watch paths deploys', r2.status === 202 && r2.body.includes('"deployed":["app"]'), r2.body);
+  await waitFor(async () => !(await api('GET', `/services/${app.id}/deployments?limit=5`)).some((d) => ['queued', 'building', 'deploying'].includes(d.status)), 120_000, 'deploy settles');
+  await api('PATCH', `/services/${app.id}`, { watchPaths: null });
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ HTTPS (local CA)');
@@ -261,6 +301,82 @@ async function main() {
     await api('POST', `/services/${mover.id}/restart`);
     await waitFor(async () => (await api('GET', `/services/${mover.id}`)).activeDeploymentId !== v3, 120_000, 'restart');
     check('a restart keeps the rolled-back image', (await runningImage()) === v1Image);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ build arguments, build target and pre-deploy');
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'servify-buildargs-'));
+    cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+    // The last stage would overwrite the greeting: only --target app plus --build-arg gives "hi servify".
+    writeFileSync(join(dir, 'Dockerfile'), 'FROM alpine:3.20 AS base\nARG GREETING=unset\nRUN echo "$GREETING" > /greeting\nFROM base AS app\nCMD ["sh", "-c", "sleep 1d"]\nFROM base AS other\nRUN echo wrong > /greeting\n');
+    const made = await api('POST', `/projects/${P.id}/services`, { name: 'built', path: dir, protocol: 'none', env: { NAME: 'servify' }, deploy: false });
+    const b = made.service;
+    await api('PATCH', `/services/${b.id}`, { buildArgs: { GREETING: 'hi ${NAME}' }, buildTarget: 'app', preDeployCommand: 'echo "migrated $NAME"' });
+    const d1 = await api('POST', `/services/${b.id}/deploy`);
+    const ok1 = await waitFor(async () => ['active', 'failed'].includes((await api('GET', `/deployments/${d1.id}`)).status), 240_000, 'build deploy');
+    const dep1 = await api('GET', `/deployments/${d1.id}`);
+    check('a build with arguments and a target deploys', !!ok1 && dep1.status === 'active', dep1.error ?? dep1.status);
+    check('the build used the target and the argument', (await exec(b.id, 'cat /greeting')).output.trim() === 'hi servify');
+    const log1 = (await api('GET', `/deployments/${d1.id}/logs`)).map((l) => (typeof l === 'string' ? l : l.text ?? l.line ?? '')).join('\n');
+    check('the pre-deploy command ran with the service variables', log1.includes('migrated servify'));
+    await api('PATCH', `/services/${b.id}`, { preDeployCommand: 'echo boom; exit 3' });
+    const d2 = await api('POST', `/services/${b.id}/deploy`);
+    await waitFor(async () => ['active', 'failed'].includes((await api('GET', `/deployments/${d2.id}`)).status), 240_000, 'failing deploy');
+    const dep2 = await api('GET', `/deployments/${d2.id}`);
+    check('a failing pre-deploy command stops the deploy', dep2.status === 'failed' && /pre-deploy/.test(dep2.error ?? ''), `${dep2.status} ${dep2.error ?? ''}`);
+    check('and the running version stays', (await api('GET', `/services/${b.id}`)).activeDeploymentId === d1.id && (await exec(b.id, 'cat /greeting')).output.trim() === 'hi servify');
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ shared variables');
+  {
+    const SP = await api('POST', '/projects', { name: `shared-${Date.now().toString(36)}` });
+    projectsToDelete.push(SP.id);
+    const reader = (await api('POST', `/projects/${SP.id}/services`, { name: 'reader', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { GREETING: '${{shared.GREETING}}', URL: 'https://${{shared.HOST}}/x', MISSING: '${{shared.NOPE}}' }, deploy: false })).service;
+    const upd = await api('PATCH', `/projects/${SP.id}`, { variables: { GREETING: 'hello', HOST: 'example.com', TOKEN: 's3cret' }, secretKeys: ['TOKEN'] });
+    check('saving shared variables lists the services that use them', (upd.usesShared ?? []).some((u) => u.id === reader.id));
+    const res = await api('GET', `/services/${reader.id}/variables/resolved`);
+    check('a service resolves ${{shared.NAME}}', res.env.GREETING === 'hello' && res.env.URL === 'https://example.com/x', JSON.stringify(res.env));
+    check('an unknown shared variable is reported', res.unresolved.includes('shared.NOPE'));
+    const again = await api('PATCH', `/projects/${SP.id}`, { variables: { GREETING: 'hello', HOST: 'example.com', TOKEN: '••••••••' }, secretKeys: ['TOKEN'] });
+    check('sending a masked secret back keeps it', (await api('GET', `/projects/${SP.id}`)).project.variables.TOKEN === 's3cret' && !!again);
+    const env = await api('POST', `/projects/${SP.id}/environments`, { name: 'staging', deploy: false });
+    await api('PATCH', `/projects/${env.id}`, { variables: { GREETING: 'hi from staging' } });
+    const envReader = (await api('GET', `/projects/${env.id}`)).services.find((x) => x.name === 'reader');
+    const envRes = await api('GET', `/services/${envReader.id}/variables/resolved`);
+    check("an environment's shared variable overrides the project's (the rest are inherited)", envRes.env.GREETING === 'hi from staging' && envRes.env.URL === 'https://example.com/x', JSON.stringify(envRes.env));
+    if (DATA) {
+      const ro = execSync(`node --disable-warning=ExperimentalWarning server/bin/servify.mjs token acceptance-ro --read`, { env: { ...process.env, SERVIFY_DATA_DIR: DATA } }).toString().match(/svf_[A-Za-z0-9_-]+/)?.[0];
+      const roSnap = await fetch(`${BASE}/api/projects/${SP.id}`, { headers: { authorization: `Bearer ${ro}` } }).then((r) => r.json());
+      check('read-only access sees shared secrets masked', roSnap.project.variables.TOKEN === '••••••••' && roSnap.project.variables.GREETING === 'hello', JSON.stringify(roSnap.project?.variables));
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ moving a service to another project');
+  {
+    const A = await api('POST', '/projects', { name: `move-a-${Date.now().toString(36)}` });
+    const Bp = await api('POST', '/projects', { name: `move-b-${Date.now().toString(36)}` });
+    projectsToDelete.push(A.id, Bp.id);
+    const mover = (await api('POST', `/projects/${A.id}/services`, { name: 'keeper', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { SECRET_WORD: 'kept' } })).service;
+    await waitFor(async () => (await api('GET', `/services/${mover.id}`)).status === 'running', 120_000, 'keeper running');
+    await api('POST', `/projects/${A.id}/volumes`, { name: 'keeper-data', serviceId: mover.id, mountPath: '/data' });
+    await waitFor(async () => (await exec(mover.id, "grep -q ' /data ' /proc/mounts").catch(() => null))?.exitCode === 0, 120_000, 'keeper running with its volume');
+    await exec(mover.id, 'echo moved-data > /data/file');
+    const user = (await api('POST', `/projects/${A.id}/services`, { name: 'user', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { WORD: '${{keeper.SECRET_WORD}}' }, deploy: false })).service;
+    const refused = await fetch(`${BASE}/api/services/${mover.id}/move-project`, { method: 'POST', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ project: Bp.id }) });
+    check('a move that would break references is refused', refused.status === 409 && /user/.test((await refused.json()).error ?? ''));
+    await api('DELETE', `/services/${user.id}`);
+    await api('POST', `/services/${mover.id}/move-project`, { project: Bp.id });
+    const inB = await api('GET', `/projects/${Bp.id}`);
+    check('the service and its volume are in the new project', inB.services.some((x) => x.id === mover.id) && inB.volumes.some((v) => v.serviceId === mover.id));
+    check('and gone from the old one', !(await api('GET', `/projects/${A.id}`)).services.some((x) => x.id === mover.id));
+    const restarted = await waitFor(async () => {
+      const r = await exec(mover.id, 'cat /data/file').catch(() => null);
+      return r && r.output.trim() === 'moved-data' && (await api('GET', `/services/${mover.id}`)).status === 'running';
+    }, 120_000, 'moved service running');
+    check('it runs in the new project with its data', !!restarted);
   }
 
   // ─────────────────────────────────────────────────────────────

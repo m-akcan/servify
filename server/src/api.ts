@@ -348,6 +348,10 @@ api.delete('/servers/:id', async (c) => {
   await removeServer(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
+api.post('/services/:id/move-project', async (c) => {
+  const { project } = await jsonBody<{ project: string }>(c);
+  return c.json(ops.moveServiceToProject(actor(c), c.req.param('id'), project ?? ''));
+});
 api.post('/services/:id/move', async (c) => {
   const { server } = await jsonBody<{ server: string }>(c);
   return c.json(await ops.moveService(actor(c), c.req.param('id'), server ?? ''));
@@ -452,6 +456,7 @@ api.get('/events', (c) => {
       let payload: unknown = ev;
       if (ev.type === 'service.updated') payload = { ...ev, service: ops.serializeService(ev.service, v) };
       if (ev.type === 'deployment.updated') payload = { ...ev, deployment: ops.serializeDeployment(ev.deployment, v) };
+      if (ev.type === 'project.updated') payload = { ...ev, project: ops.publicProject(ev.project, v) };
       void stream.writeSSE({ event: 'message', data: JSON.stringify(payload) });
     });
     const ping = setInterval(() => void stream.writeSSE({ event: 'ping', data: '' }), 15000);
@@ -489,6 +494,11 @@ api.put('/settings/autostart', async (c) => {
 api.patch('/settings/general', async (c) => {
   ownerOnly(c);
   settings.updateGeneral(actor(c), await jsonBody(c));
+  return c.json(settings.publicSettings(true));
+});
+api.patch('/settings/alerts', async (c) => {
+  ownerOnly(c);
+  settings.updateAlerts(actor(c), await jsonBody(c));
   return c.json(settings.publicSettings(true));
 });
 api.patch('/settings/https', async (c) => {

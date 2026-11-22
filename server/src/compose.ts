@@ -31,6 +31,8 @@ export type ComposeService = {
   /** Compose semantics: `command` replaces only CMD, `entrypoint` only ENTRYPOINT. */
   cmd: string[] | null;
   entrypoint: string[] | null;
+  buildArgs: Record<string, string> | null;
+  buildTarget: string | null;
   icon: string | null;
   healthPath: string | null;
   resources: { cpus: number | null; memoryMb: number | null };
@@ -228,9 +230,15 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
         else if (!existsSync(dir)) w(`build context ${dir} does not exist`);
         else source = { type: 'local', path: dir, dockerfile: build.dockerfile };
       } else if (!svc.image) w(`builds from ${ctx}; give the base folder of the compose file to build it, or it is skipped`);
-      if (build.args) w('build args are not supported yet — set them as ARG defaults in the Dockerfile');
-      if (build.target) w(`build target "${build.target}" is not supported — the last stage is built`);
     }
+    // Build arguments: a map or a KEY=VALUE list; a bare KEY takes its value from the environment (here: .env).
+    let buildArgs: Record<string, string> | null = null;
+    if (build?.args) {
+      buildArgs = {};
+      const entries: [string, unknown][] = Array.isArray(build.args) ? build.args.map((a: string) => { const i = String(a).indexOf('='); return i < 0 ? [String(a), vars[String(a)] ?? ''] : [String(a).slice(0, i), String(a).slice(i + 1)]; }) : Object.entries(build.args);
+      for (const [k, v] of entries) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) buildArgs[k] = v == null ? (vars[k] ?? '') : String(v);
+    }
+    const buildTarget = build?.target ? String(build.target) : null;
     if (!source && svc.image) source = { type: 'image', image: String(svc.image) };
     if (!source) {
       w('no image or usable build context — skipped');
@@ -365,7 +373,7 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     const dependsOn = Array.isArray(svc.depends_on) ? svc.depends_on.map(String) : Object.keys(svc.depends_on ?? {});
     const secretKeys = Object.keys(env).filter((k) => /SECRET|PASSWORD|TOKEN|KEY|PASS$/i.test(k));
 
-    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: (p.proto === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp', ...(p.hostIp ? { hostIp: p.hostIp } : {}) })), replicas, env, secretKeys, volumes, cmd, entrypoint, healthPath, resources, dependsOn, x: 0, y: 0 });
+    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: (p.proto === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp', ...(p.hostIp ? { hostIp: p.hostIp } : {}) })), replicas, env, secretKeys, volumes, cmd, entrypoint, buildArgs: source.type === 'image' ? null : buildArgs, buildTarget: source.type === 'image' ? null : buildTarget, healthPath, resources, dependsOn, x: 0, y: 0 });
   }
   if (!out.length) throw new HttpError(400, 'no importable services in this compose file');
 
@@ -416,6 +424,8 @@ export function planToSpec(plan: ComposePlan) {
       startCommand: null,
       cmd: s.cmd,
       entrypoint: s.entrypoint,
+      buildArgs: s.buildArgs ?? undefined,
+      buildTarget: s.buildTarget ?? undefined,
       healthcheck: s.healthPath ? { path: s.healthPath } : undefined,
       resources: s.resources,
       aliases: s.aliases,

@@ -19,6 +19,7 @@ const EVENTS = [
   ['backup.succeeded', 'Backup succeeded'],
   ['cert.failed', 'Certificate failed'],
   ['preview.ready', 'Preview ready'],
+  ['server.usage', 'Server disk, memory or CPU high'],
 ] as const;
 type EventKey = (typeof EVENTS)[number][0];
 
@@ -43,7 +44,9 @@ type Settings = {
   notifications: { channels: Channel[] };
   backups: { destinations: Destination[] };
   webhooks: { secret: string };
+  alerts: Alerts;
 };
+type Alerts = { enabled: boolean; diskPct: number; memPct: number; cpuPct: number };
 type Delivery = { ts: number; channelId: string; event: string; ok: boolean; error?: string };
 type HookDelivery = { ts: number; provider: string; event: string; repo: string | null; ok: boolean; result: string };
 
@@ -454,7 +457,7 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
         title="Notification channels"
         desc="Get told when deploys fail, services go down, cron jobs or backups fail — wherever you already look."
         right={
-          <Button variant="primary" size="sm" icon="plus" onClick={() => setEditing({ name: 'Slack', type: 'slack', enabled: true, events: ['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed'] })}>
+          <Button variant="primary" size="sm" icon="plus" onClick={() => setEditing({ name: 'Slack', type: 'slack', enabled: true, events: ['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed', 'server.usage'] })}>
             Add channel
           </Button>
         }
@@ -462,7 +465,7 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
         {channels.length === 0 ? (
           <div className="channel-picker">
             {(Object.keys(CHANNEL_META) as ChannelType[]).map((t) => (
-              <button key={t} className="channel-tile" onClick={() => setEditing({ name: CHANNEL_META[t].label, type: t, enabled: true, events: ['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed'] })}>
+              <button key={t} className="channel-tile" onClick={() => setEditing({ name: CHANNEL_META[t].label, type: t, enabled: true, events: ['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed', 'server.usage'] })}>
                 <ChannelIcon type={t} size={22} />
                 <span>{CHANNEL_META[t].label}</span>
               </button>
@@ -505,6 +508,7 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
           </div>
         )}
       </Card>
+      <UsageAlerts alerts={settings.alerts} reload={reload} />
       {deliveries.length > 0 && (
         <Card title="Recent deliveries">
           <div className="delivery-list">
@@ -534,6 +538,61 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
         />
       )}
     </>
+  );
+}
+
+function UsageAlerts({ alerts, reload }: { alerts: Alerts; reload: () => void }) {
+  const [draft, setDraft] = useState(alerts);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(alerts);
+  const save = async (next = draft) => {
+    try {
+      await api.patch('/settings/alerts', next);
+      toast({ title: next.enabled ? 'Usage alerts saved' : 'Usage alerts off', tone: 'ok' });
+      reload();
+    } catch (e) {
+      toastError(e, 'Could not save');
+    }
+  };
+  const pct = (key: 'diskPct' | 'memPct' | 'cpuPct', label: string, hint: string, min: number, max: number) => (
+    <Field label={label} hint={hint}>
+      <div className="row" style={{ gap: 6 }}>
+        <input className="input mono" type="number" min={min} max={max} style={{ width: 80 }} disabled={!draft.enabled} value={draft[key]} onChange={(e) => setDraft({ ...draft, [key]: Number(e.target.value) })} />
+        <span className="faint">%</span>
+      </div>
+    </Field>
+  );
+  return (
+    <Card
+      title="Usage alerts"
+      desc="Sent to the channels above that have “Server disk, memory or CPU high” ticked — for this machine and every connected server. Once when a figure crosses the line, once when it's back."
+      right={
+        <Switch
+          checked={draft.enabled}
+          onChange={(v) => {
+            const next = { ...draft, enabled: v };
+            setDraft(next);
+            void save(next);
+          }}
+          label="Usage alerts"
+        />
+      }
+    >
+      <div className="alert-thresholds">
+        {pct('diskPct', 'Disk', 'Alerts as soon as it’s crossed.', 50, 99)}
+        {pct('memPct', 'Memory', 'After 5 minutes above.', 50, 99)}
+        {pct('cpuPct', 'CPU', 'After 10 minutes above.', 50, 100)}
+      </div>
+      {dirty && (
+        <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+          <Button size="sm" variant="ghost" onClick={() => setDraft(alerts)}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="primary" onClick={() => void save()}>
+            Save
+          </Button>
+        </div>
+      )}
+    </Card>
   );
 }
 

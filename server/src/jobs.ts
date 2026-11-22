@@ -1,5 +1,6 @@
 /** Background jobs: autoscaling, git auto-deploy polling, image garbage collection. */
 import { services as servicesTable, deployments as deploymentsTable } from './db.ts';
+import { githubChangedFiles, touchesWatchPaths } from './watchpaths.ts';
 import { metricsHistory } from './metrics.ts';
 import { recordActivity, SYSTEM, type Actor } from './events.ts';
 import { updateService, deployService } from './ops.ts';
@@ -50,6 +51,9 @@ async function autoscale() {
   }
 }
 
+/** Heads already checked against a service's watch paths (and found unrelated), so they aren't asked again. */
+const checkedHeads = new Map<string, string>();
+
 async function gitWatch() {
   for (const svc of servicesTable.all()) {
     if (!svc.autoDeploy || svc.source.type !== 'git' || svc.stopped || isDeploying(svc.id)) continue;
@@ -61,6 +65,15 @@ async function gitWatch() {
     const head = await latestCommit(svc.source.repo, svc.source.branch, svc.source.token);
     if (!head || head === lastSha) continue;
     if (deps.some((d) => d.commitSha === head && d.status === 'failed')) continue; // don't loop on a broken commit
+    if (svc.watchPaths?.length) {
+      if (checkedHeads.get(svc.id) === head) continue;
+      const files = await githubChangedFiles(svc.source.repo, lastSha, head, svc.source.token);
+      if (!touchesWatchPaths(files, svc.watchPaths)) {
+        checkedHeads.set(svc.id, head);
+        recordActivity(GIT, 'git.push', `New commit ${head.slice(0, 7)} on ${svc.name} doesn't touch its watch paths — not deploying`, svc.projectId, svc.id);
+        continue;
+      }
+    }
     recordActivity(GIT, 'git.push', `New commit ${head.slice(0, 7)} on ${svc.name} — deploying`, svc.projectId, svc.id);
     deployService(GIT, svc.id, 'git');
   }

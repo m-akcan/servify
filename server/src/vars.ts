@@ -8,6 +8,13 @@
 import type { Service, Project } from './types.ts';
 import { config } from './config.ts';
 import { hasPublicCert } from './certs.ts';
+import { projects as projectsTable } from './db.ts';
+
+/** The shared variables a project's services see: its base project's, overridden by its own (environments). */
+export function sharedVariables(project: Project): Record<string, string> {
+  const base = project.parentId ? projectsTable.get(project.parentId) : null;
+  return { ...(base?.variables ?? {}), ...(project.variables ?? {}) };
+}
 
 const REF = /\$\{\{\s*([A-Za-z0-9_-]+)(?:\.([A-Za-z0-9_]+))?\s*\}\}/g;
 
@@ -45,7 +52,7 @@ export function referencedServices(svc: Service, siblings: Service[]): string[] 
   const out = new Set<string>();
   for (const v of Object.values(svc.env)) {
     for (const m of v.matchAll(REF)) {
-      if (!m[2]) continue;
+      if (!m[2] || m[1] === 'shared') continue;
       const target = siblings.find((s) => s.id !== svc.id && (s.slug === m[1] || s.name === m[1]));
       if (target) out.add(target.id);
     }
@@ -62,6 +69,7 @@ export function resolveEnv(
 ): { env: Record<string, string>; unresolved: string[] } {
   const unresolved: string[] = [];
   const cache = new Map<string, Record<string, string>>();
+  const shared = sharedVariables(project);
 
   const scopeFor = (s: Service, rawEnv: Record<string, string>, depth: number): Record<string, string> => {
     const key = s.id;
@@ -77,6 +85,12 @@ export function resolveEnv(
           if (a in out) return out[a];
           if (a in base) return resolveValue(base[a], d + 1);
           unresolved.push(a);
+          return '';
+        }
+        // ${{shared.NAME}}: the project's (or environment's) shared variables.
+        if (a === 'shared' && (b in shared || !siblings.some((x) => x.slug === 'shared' || x.name === 'shared'))) {
+          if (b in shared) return resolveValue(shared[b], d + 1);
+          unresolved.push(`shared.${b}`);
           return '';
         }
         const target = siblings.find((x) => x.slug === a || x.name === a);

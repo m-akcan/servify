@@ -1,4 +1,5 @@
 import { serve } from '@hono/node-server';
+import { startUsageAlerts } from './alerts.ts';
 import { startHostStats } from './hoststats.ts';
 import { Hono } from 'hono';
 import { getCookie } from 'hono/cookie';
@@ -127,6 +128,7 @@ async function main() {
   await startEngine();
   startMetrics();
   startHostStats();
+  startUsageAlerts();
   startBackgroundJobs();
   startScheduler();
   startCertificates();

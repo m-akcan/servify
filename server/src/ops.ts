@@ -3,7 +3,7 @@
  * so every capability is available to humans and agents alike, with the same validation.
  */
 import { z } from 'zod';
-import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db } from './db.ts';
+import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
 import type { Project, Service, Deployment, Source, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { id, slugify, secret, HttpError, assert } from './util.ts';
@@ -19,7 +19,7 @@ import { isLocalHost } from './certs.ts';
 import { getSettings, destinationById } from './settings.ts';
 import { backupMethod, backupService, listBackups, isRestoring } from './backups.ts';
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
-import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume } from './volumes.ts';
+import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume, borrowersOf } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { clusterStatus } from './pgcluster.ts';
 import { isExternal, isRoute, parseExternalUrl, parseRedirect, externalTarget } from './external.ts';
@@ -108,8 +108,9 @@ export function listProjects() {
   return all.map((p) => {
     const svcs = servicesTable.all('WHERE project_id = ?', p.id);
     const serverIds = [...new Set(svcs.map((s) => nodeOf(s)))];
+    const { variables: _v, secretKeys: _s, ...rest } = p; // shared variables only travel in a project's own snapshot
     return {
-      ...p,
+      ...rest,
       environments: p.parentId ? 0 : all.filter((x) => x.parentId === p.id).length,
       serviceCount: svcs.length,
       running: svcs.filter((s) => s.status === 'running').length,
@@ -143,7 +144,7 @@ export function projectSnapshot(projectId: string, view: View = { revealSecrets:
   const edges: { from: string; to: string }[] = [];
   for (const s of svcs) for (const t of referencedServices(s, svcs)) edges.push({ from: s.id, to: t });
   return {
-    project,
+    project: publicProject(project, view),
     services: svcs.map((s) => serializeService(s, view)),
     deployments: deps.map((d) => serializeDeployment(d, view)),
     replicas,
@@ -173,16 +174,41 @@ export function createProject(actor: Actor, input: { name: string; color?: strin
   return p;
 }
 
-export function updateProject(actor: Actor, projectId: string, patch: { name?: string; color?: string; icon?: string | null }) {
+export function updateProject(actor: Actor, projectId: string, patch: { name?: string; color?: string; icon?: string | null; variables?: Record<string, string> | null; secretKeys?: string[] | null }) {
   const p = getProjectOrThrow(projectId);
   if (patch.name?.trim()) p.name = patch.name.trim();
   if (patch.color) p.color = patch.color;
   if (patch.icon !== undefined) p.icon = projectIcon(patch.icon);
+  let sharedChanged = false;
+  if (patch.variables !== undefined) {
+    const vars = patch.variables ?? {};
+    assert(typeof vars === 'object' && !Array.isArray(vars), 400, 'variables must be an object');
+    const entries = Object.entries(vars);
+    assert(entries.length <= 200, 400, 'at most 200 shared variables');
+    for (const [k, v] of entries) assert(/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) && typeof v === 'string' && v.length <= 32_768, 400, `invalid shared variable ${k}`);
+    // A masked value sent back unchanged keeps the stored secret.
+    const prev = p.variables ?? {};
+    p.variables = Object.fromEntries(entries.map(([k, v]) => [k, v === '••••••••' && k in prev ? prev[k] : v]));
+    sharedChanged = true;
+  }
+  if (patch.secretKeys !== undefined) p.secretKeys = (patch.secretKeys ?? []).filter((k) => typeof k === 'string' && k in (p.variables ?? {}));
   p.updatedAt = Date.now();
   projectsTable.put(p);
   bus.publish({ type: 'project.updated', project: p });
-  recordActivity(actor, 'project.updated', `Updated project ${p.name}`, p.id);
-  return p;
+  recordActivity(actor, 'project.updated', sharedChanged ? `Updated the shared variables of ${p.name}` : `Updated project ${p.name}`, p.id);
+  // Services that read shared variables pick changes up on their next deploy; tell the caller which.
+  const scope = [p.id, ...projectsTable.all().filter((x) => x.parentId === p.id).map((x) => x.id)];
+  const usesShared = sharedChanged
+    ? servicesTable.all().filter((s) => scope.includes(s.projectId) && Object.values(s.env).some((v) => v.includes('{{') && /\$\{\{\s*shared\./.test(v))).map((s) => ({ id: s.id, name: s.name, projectId: s.projectId }))
+    : [];
+  return { ...p, usesShared };
+}
+
+/** A project for the API: secret shared variables masked for read-only access. */
+export function publicProject(p: Project, view: View = { revealSecrets: true }): Project {
+  if (view.revealSecrets || !p.variables) return p;
+  const secret = new Set(p.secretKeys ?? []);
+  return { ...p, variables: Object.fromEntries(Object.entries(p.variables).map(([k, v]) => [k, secret.has(k) ? '••••••••' : v])) };
 }
 
 export async function deleteProject(actor: Actor, projectId: string) {
@@ -524,6 +550,10 @@ export const updateServiceInput = z.object({
   cmd: z.array(z.string()).nullable().optional().describe('Override only the image CMD (argv array). Ignored when startCommand is set.'),
   entrypoint: z.array(z.string()).nullable().optional().describe('Override only the image ENTRYPOINT (argv array).'),
   buildCommand: z.string().nullable().optional(),
+  buildArgs: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'build arg names are letters, digits and _'), z.string()).nullable().optional().describe('Docker build arguments; values may use ${VAR} from the service variables'),
+  buildTarget: z.string().max(64).nullable().optional().describe('Multi-stage build target'),
+  watchPaths: z.array(z.string().min(1).max(200)).max(50).nullable().optional().describe('Git: deploy only when a push changes files matching these globs (e.g. apps/web/**, !**/*.md)'),
+  preDeployCommand: z.string().max(2000).nullable().optional().describe('Runs once per new deploy (e.g. migrations) in a one-off container from the new image; a failure stops the deploy'),
   resources: z.object({ cpus: z.number().positive().max(64).nullable().optional(), memoryMb: z.number().int().min(16).nullable().optional() }).optional(),
   autoDeploy: z.boolean().optional(),
   secretKeys: z.array(z.string()).optional(),
@@ -660,6 +690,10 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.cmd !== undefined) set('cmd', patch.cmd?.length ? patch.cmd : null, 'command');
   if (patch.entrypoint !== undefined) set('entrypoint', patch.entrypoint?.length ? patch.entrypoint : null, 'entrypoint');
   if (patch.buildCommand !== undefined) set('buildCommand', patch.buildCommand?.trim() || null, 'build command');
+  if (patch.buildArgs !== undefined) set('buildArgs', patch.buildArgs && Object.keys(patch.buildArgs).length ? patch.buildArgs : null, 'build arguments');
+  if (patch.buildTarget !== undefined) set('buildTarget', patch.buildTarget?.trim() || null, 'build target');
+  if (patch.watchPaths !== undefined) set('watchPaths', patch.watchPaths?.map((p) => p.trim()).filter(Boolean).length ? patch.watchPaths.map((p) => p.trim()).filter(Boolean) : null, 'watch paths');
+  if (patch.preDeployCommand !== undefined) set('preDeployCommand', patch.preDeployCommand?.trim() || null, 'pre-deploy command');
   if (patch.resources) set('resources', { ...svc.resources, ...patch.resources } as Service['resources'], 'resources');
   if (patch.autoDeploy !== undefined) set('autoDeploy', patch.autoDeploy, 'auto-deploy');
   if (patch.secretKeys !== undefined) set('secretKeys', patch.secretKeys, 'secrets');
@@ -860,6 +894,44 @@ export function deployService(actor: Actor, serviceId: string, trigger: 'manual'
 }
 
 /** Zero-downtime restart: roll the current image onto fresh replicas. */
+/**
+ * Move a service to another project: its volumes, deploy history and backups go with it, and its containers are
+ * recreated on the new project's private network. Refused when the move would break something (references either
+ * way, shared volumes, a cluster, a name already taken there).
+ */
+export function moveServiceToProject(actor: Actor, serviceId: string, targetRef: string) {
+  const svc = getServiceOrThrow(serviceId);
+  const target = getProjectOrThrow(targetRef);
+  if (target.id === svc.projectId) return serializeService(svc);
+  const from = getProjectOrThrow(svc.projectId);
+  assert(!svc.cluster, 409, `${svc.name} is a database cluster — clusters stay in their project`);
+  assert(!svc.volumes.some((m) => m.borrowed), 409, `${svc.name} reads another service's volume — remove that share first`);
+  const siblings = servicesTable.all('WHERE project_id = ?', svc.projectId);
+  const usedBy = siblings.filter((s) => s.id !== svc.id && referencedServices(s, siblings).includes(svc.id));
+  assert(!usedBy.length, 409, `${usedBy.map((s) => s.name).join(', ')} use${usedBy.length === 1 ? 's' : ''} ${svc.name}'s variables (\${{${svc.slug}.…}}) — that would break after the move; change those references first`);
+  const uses = referencedServices(svc, siblings).map((id) => siblings.find((s) => s.id === id)?.name ?? id);
+  assert(!uses.length, 409, `${svc.name} uses variables of ${uses.join(', ')}, which stay in ${from.name} — change those references first`);
+  const vols = volumesTable.all('WHERE project_id = ?', from.id).filter((v) => v.serviceId === svc.id);
+  const shared = vols.flatMap((v) => borrowersOf(v).filter((s) => s.id !== svc.id).map((s) => s.name));
+  assert(!shared.length, 409, `${shared.join(', ')} read${shared.length === 1 ? 's' : ''} ${svc.name}'s volume — remove that share first`);
+  const taken = servicesTable.all('WHERE project_id = ?', target.id).find((s) => s.slug === svc.slug || s.name.toLowerCase() === svc.name.toLowerCase());
+  assert(!taken, 409, `${target.name} already has a service called ${taken?.name} — rename one of them first`);
+
+  for (const v of vols) volumesTable.put({ ...v, projectId: target.id, updatedAt: Date.now() });
+  for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) deploymentsTable.put({ ...d, projectId: target.id });
+  for (const b of backupsTable.all('WHERE service_id = ?', svc.id)) backupsTable.put({ ...b, projectId: target.id });
+  const pos = placeNear(target.id, 0, 0);
+  const moved: Service = { ...svc, projectId: target.id, x: pos.x, y: pos.y, updatedAt: Date.now() };
+  servicesTable.put(moved);
+  bus.publish({ type: 'service.deleted', serviceId: svc.id, projectId: from.id });
+  bus.publish({ type: 'service.updated', service: moved });
+  recordActivity(actor, 'service.moved', `Moved ${svc.name} from ${from.name} to ${target.name}`, target.id, svc.id);
+  recordActivity(actor, 'service.moved', `Moved ${svc.name} to ${target.name}`, from.id, null);
+  // Containers live on their project's network: recreate them there (the image is unchanged, no pre-deploy).
+  if (!isRoute(moved) && moved.activeDeploymentId && !moved.stopped) restartService(actor, moved.id);
+  return serializeService(moved);
+}
+
 export function restartService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'restart');
@@ -1154,7 +1226,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'redirect') Object.assign(input, { redirect: s.to, redirectCode: s.code, keepPath: s.keepPath });
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -1176,7 +1248,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'buildCommand', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1244,6 +1316,10 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       secretKeys: [...new Set([...svc.secretKeys, ...(raw.secretKeys ?? [])])],
       startCommand: raw.startCommand === undefined ? svc.startCommand : raw.startCommand,
       buildCommand: raw.buildCommand === undefined ? svc.buildCommand : raw.buildCommand,
+      buildArgs: raw.buildArgs ?? null,
+      buildTarget: raw.buildTarget ?? null,
+      watchPaths: raw.watchPaths ?? null,
+      preDeployCommand: raw.preDeployCommand ?? null,
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),
       schedule: raw.schedule ?? null,
