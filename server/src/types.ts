@@ -378,7 +378,7 @@ export interface Template {
   name: string;
   description: string;
   icon: string;
-  category: 'database' | 'cache' | 'storage' | 'app' | 'tool';
+  category: 'database' | 'cache' | 'queue' | 'storage' | 'app' | 'tool';
   image: string;
   protocol: Protocol;
   port: number;

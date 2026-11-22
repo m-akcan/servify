@@ -313,8 +313,8 @@ export function NewServiceModal({
 }
 
 function TemplateGallery({ templates, busy, onPick }: { templates: Template[]; busy: boolean; onPick: (t: Template) => void }) {
-  const cats: Template['category'][] = ['database', 'cache', 'storage', 'app', 'tool'];
-  const names: Record<string, string> = { database: 'Databases', cache: 'Caches', storage: 'Storage', app: 'Web', tool: 'Tools' };
+  const cats: Template['category'][] = ['database', 'cache', 'queue', 'storage', 'app', 'tool'];
+  const names: Record<string, string> = { database: 'Databases', cache: 'Caches', queue: 'Messaging', storage: 'Storage', app: 'Web', tool: 'Tools' };
   let i = 0;
   return (
     <div className="tpl-gallery">

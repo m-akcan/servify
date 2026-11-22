@@ -9,6 +9,7 @@ import { dockerForContainer } from './nodes.ts';
 import { busy, replicasOf, requestReconcile } from './engine.ts';
 import { bus, recordActivity, SYSTEM } from './events.ts';
 import type { Service } from './types.ts';
+import { getTemplate } from './templates.ts';
 
 const UNIT = Number(process.env.SERVIFY_SLEEP_UNIT_MS) || 60_000; // one "minute" (shorter in tests)
 const CHECK = Number(process.env.SERVIFY_SLEEP_CHECK_MS) || 30_000;
@@ -29,6 +30,8 @@ export function cannotSleep(svc: Service): string | null {
   if (svc.ports?.length) return 'it publishes ports on the server, and that traffic doesn’t pass the router';
   if (svc.cluster) return 'clusters can’t sleep';
   if (svc.source.type === 'external' || svc.source.type === 'redirect') return 'routes don’t run anything';
+  const category = svc.templateId ? getTemplate(svc.templateId)?.category : null;
+  if (category === 'database' || category === 'cache' || category === 'queue') return 'apps reach it over the private network, which doesn’t wake it';
   const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
   if (dep?.database) return 'databases can’t sleep: apps reach them over the private network, which doesn’t wake them';
   if ((dep?.config as any)?.schedule) return 'cron services already run only when scheduled';

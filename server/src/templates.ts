@@ -118,6 +118,31 @@ export const templates: Template[] = [
     singleton: true,
   },
   {
+    id: 'rabbitmq',
+    name: 'RabbitMQ',
+    description: 'Message broker: queues hold messages until your workers take them. AMQP_URL for apps; this address opens the management page.',
+    icon: 'rabbitmq',
+    category: 'queue',
+    image: 'rabbitmq:4-management-alpine',
+    // The main port is the management page (so it gets an address and can get a domain); apps connect over the
+    // private network to port 5672, which needs no publishing.
+    protocol: 'http',
+    port: 15672,
+    healthPath: '/',
+    graceSec: 120,
+    volumes: [{ name: 'data', mountPath: '/var/lib/rabbitmq' }],
+    env: {
+      RABBITMQ_DEFAULT_USER: 'admin',
+      RABBITMQ_DEFAULT_PASS: '{{secret}}',
+      // RabbitMQ keeps its data under the node name, which defaults to the container's hostname — new on every
+      // deploy. A fixed name keeps queues and messages across redeploys.
+      RABBITMQ_NODENAME: 'rabbit@localhost',
+      AMQP_URL: 'amqp://${{RABBITMQ_DEFAULT_USER}}:${{RABBITMQ_DEFAULT_PASS}}@${{SERVIFY_PRIVATE_DOMAIN}}:5672',
+    },
+    secretKeys: ['RABBITMQ_DEFAULT_PASS', 'AMQP_URL'],
+    singleton: true,
+  },
+  {
     id: 'minio',
     name: 'MinIO',
     description: 'S3-compatible object storage.',
