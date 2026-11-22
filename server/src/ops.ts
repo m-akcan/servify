@@ -3,9 +3,11 @@
  * so every capability is available to humans and agents alike, with the same validation.
  */
 import { z } from 'zod';
+import { cannotSleep, wake } from './sleep.ts';
+import { removeUploads, uploadPath } from './uploads.ts';
 import { imageUpdateOf, checkService } from './imageupdates.ts';
 import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
-import type { Project, Service, Deployment, Source, Replica } from './types.ts';
+import type { Project, Service, Deployment, Source, SourceUpload, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { id, slugify, secret, HttpError, assert } from './util.ts';
 import { getTemplate, templates } from './templates.ts';
@@ -66,7 +68,7 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.clusterStatus = clusterStatus(s);
   const node = nodeOf(s);
   out.server = { id: node, name: node === LOCAL ? 'This machine' : nodeName(node), online: isOnline(node) };
-  // Private names (service.project.internal / ${{ x.HOST }}) only resolve on the same server in this version.
+  // Private names work across servers through mesh relays (main port only); the panel says so.
   out.crossServerRefs = referencedServicesOn(s);
   out.external = externalTarget(s);
   out.restoring = isRestoring(s.id);
@@ -255,6 +257,7 @@ export const createServiceInput = z.object({
   dockerfile: z.string().optional().describe('Path to a Dockerfile relative to the root dir'),
   token: z.string().optional().describe('Access token for private git repositories'),
   path: z.string().optional().describe('Absolute path of a local folder to build (local-first!)'),
+  upload: z.boolean().optional().describe('Code comes from `servify up` (the service waits for the first upload)'),
   port: z.number().int().min(1).max(65535).optional().describe('Port the app listens on inside the container'),
   protocol: z.enum(['http', 'tcp', 'none']).optional().describe('http = routed by domain, tcp = raw TCP, none = background worker'),
   replicas: z.number().int().min(0).max(32).optional(),
@@ -353,7 +356,7 @@ export function upgradeIcons() {
 function iconFor(input: CreateServiceInput): string {
   if (input.templateId) return getTemplate(input.templateId)?.icon ?? 'box';
   if (input.repo) return 'git';
-  if (input.path) return 'folder';
+  if (input.path || input.upload) return 'folder';
   return iconForImage(input.image ?? '') ?? 'box';
 }
 
@@ -409,13 +412,14 @@ export async function createService(actor: Actor, projectId: string, raw: Create
       token: input.token?.trim() || undefined,
     };
   else if (input.path) source = { type: 'local', path: input.path.trim(), dockerfile: input.dockerfile?.trim() || undefined };
+  else if (input.upload) source = { type: 'upload', uploadId: null, uploadedAt: null, files: 0, bytes: 0 };
   else if (input.external) {
     // The router can reach anything this machine can: pointing it somewhere is the owner's call.
     requireOwner(actor, 'External routes');
     source = { type: 'external', ...parseExternalUrl(input.external, input.protocol ?? 'http'), ...(input.udp ? { udp: true } : {}) };
     if (input.udp && (input.protocol ?? 'http') !== 'tcp') throw new HttpError(400, 'UDP forwarding needs a TCP route (protocol tcp)');
   } else if (input.redirect) source = parseRedirect(input.redirect, input.redirectCode, input.keepPath);
-  else throw new HttpError(400, 'provide one of: templateId, image, repo, path, external, redirect');
+  else throw new HttpError(400, 'provide one of: templateId, image, repo, path, upload, external, redirect');
 
   // A GitHub "tree" URL carries branch and subdirectory.
   if (input.repo) {
@@ -492,11 +496,23 @@ export async function createService(actor: Actor, projectId: string, raw: Create
   return { service: serializeService(servicesTable.get(svc.id)!), deployment: deployment ? serializeDeployment(deployment) : null };
 }
 
+/** A duplicate (or an environment's copy) of an uploaded service starts from the same files. */
+function copyUpload(fromId: string, toId: string, s: SourceUpload) {
+  const from = uploadPath(fromId, s.uploadId!);
+  if (!existsSync(from)) return;
+  cpSync(from, uploadPath(toId, s.uploadId!), { recursive: true });
+  const svc = servicesTable.get(toId);
+  if (!svc) return;
+  svc.source = { ...s };
+  servicesTable.put(svc);
+}
+
 function describeSource(s: Source) {
   if (s.type === 'external') return s.url;
   if (s.type === 'redirect') return `a redirect to ${s.to}`;
   if (s.type === 'image') return s.image;
   if (s.type === 'git') return s.repo.replace(/^https:\/\/github\.com\//, '');
+  if (s.type === 'upload') return 'an upload';
   return s.path;
 }
 
@@ -555,6 +571,7 @@ export const updateServiceInput = z.object({
   buildCommand: z.string().nullable().optional(),
   buildArgs: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'build arg names are letters, digits and _'), z.string()).nullable().optional().describe('Docker build arguments; values may use ${VAR} from the service variables'),
   buildTarget: z.string().max(64).nullable().optional().describe('Multi-stage build target'),
+  sleepAfterMinutes: z.number().int().min(1).max(1440).nullable().optional().describe('HTTP services: stop after this many idle minutes; the next request starts it again (takes a few seconds)'),
   imageAutoUpdate: z.boolean().optional().describe('Image services: redeploy automatically when a new image is published under the same tag (not for databases or clusters)'),
   watchPaths: z.array(z.string().min(1).max(200)).max(50).nullable().optional().describe('Git: deploy only when a push changes files matching these globs (e.g. apps/web/**, !**/*.md)'),
   preDeployCommand: z.string().max(2000).nullable().optional().describe('Runs once per new deploy (e.g. migrations) in a one-off container from the new image; a failure stops the deploy'),
@@ -696,6 +713,14 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.buildCommand !== undefined) set('buildCommand', patch.buildCommand?.trim() || null, 'build command');
   if (patch.buildArgs !== undefined) set('buildArgs', patch.buildArgs && Object.keys(patch.buildArgs).length ? patch.buildArgs : null, 'build arguments');
   if (patch.buildTarget !== undefined) set('buildTarget', patch.buildTarget?.trim() || null, 'build target');
+  if (patch.sleepAfterMinutes !== undefined) {
+    if (patch.sleepAfterMinutes) {
+      const why = cannotSleep({ ...svc, protocol: patch.protocol ?? svc.protocol });
+      if (why) throw new HttpError(400, `${svc.name} can’t sleep: ${why}`);
+    }
+    set('sleepAfterMinutes', patch.sleepAfterMinutes || null, 'sleep when idle');
+    if (!patch.sleepAfterMinutes && svc.sleeping) void wake(svc.id, 'sleeping being turned off');
+  }
   if (patch.imageAutoUpdate !== undefined) set('imageAutoUpdate', patch.imageAutoUpdate, 'image auto-update');
   if (patch.watchPaths !== undefined) set('watchPaths', patch.watchPaths?.map((p) => p.trim()).filter(Boolean).length ? patch.watchPaths.map((p) => p.trim()).filter(Boolean) : null, 'watch paths');
   if (patch.preDeployCommand !== undefined) set('preDeployCommand', patch.preDeployCommand?.trim() || null, 'pre-deploy command');
@@ -851,7 +876,7 @@ export function resolveServer(ref: string | null | undefined): string {
   return n.id;
 }
 
-/** Siblings this service references by variable that run on another server (their private names won't resolve). */
+/** Siblings this service references by variable that run on another server (reached through mesh relays). */
 export function referencedServicesOn(s: Service): string[] {
   const siblings = servicesTable.all('WHERE project_id = ?', s.projectId);
   return referencedServices(s, siblings)
@@ -997,6 +1022,7 @@ export function cancelDeployment(actor: Actor, deploymentId: string) {
 export async function stopService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   svc.stopped = true;
+  svc.sleeping = false;
   svc.status = 'stopped';
   svc.updatedAt = Date.now();
   servicesTable.put(svc);
@@ -1011,6 +1037,7 @@ export async function stopService(actor: Actor, serviceId: string) {
 export function startService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   svc.stopped = false;
+  svc.sleeping = false;
   if (isRoute(svc)) {
     svc.status = svc.source.type === 'redirect' ? 'running' : 'deploying';
     servicesTable.put(svc);
@@ -1039,6 +1066,7 @@ export async function deleteService(actor: Actor, serviceId: string, opts: { qui
   const svc = getServiceOrThrow(serviceId);
   assert(isOnline(nodeOf(svc)), 409, `${svc.name} runs on ${nodeName(nodeOf(svc))}, which is offline — bring it back online before deleting`);
   servicesTable.delete(svc.id);
+  removeUploads(svc.id);
   bus.publish({ type: 'service.deleted', serviceId: svc.id, projectId: svc.projectId });
   if (!opts.quiet) recordActivity(actor, 'service.deleted', `Deleted ${svc.name}`, svc.projectId, null);
   const cids = replicasOf(svc.id).map((r) => r.containerId);
@@ -1170,7 +1198,7 @@ export function serviceSummary(s: Service) {
 
 import { fileURLToPath } from 'node:url';
 import { dirname, join as pjoin } from 'node:path';
-import { existsSync } from 'node:fs';
+import { cpSync, existsSync } from 'node:fs';
 import httpMod from 'node:http';
 import dgram from 'node:dgram';
 import netMod from 'node:net';
@@ -1257,9 +1285,11 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
   else if (s.type === 'external') Object.assign(input, { external: s.url, udp: s.udp });
   else if (s.type === 'redirect') Object.assign(input, { redirect: s.to, redirectCode: s.code, keepPath: s.keepPath });
+  else if (s.type === 'upload') input.upload = true;
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
-  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false }, { quiet: true });
+  if (s.type === 'upload' && s.uploadId) copyUpload(src.id, r.service.id, s);
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -1281,7 +1311,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1315,7 +1345,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
   for (const raw of spec.services) {
     const tpl = raw.templateId ? tpls.get(raw.templateId) : null;
     const src = raw.source ?? (tpl ? { type: 'image' as const, image: tpl.image } : undefined);
-    assert(src && ['image', 'git', 'local', 'external', 'redirect'].includes(src.type), 400, `service ${raw.name}: invalid source`);
+    assert(src && ['image', 'git', 'local', 'upload', 'external', 'redirect'].includes(src.type), 400, `service ${raw.name}: invalid source`);
     // Start from the template (all its variables, volumes, port…) when there is one; the spec overrides.
     const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y };
     if (tpl) input.templateId = tpl.id;
@@ -1323,6 +1353,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
     else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile, token: src.token });
     else if (src.type === 'external') Object.assign(input, { external: src.url, udp: src.udp });
     else if (src.type === 'redirect') Object.assign(input, { redirect: src.to, redirectCode: src.code, keepPath: src.keepPath });
+    else if (src.type === 'upload') input.upload = true;
     else Object.assign(input, { path: src.path, dockerfile: src.dockerfile });
     if (raw.protocol) input.protocol = raw.protocol;
     if (raw.port) input.port = raw.port;
@@ -1353,6 +1384,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       buildTarget: raw.buildTarget ?? null,
       watchPaths: raw.watchPaths ?? null,
       imageAutoUpdate: raw.imageAutoUpdate ?? false,
+      sleepAfterMinutes: raw.sleepAfterMinutes ?? null,
       preDeployCommand: raw.preDeployCommand ?? null,
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),

@@ -109,6 +109,7 @@ function sourceLabel(svc: Service): string {
   if (s.type === 'external') return s.url;
   if (s.type === 'redirect') return `→ ${s.to}`;
   if (s.type === 'image') return s.image;
+  if (s.type === 'upload') return `upload${s.label ? ` · ${s.label}` : ''}`;
   if (s.type === 'git') return `${s.repo.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '')}${s.branch ? `@${s.branch}` : ''}`;
   return (s as any).path;
 }
@@ -163,6 +164,15 @@ export function queueDeployment(
   actor: Actor,
   opts: { image?: string; port?: number | null; fromDeployment?: Deployment } = {},
 ): Deployment {
+  // A deploy (or restart, rollback…) wakes a sleeping service: its new replicas must run.
+  if (svc.sleeping) {
+    svc.sleeping = false;
+    const fresh = servicesTable.get(svc.id);
+    if (fresh?.sleeping) {
+      fresh.sleeping = false;
+      servicesTable.put(fresh);
+    }
+  }
   // Cancel older queued deployments of this service — only the newest matters.
   for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) {
     if (d.status === 'queued') {
@@ -244,7 +254,7 @@ async function runDeployment(depId: string, actor: Actor) {
     dep.nodeId = node === LOCAL ? null : node;
     if (node !== LOCAL) log(`▸ Deploying on server ${nodeName(node)}`);
     const crossRefs = referencedServicesOn(svc);
-    if (crossRefs.length) log(`! ${svc.name} references ${crossRefs.join(', ')} on another server — private names (and \${{ ….HOST }}) only resolve on the same server. Move them together, or use their public URL / TCP address.`);
+    if (crossRefs.length) log(`▸ ${crossRefs.join(', ')} run${crossRefs.length === 1 ? 's' : ''} on another server — reached over Servify's private network relay (main port only)`);
     // Images live per server: after a move, a rollback or restart may find its image elsewhere.
     if (dep.image && !(await d.inspectImage(dep.image))) {
       if (src.type === 'image' && !dep.image.startsWith('servify/')) {

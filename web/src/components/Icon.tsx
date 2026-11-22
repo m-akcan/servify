@@ -85,6 +85,7 @@ const P: Record<string, string> = {
   filter: 'M4 5h16l-6 8v6l-4-2v-4L4 5z',
   pin: 'M12 21v-6M7 15h10l-1.5-4V5h-7v6L7 15z',
   download: 'M12 4v12M7 11l5 5 5-5M5 20h14',
+  upload: 'M12 20V8M7 13l5-5 5 5M5 4h14',
 };
 
 export type IconName = keyof typeof P;

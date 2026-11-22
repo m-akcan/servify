@@ -14,7 +14,9 @@ export type SourceExternal = {
 };
 /** A domain that only redirects (e.g. a bare domain to its www, an old name to the new one). */
 export type SourceRedirect = { type: 'redirect'; to: string; code: 301 | 302 | 307 | 308; keepPath: boolean };
-export type Source = SourceImage | SourceGit | SourceLocal | SourceExternal | SourceRedirect;
+/** A folder uploaded with `servify up`, kept under the data directory. */
+export type SourceUpload = { type: 'upload'; uploadId: string | null; uploadedAt: number | null; files: number; bytes: number; label?: string | null; commitSha?: string | null; commitMessage?: string | null; dockerfile?: string; rootDir?: string };
+export type Source = SourceImage | SourceGit | SourceLocal | SourceUpload | SourceExternal | SourceRedirect;
 
 export type Protocol = 'http' | 'tcp' | 'none';
 export type LbStrategy = 'round-robin' | 'least-conn' | 'ip-hash' | 'random';
@@ -27,6 +29,7 @@ export type ServiceStatus =
   | 'degraded' // some replicas unhealthy
   | 'crashed'
   | 'stopped'
+  | 'sleeping' // idle: containers stopped until the next request wakes it
   | 'failed';
 
 /** A mount of a volume into a service. */
@@ -134,6 +137,10 @@ export interface Service {
   buildTarget?: string | null;
   /** Git deploys only when a push changes files matching these globs; a leading ! excludes (see watchpaths.ts). */
   watchPaths?: string[] | null;
+  /** Stop after this many minutes without a request through the router; the next request starts it again. */
+  sleepAfterMinutes?: number | null;
+  /** Asleep right now (set by the sleeper, cleared by a request, a deploy, a start or a stop). */
+  sleeping?: boolean;
   /** Image services: redeploy automatically when a new image is published under the same tag. */
   imageAutoUpdate?: boolean;
   /** Docker-style overrides (e.g. from Compose): replace only CMD / only ENTRYPOINT. Ignored when startCommand is set. */

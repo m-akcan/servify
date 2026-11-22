@@ -176,6 +176,7 @@ export function refreshServiceStatus(serviceId: string) {
   if (!isOnline(nodeOf(svc))) return; // unknown, not down: keep the last status until the server is back
   let next = svc.status;
   if (svc.stopped) next = 'stopped';
+  else if (svc.sleeping) next = 'sleeping';
   else if (!svc.activeDeploymentId) next = svc.status === 'failed' ? 'failed' : 'idle';
   else if (deployedSchedule(svc)) next = 'running';
   else {
@@ -736,7 +737,7 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
   }
   if (toRemove.length) void drainAndRemove(toRemove, 4000);
 
-  if (!dep || !dep.image || svc.stopped) return;
+  if (!dep || !dep.image || svc.stopped || svc.sleeping) return; // asleep: keep the stopped containers as they are
   const d = dockerFor(nodeOf(svc));
 
   // Crash-loop detection: many restarts in a short window → back off.

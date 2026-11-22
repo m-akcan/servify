@@ -12,6 +12,7 @@
  *     router and health probes treat remote replicas exactly like local ones.
  */
 import https from 'node:https';
+import { handleMeshUpgrade } from './mesh.ts';
 import net from 'node:net';
 import { readFileSync, mkdirSync, rmSync, mkdtempSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -350,6 +351,7 @@ function dropConn(c: Conn, why: string, announce: boolean) {
 
 function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
   socket.on('error', () => {});
+  if (req.url?.startsWith('/mesh/') && handleMeshUpgrade(req, socket, head)) return; // relays authenticate per project
   const node = authNode(req);
   if (!node) {
     console.warn(`[servers] rejected an agent connection from ${req.socket.remoteAddress ?? '?'} (bad token)`);
@@ -428,6 +430,9 @@ export function startServers() {
 }
 
 // ───────────────────────────── management ─────────────────────────────
+
+/** The address servers use to reach this machine (agents and mesh relays). */
+export const hubAddress = () => guessAddress();
 
 function guessAddress(): string {
   if (config.agentPublicHost) return config.agentPublicHost;

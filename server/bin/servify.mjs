@@ -7,6 +7,10 @@
  *   servify service install | uninstall | status | print   run in the background, start at login/boot
  *   servify agent --join <url> --token <t> --fingerprint <fp>   let a Servify run services on this machine
  *   servify cert import <host> <fullchain.pem> <privkey.pem>   take over an existing certificate
+ *
+ * From your own machine, against a Servify here or on a server (see src/cli.ts):
+ *   servify login [url] · link [project] [service] · up [--service name] · deploy · logs [-f] [--build]
+ *   servify run <command…> · exec <command…> · status · open
  */
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -20,7 +24,15 @@ if (major < 22 || (major === 22 && minor < 18)) {
   process.exit(1);
 }
 
-if (cmd === 'start') {
+const CLIENT = ['login', 'logout', 'link', 'unlink', 'up', 'deploy', 'logs', 'run', 'exec', 'status', 'open'];
+
+if (CLIENT.includes(cmd)) {
+  const { main } = await import(pathToFileURL(join(here, '../src/cli.ts')).href);
+  await main(cmd, rest);
+} else if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
+  const { readFileSync } = await import('node:fs');
+  console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0].replace(/^#!.*\n\/\*\*\n/, '').replace(/^ \* ?/gm, ''));
+} else if (cmd === 'start') {
   await import(pathToFileURL(join(here, '../src/main.ts')).href);
 } else if (cmd === 'mcp') {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
@@ -66,6 +78,6 @@ if (cmd === 'start') {
   const { serviceCommand } = await import(pathToFileURL(join(here, 'service.mjs')).href);
   await serviceCommand(rest[0] ?? 'status', fileURLToPath(import.meta.url));
 } else {
-  console.log('usage: servify [start | mcp | token <name> [--read] | service install|uninstall|status|print | agent --join …]');
+  console.log('usage: servify <command> — run `servify help` for the list');
   process.exit(cmd === 'help' || cmd === '--help' ? 0 : 1);
 }

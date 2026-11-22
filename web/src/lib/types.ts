@@ -43,7 +43,7 @@ export type ServiceView = Service & {
   clusterStatus: ClusterStatus | null;
   /** Where it runs. */
   server?: { id: string; name: string; online: boolean };
-  /** Services it references by variable that run on another server (private names won't resolve). */
+  /** Services it references by variable that run on another server (reached through mesh relays). */
   crossServerRefs?: string[];
   /** External routes: the target and whether it answered the last probe. */
   external?: { host: string; port: number; healthy: boolean | null; lastProbe: number | null } | null;

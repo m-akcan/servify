@@ -38,6 +38,14 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Runs in the background.** `servify service install` starts it at login (launchd) or with your session/boot (systemd).
 - **Volumes you can move.** Volumes are first-class: create them, attach them to a service, detach them (the data stays, as a card on the canvas), drag them onto another service, rename and delete them. Sizes are shown live.
 - **Secrets encrypted at rest** (AES-256-GCM) with a master key you control.
+- **A command line.** `servify up` uploads the folder you're in, builds and deploys it and follows the build; `link`, `deploy`, `logs -f`, `run` (a local command with the service's variables), `exec`, `status`, `open`.
+- **Database browser.** A Data tab on Postgres and MySQL/MariaDB services: databases, tables, rows (sorted, paged, NULLs shown as such) and a SQL box that is read-only until you allow writes — using the client inside the container, nothing to install or expose.
+- **Pre-deploy commands, build arguments and targets.** Run migrations in a one-off container before the new version starts (a failure keeps the old one); pass `--build-arg`s and pick a Dockerfile stage.
+- **Shared variables** per project (and per environment), referenced as `${{ shared.NAME }}`, with secrets masked.
+- **Watch paths** for monorepos: a push only deploys the services whose folders it touched.
+- **Image updates.** Registry images are checked for a newer image under the same tag and for newer tags (the same major and the next one), with one-click updates and opt-in automatic ones. Uses manifest HEAD requests, which don't count against Docker Hub's pull limit.
+- **App sleeping.** An HTTP service can stop after a while without requests and wake on the next one (about a second for a small app).
+- **Usage alerts** when a server's disk, memory or CPU stays high, and again when it's back to normal.
 - **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 48 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
@@ -53,6 +61,20 @@ pnpm start
 
 Open **http://localhost:7700**, choose an owner password, and hit **Try the demo** for a ready-made stack (load-balanced web tier, an API built from a local folder, Redis and Postgres) — or create a project and deploy your own. Apps are served at
 `http://<service>.<project>.localhost:8080` — `*.localhost` resolves to your machine in every modern browser and in curl, so there's nothing to configure.
+
+### The command line
+
+From any machine that can reach your Servify (needs Node 22.18+ and this repository, or `npm i -g ./server`):
+
+```bash
+servify login http://your-server:7700   # asks for an API token (Agents → API tokens)
+cd my-app
+servify up --project shop --service web  # creates the service on first use, uploads, builds, deploys
+servify logs -f
+servify run -- npm run migrate           # a local command with the service's variables
+```
+
+`up` honours `.gitignore` in a git repository (and always skips `.git` and `node_modules`); Docker still applies `.dockerignore` during the build. Links are remembered per folder; `SERVIFY_URL`, `SERVIFY_TOKEN`, `SERVIFY_PROJECT` and `SERVIFY_SERVICE` override everything for CI. Note that `run` gets the variables as the service sees them, so private hostnames like `postgres` only resolve inside Servify.
 
 ### Run it in Docker instead
 
@@ -213,7 +235,7 @@ The agent (`server/bin/agent.mjs`, no dependencies) connects **out** to this Ser
 - **Placement:** pick the server when you create a service (or `server` in `create_service`). **Move** in a service's settings (or `move_service`) redeploys the same version on the other server — pulling it, or copying a built image across exactly rather than rebuilding — switches traffic once it is healthy, then removes the old replicas. Old images stay on the previous server until image cleanup removes them. Environments and project exports keep each service's server.
 - **Everything runs where the service runs:** builds, image pulls, cron jobs, backups and `exec`; logs, metrics and backup files travel back. The router here reaches remote replicas through the agent's connection.
 - **Volumes stay on their server.** A service with volumes can't move (back it up and restore it into a service on the other server), and a volume can't be attached to a service on another server. PostgreSQL clusters run all members on one server.
-- **Private names resolve per server.** `db`, `${{ db.HOST }}` and friends work between services on the same server. Servify warns (in settings and the deploy log) when a service references one on another server; use the public URL or TCP address, or keep them together.
+- **A private network across servers.** `db`, `${{ db.HOST }}` and friends work wherever the services run. When a project spans servers, each server gets a small relay container per service that lives elsewhere, answering on its names and main port; connections travel over TLS through this machine (the agents' pinned certificate, a per-project token) to a healthy replica. No ports open between servers. Only the main port is relayed, and the detour adds latency, so keep chatty pairs (an app and its database) on one server.
 - **Offline is not down.** If a server stops answering, its services keep running there; Servify shows them as unreachable, does nothing to them (no restarts, no failovers, no deletes) and re-adopts them when the agent reconnects. You get a notification after a minute.
 
 The agent endpoint listens on `0.0.0.0:7701` only once you add a server (`SERVIFY_AGENT_HOST`, `SERVIFY_AGENT_PORT`). The join command uses your first LAN address; set `SERVIFY_AGENT_PUBLIC_HOST` if servers reach this machine under another name (a VPN or public address). Treat an agent token like a password: whoever holds it can pose as that server.

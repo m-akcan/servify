@@ -283,6 +283,16 @@ export function startImageChecks() {
   bus.subscribe((ev) => {
     if (ev.type !== 'deployment.updated' || ev.deployment.status !== 'active' || ev.deployment.builder !== 'image') return;
     if (!imageUpdateOf(ev.deployment.serviceId)) return;
-    setTimeout(() => void checkService(ev.deployment.serviceId).catch(() => {}), 2000);
+    // Wait until the service points at the new deployment (it switches after the replicas are healthy).
+    const { id: depId, serviceId } = ev.deployment;
+    let tries = 0;
+    const later = () =>
+      setTimeout(() => {
+        const svc = servicesTable.get(serviceId);
+        if (!svc) return;
+        if (svc.activeDeploymentId === depId) void checkService(serviceId).catch(() => {});
+        else if (++tries < 30) later();
+      }, 2000);
+    later();
   });
 }

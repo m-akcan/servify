@@ -542,7 +542,7 @@ export function buildMcpServer(principal: Principal): McpServer {
   server.registerTool(
     'move_service',
     {
-      description: 'Run a service on another server (id or name from list_servers; "local" = this machine). Redeploys there, then retires the old replicas. Services with volumes cannot move (data stays on its server). Private service names only resolve between services on the same server.',
+      description: 'Run a service on another server (id or name from list_servers; "local" = this machine). Redeploys there, then retires the old replicas. Services with volumes cannot move (data stays on its server). Private service names keep working across servers (connections to the main port are relayed through Servify).',
       inputSchema: { service: svcRef, server: z.string() },
       annotations: { destructiveHint: true },
     },

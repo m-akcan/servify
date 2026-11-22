@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { uploadPath } from './uploads.ts';
 import { existsSync, mkdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import type { DockerClient } from './docker.ts';
@@ -162,6 +163,14 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     // Last commit that touched this folder (it may live inside a larger repository).
     const g = await run('git', ['-C', repoDir, 'log', '-1', '--format=%H%n%s', '--', '.']).catch(() => null);
     if (g && g.code === 0) [commitSha, commitMessage] = g.out.trim().split('\n');
+  } else if (src.type === 'upload') {
+    if (!src.uploadId) throw new Error('nothing uploaded yet — run `servify up` in your project folder');
+    repoDir = uploadPath(svc.id, src.uploadId);
+    if (!existsSync(repoDir)) throw new Error('the uploaded files are gone — run `servify up` again');
+    mkdirSync(workDir, { recursive: true });
+    log(`▸ Building the upload from ${src.uploadedAt ? new Date(src.uploadedAt).toISOString().replace('T', ' ').slice(0, 16) : 'earlier'} (${src.files.toLocaleString()} files${src.label ? `, ${src.label}` : ''})`);
+    commitSha = src.commitSha ?? null;
+    commitMessage = src.commitMessage ?? null;
   } else {
     throw new Error('image sources are not built');
   }

@@ -1,4 +1,6 @@
 import { serve } from '@hono/node-server';
+import { startMesh } from './mesh.ts';
+import { startSleeper } from './sleep.ts';
 import { startImageChecks } from './imageupdates.ts';
 import { startUsageAlerts } from './alerts.ts';
 import { startHostStats } from './hoststats.ts';
@@ -131,6 +133,8 @@ async function main() {
   startHostStats();
   startUsageAlerts();
   startImageChecks();
+  startSleeper();
+  startMesh();
   startBackgroundJobs();
   startScheduler();
   startCertificates();

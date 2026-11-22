@@ -12,13 +12,14 @@ import { MetricsTab } from './MetricsTab.tsx';
 import { SettingsTab } from './SettingsTab.tsx';
 import { ConsoleTab } from './ConsoleTab.tsx';
 import { BackupsTab } from './BackupsTab.tsx';
+import { DataTab } from './DataTab.tsx';
 
-export type PanelTab = 'overview' | 'deployments' | 'logs' | 'console' | 'variables' | 'metrics' | 'backups' | 'settings';
+export type PanelTab = 'overview' | 'deployments' | 'logs' | 'console' | 'data' | 'variables' | 'metrics' | 'backups' | 'settings';
 
 export function ServicePanel({ service: s, tab, onClose, onTab }: { service: ServiceView; tab?: string; onClose: () => void; onTab: (t: PanelTab) => void }) {
   const current = useStore((st) => st.current);
   const deps = deploymentsFor(current, s.id);
-  const active: PanelTab = (['overview', 'deployments', 'logs', 'console', 'variables', 'metrics', 'backups', 'settings'] as const).includes(tab as PanelTab) ? (tab as PanelTab) : 'overview';
+  const active: PanelTab = (['overview', 'deployments', 'logs', 'console', 'data', 'variables', 'metrics', 'backups', 'settings'] as const).includes(tab as PanelTab) ? (tab as PanelTab) : 'overview';
   const latest = deps[0];
   const busy = isBusy(s.status) || (latest && isBusy(latest.status));
 
@@ -89,6 +90,7 @@ export function ServicePanel({ service: s, tab, onClose, onTab }: { service: Ser
           { value: 'deployments', label: 'Deployments', count: deps.length || null },
           { value: 'logs', label: 'Logs' },
           { value: 'console', label: 'Console' },
+          ...(s.backupMethod === 'pg_dumpall' || s.backupMethod === 'mysqldump' ? [{ value: 'data' as const, label: 'Data' }] : []),
           { value: 'variables', label: 'Variables', count: Object.keys(s.env).length || null },
           { value: 'metrics', label: 'Metrics' },
           ...(s.backupMethod ? [{ value: 'backups' as const, label: 'Backups' }] : []),
@@ -100,6 +102,7 @@ export function ServicePanel({ service: s, tab, onClose, onTab }: { service: Ser
         {active === 'deployments' && <DeploymentsTab service={s} />}
         {active === 'logs' && <LogsTab service={s} />}
         {active === 'console' && <ConsoleTab service={s} />}
+        {active === 'data' && <DataTab service={s} />}
         {active === 'variables' && <VariablesTab service={s} />}
         {active === 'metrics' && <MetricsTab service={s} />}
         {active === 'backups' && <BackupsTab service={s} />}

@@ -259,10 +259,10 @@ function ServiceServer({ service: s }: { service: ServiceView }) {
         )}
       </div>
       {!!s.crossServerRefs?.length && (
-        <div className="callout" data-tone="warn">
-          <Icon name="alert" size={14} />
+        <div className="callout">
+          <Icon name="link" size={14} />
           <span>
-            {s.name} uses variables from {s.crossServerRefs.join(', ')}, which run{s.crossServerRefs.length === 1 ? 's' : ''} on another server. Private names only resolve on the same server — move them together, or point it at their public URL or TCP address.
+            {s.name} uses {s.crossServerRefs.join(', ')}, which run{s.crossServerRefs.length === 1 ? 's' : ''} on another server. Their private names still work: Servify relays connections to their main port through this machine. For chatty traffic (a database on every request), keeping them on one server is faster.
           </span>
         </div>
       )}
@@ -578,7 +578,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         </Section>
       )}
       {!ext && (
-      <Section title="Source" icon={src.type === 'git' ? 'github' : src.type === 'local' ? 'folder' : 'box'} desc="Changes apply on the next deploy.">
+      <Section title="Source" icon={src.type === 'git' ? 'github' : src.type === 'local' || src.type === 'upload' ? 'folder' : 'box'} desc="Changes apply on the next deploy.">
         <Segmented
           value={src.type}
           onChange={(t) => {
@@ -599,6 +599,30 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
           </Field>
         )}
         {src.type === 'image' && <ImageUpdates service={s} />}
+        {src.type === 'upload' && (
+          <div className="image-updates">
+            <div className="row" style={{ gap: 8 }}>
+              <Icon name="upload" size={13} />
+              <span className="grow">
+                {src.uploadedAt ? (
+                  <>
+                    Uploaded {timeAgo(src.uploadedAt)}
+                    {src.label ? <> from <span className="mono">{src.label}</span></> : null} · {src.files.toLocaleString()} files, {bytes(src.bytes)}
+                  </>
+                ) : (
+                  'Waiting for the first upload.'
+                )}
+              </span>
+            </div>
+            <div className="faint" style={{ fontSize: 12 }}>
+              Deploy from your project folder with <span className="mono">servify up</span>. Redeploys build the latest upload again.
+            </div>
+            <div className="row" style={{ gap: 6 }}>
+              <input className="input mono" readOnly value={`servify link ${project?.slug ?? ''} ${s.slug ?? s.name} && servify up`} onFocus={(e) => e.currentTarget.select()} />
+              <CopyButton text={`servify link ${project?.slug ?? ''} ${s.slug ?? s.name} && servify up`} label="Copy" />
+            </div>
+          </div>
+        )}
         {src.type === 'git' && (
           <>
             <Field label="Repository">
@@ -790,6 +814,24 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             <Field label="Startup grace (s)">
               <CommitInput mono value={String(s.healthcheck.graceSec)} onCommit={(v) => void patch(id, { healthcheck: { graceSec: Number(v) || 60 } })} />
             </Field>
+          </div>
+        </Section>
+      )}
+
+      {s.protocol === 'http' && !ext && !s.cluster && !['pg_dumpall', 'mysqldump', 'mongodump'].includes(s.backupMethod ?? '') && (
+        <Section title="Sleep when idle" icon="moon" desc="Stops the service after a while without requests and starts it again on the next one (the first request waits a few seconds). Only traffic through its URL or domains counts.">
+          <div className="setting-row">
+            <div className="grow">
+              <div className="title">{s.sleepAfterMinutes ? `Sleeps after ${s.sleepAfterMinutes >= 60 ? `${s.sleepAfterMinutes / 60} h` : `${s.sleepAfterMinutes} min`} without requests` : 'Always on'}</div>
+              <div className="desc">{s.sleeping ? 'Asleep now — the next request wakes it.' : 'Saves memory and CPU for apps that are rarely used.'}</div>
+            </div>
+            <select className="select" style={{ width: 'auto' }} value={String(s.sleepAfterMinutes ?? 0)} onChange={(e) => void patch(id, { sleepAfterMinutes: Number(e.target.value) || null })} aria-label="Sleep after">
+              {[0, 5, 10, 15, 30, 60, 120, 360, 1440].map((m) => (
+                <option key={m} value={m}>
+                  {m === 0 ? 'Never' : m >= 60 ? `${m / 60} h` : `${m} min`}
+                </option>
+              ))}
+            </select>
           </div>
         </Section>
       )}

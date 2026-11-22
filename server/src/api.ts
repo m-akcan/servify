@@ -1,4 +1,6 @@
 import { Hono, type Context } from 'hono';
+import { receiveUpload } from './uploads.ts';
+import * as dbb from './dbbrowser.ts';
 import { overview } from './overview.ts';
 import { streamSSE } from 'hono/streaming';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
@@ -348,6 +350,21 @@ api.delete('/servers/:id', async (c) => {
   await removeServer(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
+api.post('/services/:id/upload', async (c) => {
+  const svc = ops.getServiceOrThrow(c.req.param('id'));
+  if (!c.req.raw.body) throw new HttpError(400, 'send the folder as a gzipped tar');
+  const h = (k: string) => {
+    const v = c.req.header(k);
+    try {
+      return v ? decodeURIComponent(v) : null;
+    } catch {
+      return v ?? null;
+    }
+  };
+  const { Readable } = await import('node:stream');
+  const r = await receiveUpload(actor(c), svc, Readable.fromWeb(c.req.raw.body as any), { label: h('x-servify-label'), commitSha: h('x-servify-commit'), commitMessage: h('x-servify-message'), deploy: c.req.query('deploy') !== '0' });
+  return c.json({ source: r.source, deployment: r.deployment ? ops.serializeDeployment(r.deployment) : null, skipped: r.skipped }, 201);
+});
 api.post('/services/:id/image-check', async (c) => c.json(await ops.checkServiceImage(c.req.param('id'))));
 api.post('/services/:id/update-image', async (c) => {
   const body = await c.req.json().catch(() => ({}));
@@ -377,6 +394,28 @@ api.post('/services/:id/run', async (c) => {
   return c.json(run, 202);
 });
 api.get('/services/:id/runs', (c) => c.json(ops.serviceRuns(c.req.param('id'), Number(c.req.query('limit') ?? 30))));
+const dbView = (c: Context<Env>) => {
+  if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot read database contents');
+};
+api.get('/services/:id/db', async (c) => {
+  dbView(c);
+  return c.json(await dbb.databases(c.req.param('id')));
+});
+api.get('/services/:id/db/tables', async (c) => {
+  dbView(c);
+  return c.json(await dbb.tables(c.req.param('id'), c.req.query('db') || null));
+});
+api.get('/services/:id/db/rows', async (c) => {
+  dbView(c);
+  const q = c.req.query();
+  return c.json(await dbb.rows(c.req.param('id'), { db: q.db || null, schema: q.schema || null, table: q.table ?? '', limit: Number(q.limit ?? 100), offset: Number(q.offset ?? 0), order: q.order || null, dir: q.dir || null }));
+});
+api.post('/services/:id/db/query', async (c) => {
+  const { sql, db, write } = await jsonBody<{ sql: string; db?: string | null; write?: boolean }>(c);
+  const svc = ops.getServiceOrThrow(c.req.param('id'));
+  recordActivity(actor(c), 'service.exec', `Ran ${write ? 'a' : 'a read-only'} query in ${svc.name}${db ? `/${db}` : ''}: ${String(sql ?? '').replace(/\s+/g, ' ').slice(0, 80)}`, svc.projectId, svc.id);
+  return c.json(await dbb.query(svc.id, String(sql ?? ''), { db: db ?? null, write: !!write }));
+});
 api.post('/services/:id/exec', async (c) => {
   const { command, replica } = await jsonBody<{ command: string; replica?: number }>(c);
   return c.json(await ops.execInService(actor(c), c.req.param('id'), command, replica));

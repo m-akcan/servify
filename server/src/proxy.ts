@@ -5,6 +5,7 @@
  *  L4: per-service TCP listeners (databases, raw TCP) balanced across replicas.
  */
 import http from 'node:http';
+import { touch, wake } from './sleep.ts';
 import https from 'node:https';
 import net from 'node:net';
 import dgram from 'node:dgram';
@@ -172,6 +173,7 @@ function unavailable(res: http.ServerResponse, svc: Service | null, host: string
   const starting = anyReplicaStarting(svc) || svc.status === 'building' || svc.status === 'deploying';
   res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'retry-after': '3', 'cache-control': 'no-store' });
   if (svc.stopped) res.end(page(503, `${escapeHtml(svc.name)} is stopped`, 'Start it from the dashboard to bring it back online.'));
+  else if (svc.sleeping) res.end(page(503, `${escapeHtml(svc.name)} is waking up`, 'It was asleep after a while without visitors. This page refreshes automatically.', true));
   else if (starting) res.end(page(503, `${escapeHtml(svc.name)} is starting`, 'A deploy is in progress. This page refreshes automatically.', true));
   else res.end(page(503, `${escapeHtml(svc.name)} has no healthy replicas`, 'All replicas are failing their health checks. Check the logs in the dashboard.', true));
 }
@@ -244,6 +246,18 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
     res.writeHead(svc.source.code, { location: redirectLocation(svc, req.url), 'content-length': '0' });
     return res.end();
   }
+  touch(svc.id);
+  if (svc.sleeping) {
+    // Hold the request while the service wakes up; the body stays unread until then.
+    req.pause();
+    void wake(svc.id).then((ok) => {
+      const fresh = lookup(req.headers.host);
+      if (!ok || !fresh) return unavailable(res, fresh ?? svc, req.headers.host ?? '');
+      req.resume();
+      handle(req, res, proto);
+    });
+    return;
+  }
   const t0 = performance.now();
   const tried = new Set<string>();
 
@@ -315,6 +329,12 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
   if (!svc) return socket.destroy();
   if (svc.source.type === 'redirect') {
     socket.end(`HTTP/1.1 ${svc.source.code} Redirect\r\nLocation: ${redirectLocation(svc, req.url)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+    return;
+  }
+  touch(svc.id);
+  if (svc.sleeping) {
+    socket.pause();
+    void wake(svc.id).then((ok) => (ok ? handleUpgrade(req, socket, head, proto) : socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n')));
     return;
   }
   const up = pickUpstream(svc, socket.remoteAddress ?? '');

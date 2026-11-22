@@ -34,6 +34,7 @@ function sourceLine(s: ServiceView) {
   if (s.source.type === 'git') return s.source.repo.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '') + (s.source.branch ? `@${s.source.branch}` : '');
   if (s.source.type === 'external') return `→ ${s.source.url.replace(/^http:\/\//, '')}`;
   if (s.source.type === 'redirect') return `↪ ${s.source.to.replace(/^https?:\/\//, '')}`;
+  if (s.source.type === 'upload') return s.source.label ? `↑ ${s.source.label}` : 'waiting for servify up';
   return s.source.path.replace(/^\/Users\/[^/]+/, '~');
 }
 

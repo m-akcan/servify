@@ -400,6 +400,60 @@ export function createDockerClient(target: DockerTarget) {
       });
     },
 
+    /** Run a command with extra env, keeping stdout and stderr apart and stopping at maxBytes of stdout. */
+    async execCapture(id: string, cmd: string[], opts: { env?: Record<string, string>; timeoutMs?: number; maxBytes?: number } = {}): Promise<{ exitCode: number; stdout: string; stderr: string; truncated: boolean }> {
+      const timeoutMs = opts.timeoutMs ?? 60_000;
+      const maxBytes = opts.maxBytes ?? 5 * 1024 * 1024;
+      const ex = await call<{ Id: string }>('POST', `/containers/${id}/exec`, {
+        body: { AttachStdout: true, AttachStderr: true, Tty: false, Cmd: cmd, Env: Object.entries(opts.env ?? {}).map(([k, v]) => `${k}=${v}`) },
+        timeout: 10_000,
+      });
+      let res: http.IncomingMessage | undefined;
+      let timedOut = false;
+      let truncated = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        res?.destroy();
+      }, timeoutMs);
+      const out: Buffer[] = [];
+      const err: Buffer[] = [];
+      let outBytes = 0;
+      let errBytes = 0;
+      try {
+        res = await stream('POST', `/exec/${ex.Id}/start`, { body: { Detach: false, Tty: false }, timeout: timeoutMs });
+        let buf = Buffer.alloc(0);
+        try {
+          for await (const chunk of res) {
+            buf = Buffer.concat([buf, chunk as Buffer]);
+            while (buf.length >= 8) {
+              const size = buf.readUInt32BE(4);
+              if (buf.length < 8 + size) break;
+              const frame = buf.subarray(8, 8 + size);
+              if (buf[0] === 2) {
+                if (errBytes < 64 * 1024) err.push(frame);
+                errBytes += size;
+              } else {
+                out.push(frame);
+                outBytes += size;
+              }
+              buf = buf.subarray(8 + size);
+            }
+            if (outBytes > maxBytes) {
+              truncated = true;
+              res.destroy();
+              break;
+            }
+          }
+        } catch (e) {
+          if (!timedOut && !truncated) throw e;
+        }
+        if (timedOut) throw new Error(`timed out after ${Math.round(timeoutMs / 1000)} s`);
+        const info = truncated ? { ExitCode: 0 } : await call<any>('GET', `/exec/${ex.Id}/json`, { timeout: 5000 });
+        return { exitCode: info.ExitCode ?? -1, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8'), truncated };
+      } finally {
+        clearTimeout(timer);
+      }
+    },
     async exec(id: string, cmd: string[], timeoutMs = 30000): Promise<{ exitCode: number; output: string }> {
       const ex = await call<{ Id: string }>('POST', `/containers/${id}/exec`, {
         body: { AttachStdout: true, AttachStderr: true, Tty: false, Cmd: cmd },

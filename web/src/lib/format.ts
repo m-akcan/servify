@@ -52,6 +52,7 @@ export const serviceTone: Record<ServiceStatus, Tone> = {
   degraded: 'warn',
   crashed: 'err',
   stopped: 'idle',
+  sleeping: 'idle',
   failed: 'err',
 };
 
@@ -74,6 +75,7 @@ export const serviceLabel: Record<ServiceStatus, string> = {
   degraded: 'Degraded',
   crashed: 'Crashed',
   stopped: 'Stopped',
+  sleeping: 'Asleep',
   failed: 'Failed',
 };
 

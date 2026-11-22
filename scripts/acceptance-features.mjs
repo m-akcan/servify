@@ -12,7 +12,7 @@
  */
 import { execSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -413,6 +413,156 @@ async function main() {
       check('read-only access sees shared secrets masked', roSnap.project.variables.TOKEN === '••••••••' && roSnap.project.variables.GREETING === 'hello', JSON.stringify(roSnap.project?.variables));
     }
   }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ database browser');
+  {
+    const q = (id, sql, opts = {}) => api('POST', `/services/${id}/db/query`, { sql, ...opts });
+    const pg = (await api('POST', `/projects/${P.id}/services`, { name: 'browse-pg', image: 'postgres:16-alpine', protocol: 'none', env: { POSTGRES_PASSWORD: 'pw', POSTGRES_DB: 'app' } })).service;
+    const my = (await api('POST', `/projects/${P.id}/services`, { name: 'browse-my', image: 'mariadb:11', protocol: 'none', env: { MARIADB_ROOT_PASSWORD: 'pw', MARIADB_DATABASE: 'shop' } })).service;
+    await waitFor(async () => (await exec(pg.id, 'pg_isready -q -U postgres -h 127.0.0.1').catch(() => null))?.exitCode === 0, 120_000, 'postgres ready');
+    const created = await q(pg.id, `CREATE TABLE people (id serial PRIMARY KEY, name text, note text); INSERT INTO people (name, note) VALUES ('ada', NULL), ('bob', ''), ('cy', E'a,b\n"c"')`, { write: true });
+    check('a write query reports what it did', /INSERT 0 3/.test(created.message ?? ''), JSON.stringify(created));
+    const info = await api('GET', `/services/${pg.id}/db`);
+    check('lists the databases, current first', info.kind === 'postgres' && info.current === 'app' && info.databases[0] === 'app' && info.databases.includes('postgres'), JSON.stringify(info));
+    const tbls = await api('GET', `/services/${pg.id}/db/tables?db=app`);
+    check('lists the tables', tbls.some((t) => t.schema === 'public' && t.name === 'people' && t.kind === 'table'), JSON.stringify(tbls));
+    const page = await api('GET', `/services/${pg.id}/db/rows?db=app&schema=public&table=people&order=name&dir=desc`);
+    check('pages through rows, sorted', page.total === 3 && page.columns.join() === 'id,name,note' && page.rows.map((r) => r[1]).join() === 'cy,bob,ada', JSON.stringify(page.rows));
+    check('NULL, empty strings, commas, quotes and newlines survive', page.rows[2][2] === null && page.rows[1][2] === '' && page.rows[0][2] === 'a,b\n"c"', JSON.stringify(page.rows));
+    check('column types are shown', page.types.name === 'text' && page.types.id === 'integer', JSON.stringify(page.types));
+    const two = await api('GET', `/services/${pg.id}/db/rows?db=app&schema=public&table=people&order=id&limit=2&offset=2`);
+    check('limit and offset', two.rows.length === 1 && two.rows[0][1] === 'cy');
+    const sel = await q(pg.id, 'SELECT name, length(name) AS n FROM people ORDER BY id', { db: 'app' });
+    check('a query returns columns and rows', sel.columns.join() === 'name,n' && sel.rows.length === 3 && sel.rows[0].join() === 'ada,3', JSON.stringify(sel));
+    const ro = await q(pg.id, `UPDATE people SET name = 'x'`, { db: 'app' }).then(() => 'ran', (e) => String(e.message));
+    check('queries are read-only unless writes are allowed', /read-only/.test(ro) && /Allow writes/.test(ro), ro);
+    check('the update did not happen', (await q(pg.id, `SELECT count(*) FROM people WHERE name = 'x'`, { db: 'app' })).rows[0][0] === '0');
+    const bad = await q(pg.id, 'SELEC 1', { db: 'app' }).then(() => 'ran', (e) => String(e.message));
+    check('SQL errors come back readable', /syntax error/.test(bad) && bad.includes('→ 400'), bad);
+    check('an unknown table is a 404', (await api('GET', `/services/${pg.id}/db/rows?db=app&schema=public&table=nope`).then(() => 'ok', (e) => String(e.message))).includes('→ 404'));
+    if (DATA) {
+      const tok = execSync(`node --disable-warning=ExperimentalWarning server/bin/servify.mjs token acceptance-ro2 --read`, { env: { ...process.env, SERVIFY_DATA_DIR: DATA } }).toString().match(/svf_[A-Za-z0-9_-]+/)?.[0];
+      const r = await fetch(`${BASE}/api/services/${pg.id}/db/rows?db=app&schema=public&table=people`, { headers: { authorization: `Bearer ${tok}` } });
+      check('read-only tokens cannot read database contents', r.status === 403);
+    }
+    // MariaDB
+    await waitFor(async () => (await exec(my.id, 'mariadb-admin ping -uroot -ppw --silent').catch(() => null))?.exitCode === 0, 180_000, 'mariadb ready');
+    await q(my.id, `CREATE TABLE items (id int PRIMARY KEY, title varchar(50), note text); INSERT INTO items VALUES (1, 'pen', NULL), (2, 'tab\there', 'line1\nline2')`, { db: 'shop', write: true });
+    const minfo = await api('GET', `/services/${my.id}/db`);
+    check('MySQL: lists its databases', minfo.kind === 'mysql' && minfo.databases.includes('shop') && !minfo.databases.includes('mysql'), JSON.stringify(minfo));
+    const mrows = await api('GET', `/services/${my.id}/db/rows?db=shop&table=items&order=id`);
+    check('MySQL: rows with NULL, tabs and newlines', mrows.total === 2 && mrows.rows[0][2] === null && mrows.rows[1][1] === 'tab\there' && mrows.rows[1][2] === 'line1\nline2', JSON.stringify(mrows.rows));
+    const mro = await q(my.id, `DELETE FROM items`, { db: 'shop' }).then(() => 'ran', (e) => String(e.message));
+    check('MySQL: read-only unless writes are allowed', /READ ONLY/i.test(mro), mro);
+    check('a non-database service is refused', (await api('GET', `/services/${pg.id === my.id ? '' : (await svcOf(P.id, 'web')).id}/db`).then(() => 'ok', (e) => String(e.message))).includes('→ 400'));
+    await api('DELETE', `/services/${pg.id}`);
+    await api('DELETE', `/services/${my.id}`);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ servify CLI (login, up, link, run, logs, deploy)');
+  if (DATA) {
+    const home = mkdtempSync(join(tmpdir(), 'servify-cli-home-'));
+    const dir = mkdtempSync(join(tmpdir(), 'servify-cli-app-'));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }), () => rmSync(dir, { recursive: true, force: true }));
+    const tok = execSync(`node --disable-warning=ExperimentalWarning server/bin/servify.mjs token acceptance-cli`, { env: { ...process.env, SERVIFY_DATA_DIR: DATA } }).toString().match(/svf_[A-Za-z0-9_-]+/)?.[0];
+    const env = { ...process.env, SERVIFY_CLI_HOME: home, SERVIFY_URL: '', SERVIFY_TOKEN: '', NO_COLOR: '1' };
+    delete env.SERVIFY_URL;
+    delete env.SERVIFY_TOKEN;
+    const cli = (args, opts = {}) => {
+      try {
+        return { code: 0, out: execSync(`node --disable-warning=ExperimentalWarning ${join(process.cwd(), 'server/bin/servify.mjs')} ${args}`, { cwd: opts.cwd ?? dir, env: { ...env, ...(opts.env ?? {}) }, stdio: 'pipe', timeout: 240_000 }).toString() };
+      } catch (e) {
+        return { code: e.status ?? 1, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+      }
+    };
+    const login = cli(`login ${BASE} --token ${tok}`);
+    check('login saves the URL and token', login.code === 0 && /Logged in/.test(login.out) && (statSync(join(home, 'cli.json')).mode & 0o777) === 0o600, login.out);
+    writeFileSync(join(dir, 'Dockerfile'), 'FROM nginx:alpine\nCOPY . /usr/share/nginx/html/\n');
+    writeFileSync(join(dir, 'index.html'), 'cli v1');
+    writeFileSync(join(dir, '.gitignore'), 'secret.env\n');
+    writeFileSync(join(dir, 'secret.env'), 'TOKEN=do-not-upload');
+    git(dir, 'init -q -b main');
+    git(dir, 'add .');
+    git(dir, 'commit -qm first');
+    const host = `cli-app.${P.slug}.localhost`;
+    const first = cli(`up --project ${P.id} --service cli-app`);
+    check('`up` creates the service, uploads and deploys', first.code === 0 && /Created cli-app/.test(first.out) && /Deployed/.test(first.out), first.out.slice(-600));
+    check('the uploaded code is served', !!(await waitFor(async () => (await hit(host)).body === 'cli v1', 60_000, 'cli v1')));
+    check('git-ignored files are not uploaded', (await hit(host, '/secret.env')).status === 404);
+    const linked = cli(`link ${P.id} cli-app`);
+    check('`link` remembers the folder', linked.code === 0 && /cli-app/.test(linked.out), linked.out);
+    writeFileSync(join(dir, 'index.html'), 'cli v2');
+    const second = cli('up');
+    check('`up` in a linked folder deploys local changes', second.code === 0 && /Deployed/.test(second.out), second.out.slice(-400));
+    check('the change is live', !!(await waitFor(async () => (await hit(host)).body === 'cli v2', 60_000, 'cli v2')));
+    const svc = await svcOf(P.id, 'cli-app');
+    const dep = await api('GET', `/deployments/${svc.activeDeploymentId}`);
+    check('the deployment names the commit and local changes', /@ [0-9a-f]{7}\+changes/.test(dep.sourceLabel) && dep.commitMessage === 'first', `${dep.sourceLabel} · ${dep.commitMessage}`);
+    const st = cli('status');
+    check('`status` lists the services', st.code === 0 && /cli-app\s+running/.test(st.out), st.out);
+    await api('PUT', `/services/${svc.id}/variables`, { variables: { GREETING: 'hello from servify' } });
+    const ran = cli(`run -- node -e "console.log('got:' + process.env.GREETING)"`);
+    check('`run` injects the service variables', ran.code === 0 && ran.out.includes('got:hello from servify'), ran.out);
+    const ex = cli('exec cat /usr/share/nginx/html/index.html');
+    check('`exec` runs inside the service', ex.code === 0 && ex.out.trim() === 'cli v2', ex.out);
+    const bl = cli('logs --build');
+    check('`logs --build` shows the last build', bl.code === 0 && /Building the upload/.test(bl.out) && /Deployed/.test(bl.out), bl.out.slice(-300));
+    const dp = cli('deploy');
+    check('`deploy` rebuilds the last upload', dp.code === 0 && /Deployed/.test(dp.out), dp.out.slice(-300));
+    const bad = cli('status', { env: { SERVIFY_TOKEN: 'svf_nope' } });
+    check('a bad token fails clearly', bad.code === 1 && /rejected/.test(bad.out), bad.out);
+    const elsewhere = cli('status', { cwd: home });
+    check('an unlinked folder says how to link', elsewhere.code === 1 && /servify link/.test(elsewhere.out), elsewhere.out);
+    // Unsafe archive entries never leave the upload folder.
+    const { tarEntry, tarEnd } = await import('../server/src/tar.ts');
+    const { gzipSync } = await import('node:zlib');
+    const evil = gzipSync(Buffer.concat([...tarEntry('Dockerfile', Buffer.from('FROM nginx:alpine\n')), ...tarEntry('../escaped.txt', Buffer.from('x')), ...tarEntry('/abs.txt', Buffer.from('x')), tarEnd()]));
+    const up = await fetch(`${BASE}/api/services/${svc.id}/upload?deploy=0`, { method: 'POST', headers: { 'content-type': 'application/gzip', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: evil }).then((r) => r.json());
+    check('unsafe paths in an upload are skipped', up.skipped?.includes('../escaped.txt') && !existsSync(join(DATA, 'uploads', svc.id, 'escaped.txt')) && up.source?.files === 1, JSON.stringify(up));
+    const junk = await fetch(`${BASE}/api/services/${svc.id}/upload?deploy=0`, { method: 'POST', headers: { 'content-type': 'application/gzip', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: 'not a tarball' });
+    check('a broken upload is refused', junk.status === 400);
+    await api('DELETE', `/services/${svc.id}`);
+    check('deleting the service removes its uploads', !existsSync(join(DATA, 'uploads', svc.id)));
+  } else console.log('  – skipped (set SERVIFY_DATA_DIR)');
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ app sleeping');
+  if (process.env.SERVIFY_SLEEP_UNIT_MS) {
+    const sl = (await api('POST', `/projects/${P.id}/services`, { name: 'sleeper', image: 'nginx:alpine', port: 80 })).service;
+    await running(P.id, 'sleeper');
+    const host = `sleeper.${P.slug}.localhost`;
+    check('it serves before sleeping', (await waitFor(async () => (await hit(host)).status === 200, 30_000, 'sleeper up')) === true);
+    const worker = (await api('POST', `/projects/${P.id}/services`, { name: 'no-sleep', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', deploy: false })).service;
+    check('only HTTP services can sleep', (await api('PATCH', `/services/${worker.id}`, { sleepAfterMinutes: 5 }).then(() => 'ok', (e) => String(e.message))).includes('→ 400'));
+    await api('DELETE', `/services/${worker.id}`);
+    await api('PATCH', `/services/${sl.id}`, { sleepAfterMinutes: 1 });
+    const asleep = await waitFor(async () => (await api('GET', `/services/${sl.id}`)).status === 'sleeping', 30_000, 'asleep');
+    check('an idle service goes to sleep', !!asleep);
+    const reps = (await api('GET', `/services/${sl.id}/metrics?seconds=10`)).replicas;
+    check('its containers are stopped, not removed', reps.length === 1 && reps[0].dockerState !== 'running', JSON.stringify(reps.map((r) => r.dockerState)));
+    await sleep(3000);
+    check('and it stays asleep (no restarts, no crash)', (await api('GET', `/services/${sl.id}`)).status === 'sleeping');
+    const t0 = Date.now();
+    const woke = await hit(host);
+    check('a request wakes it and gets the answer', woke.status === 200 && /nginx/i.test(woke.body), `${woke.status} after ${Date.now() - t0} ms`);
+    console.log(`    (woke in ${Date.now() - t0} ms)`);
+    check('it is running again', (await waitFor(async () => (await api('GET', `/services/${sl.id}`)).status === 'running', 15_000, 'running')) === true);
+    await waitFor(async () => (await api('GET', `/services/${sl.id}`)).status === 'sleeping', 30_000, 'asleep again');
+    const before = (await api('GET', `/services/${sl.id}`)).activeDeploymentId;
+    await api('POST', `/services/${sl.id}/deploy`);
+    const redeployed = await waitFor(async () => {
+      const x = await api('GET', `/services/${sl.id}`);
+      return x.activeDeploymentId !== before && (await api('GET', `/deployments/${x.activeDeploymentId}`)).status === 'active';
+    }, 120_000, 'deploy while asleep');
+    check('a deploy wakes it', !!redeployed);
+    await api('PATCH', `/services/${sl.id}`, { sleepAfterMinutes: null });
+    check('turning it off wakes it and keeps it running', !!(await waitFor(async () => (await api('GET', `/services/${sl.id}`)).status === 'running', 30_000, 'awake for good')));
+    await sleep(4000);
+    check('and it stays up', (await api('GET', `/services/${sl.id}`)).status === 'running');
+    await api('DELETE', `/services/${sl.id}`);
+  } else console.log('  – skipped (run Servify with SERVIFY_SLEEP_UNIT_MS)');
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ moving a service to another project');
