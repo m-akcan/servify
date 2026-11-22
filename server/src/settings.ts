@@ -24,6 +24,7 @@ export const NOTIFY_EVENTS = [
   'preview.ready',
   'server.usage',
   'image.update',
+  'servify.update',
 ] as const;
 export type NotifyEvent = (typeof NOTIFY_EVENTS)[number];
 
@@ -94,6 +95,8 @@ export type Settings = {
   alerts: z.infer<typeof alertsSchema>;
   /** Channels subscribed to failures got server.usage added once, when it was introduced. */
   usageEventAdded?: boolean;
+  /** …and servify.update (updates of Servify itself), when that was introduced. */
+  updateEventAdded?: boolean;
 };
 
 const alertsSchema = z.object({
@@ -138,6 +141,11 @@ export function getSettings(): Settings {
   if (!cache.usageEventAdded) {
     for (const ch of cache.notifications.channels) if (ch.events.includes('service.crashed') && !ch.events.includes('server.usage')) ch.events.push('server.usage');
     cache.usageEventAdded = true;
+    save(cache);
+  }
+  if (!cache.updateEventAdded) {
+    for (const ch of cache.notifications.channels) if (ch.events.includes('deploy.failed') && !ch.events.includes('servify.update')) ch.events.push('servify.update');
+    cache.updateEventAdded = true;
     save(cache);
   }
   return cache;

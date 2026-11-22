@@ -27,6 +27,7 @@ import { startBackups } from './backups.ts';
 import { startLogCollector, flushLogs } from './logstore.ts';
 import { startEnvironments } from './envs.ts';
 import { acquireLock } from './lock.ts';
+import { settleUpdate } from './updater.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -148,6 +149,7 @@ async function main() {
   setInterval(() => sessionsTable.prune(), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
+    void docker.ping().then((ok) => settleUpdate({ docker: !!ok }), () => settleUpdate({ docker: false }));
     const dash = `http://localhost:${config.port}`;
     console.log(`
   ╭───────────────────────────────────────────────╮

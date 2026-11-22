@@ -83,7 +83,7 @@ export function parseRepo(ref: string): Repo | null {
 
 /** The repository's name as `RepoDigests` spells it ("postgres", "ghcr.io/owner/app", "localhost:5000/app"). */
 const familiar = (r: Repo) => (r.registry === 'docker.io' ? r.repo.replace(/^library\//, '') : `${r.registry}/${r.repo}`);
-function sameRepo(name: string, r: Repo): boolean {
+export function sameRepo(name: string, r: Repo): boolean {
   const n = name.replace(/^(docker\.io|index\.docker\.io|registry-1\.docker\.io)\//, '').replace(/^library\//, '');
   return n === familiar(r);
 }
@@ -161,7 +161,10 @@ const cmp = (a: number[], b: number[]) => {
   return 0;
 };
 
-/** The newest same-shape tag within the current major (only for x.y / x.y.z) and above it. */
+/**
+ * The newest same-shape tag within the current major (only for x.y / x.y.z), and the newest of the next major up —
+ * not the highest major: many apps (Nextcloud, databases) can only upgrade one major at a time.
+ */
 export function newerTags(current: string, tags: string[]): { newerTag: string | null; newerMajor: string | null } {
   const cur = parseVersion(current);
   if (!cur) return { newerTag: null, newerMajor: null };
@@ -172,7 +175,7 @@ export function newerTags(current: string, tags: string[]): { newerTag: string |
     if (!v || v.shape !== cur.shape || cmp(v.nums, cur.nums) <= 0) continue;
     if (v.nums[0] === cur.nums[0]) {
       if (cur.nums.length > 1 && (!minor || cmp(v.nums, minor.v.nums) > 0)) minor = { tag, v };
-    } else if (!major || cmp(v.nums, major.v.nums) > 0) major = { tag, v };
+    } else if (!major || v.nums[0] < major.v.nums[0] || (v.nums[0] === major.v.nums[0] && cmp(v.nums, major.v.nums) > 0)) major = { tag, v };
   }
   return { newerTag: minor?.tag ?? null, newerMajor: major?.tag ?? null };
 }
@@ -188,6 +191,16 @@ export async function remoteFacts(r: Repo): Promise<Remote> {
     const digest = await remoteDigest(r);
     const tags = parseVersion(r.tag) ? await listTags(r).catch(() => []) : [];
     return { digest, tags };
+  } catch (e) {
+    const msg = (e as Error).name === 'TimeoutError' ? 'the registry did not answer' : (e as Error).message;
+    return { error: msg.startsWith('fetch failed') ? 'the registry could not be reached' : msg };
+  }
+}
+
+/** Only the digest the tag points at (one request, no tag listing). */
+export async function remoteDigestOf(r: Repo): Promise<{ digest: string } | { error: string }> {
+  try {
+    return { digest: await remoteDigest(r) };
   } catch (e) {
     const msg = (e as Error).name === 'TimeoutError' ? 'the registry did not answer' : (e as Error).message;
     return { error: msg.startsWith('fetch failed') ? 'the registry could not be reached' : msg };

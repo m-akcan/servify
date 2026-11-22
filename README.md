@@ -36,6 +36,7 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **PostgreSQL clusters.** A primary and streaming standbys, each on its own volume, with synchronous replication, automatic fenced failover, one-click switchover, and separate write (`DATABASE_URL`) and read (`DATABASE_READ_URL`) addresses.
 - **Per-replica volumes.** Give each replica its own volume so software that replicates itself can scale; deploys roll one replica at a time.
 - **Runs in the background.** `servify service install` starts it at login (launchd) or with your session/boot (systemd).
+- **Updates itself.** Settings → General → Check for updates installs a new release and restarts; if the new version can't start, it goes back to the previous one, database included.
 - **Volumes you can move.** Volumes are first-class: create them, attach them to a service, detach them (the data stays, as a card on the canvas), drag them onto another service, rename and delete them. Sizes are shown live.
 - **Secrets encrypted at rest** (AES-256-GCM) with a master key you control.
 - **A command line.** `servify up` uploads the folder you're in, builds and deploys it and follows the build; `link`, `deploy`, `logs -f`, `run` (a local command with the service's variables), `exec`, `status`, `open`.
@@ -43,7 +44,7 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Pre-deploy commands, build arguments and targets.** Run migrations in a one-off container before the new version starts (a failure keeps the old one); pass `--build-arg`s and pick a Dockerfile stage.
 - **Shared variables** per project (and per environment), referenced as `${{ shared.NAME }}`, with secrets masked.
 - **Watch paths** for monorepos: a push only deploys the services whose folders it touched.
-- **Image updates.** Registry images are checked for a newer image under the same tag and for newer tags (the same major and the next one), with one-click updates and opt-in automatic ones. Uses manifest HEAD requests, which don't count against Docker Hub's pull limit.
+- **Image updates.** Registry images are checked for a newer image under the same tag and for newer tags (the same major and the next one), with one-click updates and opt-in automatic ones. Uses manifest HEAD requests, which don't count against Docker Hub's pull limit. A service running a pinned local copy can be pointed back at its registry image without a restart (`POST /api/services/:id/track-image`), but only when the registry tag is byte-identical to what runs.
 - **App sleeping.** An HTTP service can stop after a while without requests and wake on the next one (about a second for a small app).
 - **Usage alerts** when a server's disk, memory or CPU stays high, and again when it's back to normal.
 - **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 48 tools. Everything an agent does is attributed to its token.
@@ -253,6 +254,21 @@ pnpm service print       # show the file without installing anything
 
 The login service runs with the `SERVIFY_*` and `DOCKER_HOST` settings Servify had when you turned it on. Each data directory gets its own agent, and only one Servify runs per data directory: a second copy exits right away. On Linux, `sudo loginctl enable-linger $USER` makes it start at boot without logging in.
 
+## Updating Servify
+
+**Settings → General → Updates.** Servify only looks for a new release when you click **Check for updates**; nothing is fetched in the background. **Update and restart** then:
+
+1. downloads the release package from GitHub and checks it against its SHA-256 checksum;
+2. unpacks it next to the install folder (`<install>.next`) and runs the new version's self-test (`servify selftest`);
+3. saves a copy of the database (`VACUUM INTO`, in `~/.servify/updates/`);
+4. swaps the folders (the old one stays as `<install>.prev`) and exits, so the service manager starts the new version.
+
+The new version has two minutes to serve the dashboard and reach Docker. If it crashes or misses that three times in a row, Servify puts the previous folder and the database copy back and starts the old version (the new one is kept as `<install>.failed` for a look). Either way you get a notification (`servify.update`).
+
+It needs **Start at login** to be on (something has to start Servify again) and an install from a release package or a plain copy — not a git checkout (`git pull && pnpm build`) and not the Docker image (pull or rebuild it). The same through the API: `GET /api/system/update`, `POST /api/system/update/check`, `POST /api/system/update` (owner only).
+
+Releases are built by GitHub Actions from a `v<version>` tag (`.github/workflows/release.yml`, using `scripts/release.mjs`): the server with its production dependencies and the built dashboard, so a machine only needs Node.js to run it. Every push is typechecked, built and packaged by `.github/workflows/ci.yml`.
+
 ## Backups
 
 Services with data get a **Backups** tab: back up now, a schedule (cron), how many to keep, and where (this machine, any folder, or S3-compatible storage configured in Settings → Backup storage). Postgres, MySQL/MariaDB and MongoDB are dumped while they keep serving; other services' volumes are archived. **Restore** takes a safety backup, then rebuilds the data: dumps are replayed into a freshly initialised database, archives replace the volume contents. Backups can be downloaded as `.gz` files.
@@ -314,6 +330,7 @@ pnpm typecheck
 node scripts/acceptance.mjs           # end-to-end test against a running instance (real Docker)
 node scripts/acceptance-features.mjs  # HTTPS, webhooks, notifications, backups, history, compose, environments
 node web/scripts/gen-brand-icons.mjs  # refresh the service logos (simple-icons, CC0)
+pnpm build && node scripts/release.mjs  # the release package (dist/servify-v<version>.tar.gz + .sha256)
 ```
 
 `scripts/acceptance-hosting.mjs` checks host folders, read-only shares, adopted volumes, published TCP/UDP ports, external routes, the Compose import that uses them, the owner-only gates and that restores and deletes never touch data a service doesn't own (see its header).

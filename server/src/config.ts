@@ -1,12 +1,23 @@
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync } from 'node:fs';
 
 function envInt(name: string, fallback: number): number {
   const v = process.env[name];
   if (!v) return fallback;
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/** The root package.json (a release package ships it too); server/package.json if it's missing. */
+function readVersion(): string {
+  for (const f of ['../../package.json', '../package.json']) {
+    try {
+      const v = JSON.parse(readFileSync(resolve(import.meta.dirname, f), 'utf8')).version;
+      if (typeof v === 'string' && v) return v;
+    } catch {}
+  }
+  return '0.0.0';
 }
 
 const dataDir = resolve(process.env.SERVIFY_DATA_DIR ?? join(homedir(), '.servify'));
@@ -52,7 +63,8 @@ export const config = {
     .filter(Boolean),
   inContainer: existsSync('/.dockerenv') || process.env.SERVIFY_IN_CONTAINER === '1',
   webDist: resolve(import.meta.dirname, '../../web/dist'),
-  version: '0.1.0',
+  /** One source for the version: the root package.json (a release package ships it too). */
+  version: readVersion(),
 };
 
 for (const dir of [config.dataDir, config.buildsDir, config.logsDir]) {

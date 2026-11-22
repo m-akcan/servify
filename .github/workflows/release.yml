@@ -1,0 +1,37 @@
+# On a version tag (v1.2.3): check that it matches package.json, build the package the updater installs and
+# publish it as a GitHub release with its checksum.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+          cache: pnpm
+      - name: The tag matches package.json
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: node scripts/release.mjs --out dist
+      - name: Self-test of the package
+        run: |
+          mkdir -p /tmp/pkg && tar -xzf dist/servify-${GITHUB_REF_NAME}.tar.gz -C /tmp/pkg --strip-components=1
+          node --disable-warning=ExperimentalWarning /tmp/pkg/server/bin/servify.mjs selftest
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/servify-${GITHUB_REF_NAME}.tar.gz dist/servify-${GITHUB_REF_NAME}.tar.gz.sha256 --title "Servify ${GITHUB_REF_NAME#v}" --generate-notes

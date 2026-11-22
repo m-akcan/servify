@@ -370,6 +370,36 @@ async function main() {
     await api('POST', `/services/${upd.id}/update-image`, { tag: '2.0' });
     const bks = await api('GET', `/services/${upd.id}/backups`);
     check('a tag switch on a service with data backs it up first', bks.length === backupsBefore + 1 && bks[0].status === 'succeeded' && (await api('GET', `/services/${upd.id}`)).source.image === `${reg}:2.0`, JSON.stringify(bks[0] ?? null).slice(0, 200));
+
+    // A pinned local copy (like a migrated image) can be pointed back at its registry image without a redeploy.
+    push('alpine:3.20', 'track');
+    sh(`docker rmi ${reg}:track && docker pull -q ${reg}:track && docker tag ${reg}:track servify-acc/pinned:copy`);
+    cleanups.push(async () => execSync(`docker rmi servify-acc/pinned:copy ${reg}:track || true`, { stdio: 'ignore' }));
+    const pin = (await api('POST', `/projects/${P.id}/services`, { image: 'servify-acc/pinned:copy', name: 'pinned', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'pinned');
+    const pinDep = (await api('GET', `/services/${pin.id}`)).activeDeploymentId;
+    const depCount = async () => (await api('GET', `/services/${pin.id}/deployments`)).length;
+    const n1 = await depCount();
+    check('a pinned local copy is "unknown"', (await api('POST', `/services/${pin.id}/image-check`))?.status === 'unknown');
+    const refuse = (body) => api('POST', `/services/${pin.id}/track-image`, body).then(() => 'ok', (e) => String(e.message));
+    check('tracking a repository it was not pulled from is refused', (await refuse({ image: 'alpine:3.20' })).includes('→ 409'));
+    push('busybox:1.36', 'other');
+    check('tracking a different image of that repository is refused', /→ 409.*different image/.test(await refuse({ image: `${reg}:other` })));
+    const tr = await api('POST', `/services/${pin.id}/track-image`, { image: `${reg}:track` });
+    const after = await api('GET', `/services/${pin.id}`);
+    check('tracking the identical registry image works', tr.sameImage === true && after.source.image === `${reg}:track` && tr.imageUpdate?.status === 'current', JSON.stringify(tr.imageUpdate));
+    check('without a redeploy or a pending change', after.activeDeploymentId === pinDep && (await depCount()) === n1 && (after.pendingChanges ?? []).length === 0, JSON.stringify(after.pendingChanges));
+    // The tag moves on in the registry (copied server-side, so the local tag stays): now it's an update.
+    const accept = 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json';
+    const mf = await fetch(`http://localhost:${REG_PORT}/v2/acc/app/manifests/other`, { headers: { accept } });
+    const mfBody = Buffer.from(await mf.arrayBuffer());
+    await fetch(`http://localhost:${REG_PORT}/v2/acc/app/manifests/track`, { method: 'PUT', headers: { 'content-type': mf.headers.get('content-type') }, body: mfBody });
+    check('when the tag moves on, the tracked service shows an update', (await api('POST', `/services/${pin.id}/image-check`))?.status === 'changed');
+    const pin2 = (await api('POST', `/projects/${P.id}/services`, { image: 'servify-acc/pinned:copy', name: 'pinned-two', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'pinned-two');
+    check('a tag that moved on is refused by default', /→ 409.*moved on/.test(await api('POST', `/services/${pin2.id}/track-image`, { image: `${reg}:track` }).then(() => 'ok', (e) => String(e.message))));
+    const tr2 = await api('POST', `/services/${pin2.id}/track-image`, { image: `${reg}:track`, allowMoved: true });
+    check('the tag it was pulled as can be tracked after it moved (and reports the update)', tr2.sameImage === false && tr2.imageUpdate?.status === 'changed', JSON.stringify(tr2.imageUpdate));
   }
 
   // ─────────────────────────────────────────────────────────────

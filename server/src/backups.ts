@@ -362,6 +362,8 @@ async function waitReady(svc: Service, method: BackupMethod, timeoutMs = 240_000
 
 const restoring = new Set<string>();
 export const isRestoring = (serviceId: string) => restoring.has(serviceId);
+/** Restores running anywhere right now. */
+export const restoresRunning = () => restoring.size;
 
 export function restoreBackup(actor: Actor, backupId: string) {
   const b = backupsTable.get(backupId);

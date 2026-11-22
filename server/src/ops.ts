@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { cannotSleep, wake } from './sleep.ts';
 import { removeUploads, uploadPath } from './uploads.ts';
-import { imageUpdateOf, checkService } from './imageupdates.ts';
+import { imageUpdateOf, checkService, parseRepo, remoteDigestOf, sameRepo } from './imageupdates.ts';
 import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
 import type { Project, Service, Deployment, Source, SourceUpload, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
@@ -948,6 +948,53 @@ export async function updateServiceImage(actor: Actor, serviceId: string, tag?: 
     servicesTable.put(fresh);
   }
   return serializeDeployment(queueDeployment(fresh, 'update', actor));
+}
+
+/**
+ * Point a service at a registry image without redeploying: for a copy that runs under a local name (a pinned or
+ * migrated image), so update checks can follow the registry. Allowed only when the running image provably came from
+ * that repository (Docker recorded its digest when it was pulled) and the tag resolves to exactly that image. With
+ * `allowMoved`, also the tag it was pulled as after it moved on (the check then reports the newer image) — careful
+ * with `:latest`: a normal deploy pulls it again. Nothing restarts: the containers keep running the local copy.
+ */
+export async function trackServiceImage(actor: Actor, serviceId: string, image: string, opts: { allowMoved?: boolean } = {}) {
+  const svc = getServiceOrThrow(serviceId);
+  if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run an image`);
+  const ref = normalizeImageRef(String(image ?? ''));
+  const r = parseRepo(ref);
+  if (!r) throw new HttpError(400, 'give the image as repository:tag');
+  const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
+  if (!dep?.image) throw new HttpError(409, `${svc.name} has no running deployment to compare with`);
+  const info = await dockerFor(nodeOf(svc))
+    .inspectImage(dep.image)
+    .catch(() => null);
+  if (!info) throw new HttpError(409, `the running image (${dep.image}) is no longer on the server`);
+  const recorded: string[] = [...new Set([...(dep.repoDigests ?? []), ...((info.RepoDigests as string[] | undefined) ?? [])])];
+  const digests = recorded.filter((d) => sameRepo(d.split('@')[0], r));
+  if (!digests.length) throw new HttpError(409, `the running image wasn't pulled from ${r.registry === 'docker.io' ? r.repo.replace(/^library\//, '') : `${r.registry}/${r.repo}`}`);
+  const remote = await remoteDigestOf(r);
+  const same = !('error' in remote) && digests.some((d) => d.endsWith(`@${remote.digest}`));
+  const pulledAs = ((info.RepoTags as string[] | undefined) ?? []).some((t) => {
+    const tr = parseRepo(t);
+    return !!tr && tr.registry === r.registry && tr.repo === r.repo && tr.tag === r.tag;
+  });
+  if (!same && !(opts.allowMoved && pulledAs)) {
+    if ('error' in remote) throw new HttpError(409, `couldn't check ${ref}: ${remote.error}`);
+    throw new HttpError(409, pulledAs ? `${ref} has moved on since ${svc.name}'s image was pulled (pass allowMoved to track it anyway)` : `${ref} is a different image from the one ${svc.name} runs`);
+  }
+  const before = svc.source.image;
+  svc.source = { type: 'image', image: ref };
+  svc.updatedAt = Date.now();
+  servicesTable.put(svc);
+  // The running deployment now names the same image, so this isn't a pending change.
+  dep.config = { ...dep.config, source: { type: 'image', image: ref } };
+  dep.repoDigests = [...new Set([...(dep.repoDigests ?? []), ...digests])];
+  dep.sourceLabel = ref;
+  deploymentsTable.put(dep);
+  recordActivity(actor, 'service.updated', `${svc.name} now follows ${ref} (was ${before}; ${same ? 'the same image' : 'pulled under that tag'}, nothing restarted)`, svc.projectId, svc.id);
+  bus.publish({ type: 'service.updated', service: svc });
+  const update = await checkService(svc.id).catch(() => null);
+  return { service: serializeService(svc), sameImage: same, imageUpdate: update };
 }
 
 export async function checkServiceImage(serviceId: string) {

@@ -7,6 +7,7 @@
  *   servify service install | uninstall | status | print   run in the background, start at login/boot
  *   servify agent --join <url> --token <t> --fingerprint <fp>   let a Servify run services on this machine
  *   servify cert import <host> <fullchain.pem> <privkey.pem>   take over an existing certificate
+ *   servify selftest           load the server without starting it (the updater runs this on a new release)
  *
  * From your own machine, against a Servify here or on a server (see src/cli.ts):
  *   servify login [url] · link [project] [service] · up [--service name] · deploy · logs [-f] [--build]
@@ -33,7 +34,23 @@ if (CLIENT.includes(cmd)) {
   const { readFileSync } = await import('node:fs');
   console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0].replace(/^#!.*\n\/\*\*\n/, '').replace(/^ \* ?/gm, ''));
 } else if (cmd === 'start') {
+  // Right after an update: count this start, and roll back if the new version keeps failing (see update-guard.mjs).
+  const { guardStart } = await import(pathToFileURL(join(here, 'update-guard.mjs')).href);
+  guardStart(here);
   await import(pathToFileURL(join(here, '../src/main.ts')).href);
+} else if (cmd === 'selftest') {
+  // Used by the updater on a freshly unpacked release: load every part of the server without starting it.
+  if (!process.env.SERVIFY_DATA_DIR) {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    process.env.SERVIFY_DATA_DIR = mkdtempSync(join(tmpdir(), 'servify-selftest-'));
+  }
+  for (const m of ['config.ts', 'db.ts', 'api.ts', 'mcp.ts', 'engine.ts', 'deployer.ts', 'proxy.ts', 'nodes.ts', 'mesh.ts', 'sleep.ts', 'backups.ts', 'updater.ts']) {
+    await import(pathToFileURL(join(here, '../src', m)).href);
+  }
+  const { config } = await import(pathToFileURL(join(here, '../src/config.ts')).href);
+  console.log(`selftest ok ${config.version}`);
+  process.exit(0);
 } else if (cmd === 'mcp') {
   const { StdioServerTransport } = await import('@modelcontextprotocol/sdk/server/stdio.js');
   const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');

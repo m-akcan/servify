@@ -21,6 +21,7 @@ const EVENTS = [
   ['preview.ready', 'Preview ready'],
   ['server.usage', 'Server disk, memory or CPU high'],
   ['image.update', 'Image update available'],
+  ['servify.update', 'Servify updated (or an update failed)'],
 ] as const;
 type EventKey = (typeof EVENTS)[number][0];
 
@@ -165,6 +166,7 @@ function General({ settings, reload }: { settings: Settings; reload: () => void 
         </div>
       </Card>
       <StartAtLogin />
+      <Updates />
       {system && (
         <Card title="This instance" desc="Configured with environment variables at startup (see the README).">
           <dl className="kv-grid">
@@ -246,6 +248,128 @@ function StartAtLogin() {
               </Button>
             </div>
           )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+type Release = { version: string; tag: string; url: string; notes: string; publishedAt: string | null };
+type UpdateStatus = {
+  version: string;
+  installDir: string;
+  cannotUpdate: string | null;
+  lastCheck: { at: number; release: Release | null; error?: string } | null;
+  lastUpdate: { from: string; to: string; state: 'switched' | 'confirmed' | 'rolled-back' | 'failed'; error: string | null; finishedAt: number | null; previousKeptAt: string | null } | null;
+};
+type UpdateCheck = { current: string; latest: Release | null; available: boolean; error?: string };
+
+/** Updating Servify itself: checks only when asked, installs a release and restarts (rolling back if it can't start). */
+function Updates() {
+  const [st, setSt] = useState<UpdateStatus | null>(null);
+  const [check, setCheck] = useState<UpdateCheck | null>(null);
+  const [phase, setPhase] = useState<'idle' | 'checking' | 'installing' | 'restarting'>('idle');
+  const load = () =>
+    api
+      .get<UpdateStatus>('/system/update')
+      .then(setSt)
+      .catch(() => setSt(null));
+  useEffect(() => {
+    void load();
+  }, []);
+  if (!st) return null;
+  const doCheck = async () => {
+    setPhase('checking');
+    try {
+      const r = await api.post<UpdateCheck>('/system/update/check');
+      setCheck(r);
+      if (r.error) toast({ title: 'Could not check for updates', body: r.error, tone: 'err' });
+      else if (!r.available) toast({ title: `${r.current} is the newest version`, tone: 'ok' });
+    } catch (e) {
+      toastError(e, 'Could not check for updates');
+    } finally {
+      setPhase('idle');
+    }
+  };
+  const install = async (rel: Release) => {
+    const yes = await confirmDialog({
+      title: `Update Servify to ${rel.version}?`,
+      body: `Servify downloads the release, checks and tests it, saves a copy of its database, then restarts on the new version (the dashboard is gone for a few seconds; your services keep running). If the new version can't start properly, it goes back to ${st.version} on its own.`,
+      confirm: 'Update and restart',
+    });
+    if (!yes) return;
+    setPhase('installing');
+    try {
+      await api.post('/system/update', { version: rel.version });
+      setPhase('restarting');
+      // Wait for the new version to answer (or the old one, after a rollback).
+      const until = Date.now() + 8 * 60_000;
+      while (Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const h = await fetch('/api/health').then((r) => (r.ok ? r.json() : null), () => null);
+        if (!h) continue;
+        const s = await api.get<UpdateStatus>('/system/update').catch(() => null);
+        if (s?.lastUpdate?.state === 'confirmed' && h.version === rel.version) {
+          toast({ title: `Updated to ${rel.version}`, tone: 'ok' });
+          location.reload();
+          return;
+        }
+        if (s?.lastUpdate && (s.lastUpdate.state === 'rolled-back' || s.lastUpdate.state === 'failed')) {
+          toast({ title: `The update to ${rel.version} didn’t work`, body: s.lastUpdate.error ?? undefined, tone: 'err' });
+          setSt(s);
+          setPhase('idle');
+          return;
+        }
+      }
+      toast({ title: 'Still restarting', body: 'Reload this page in a minute.', tone: 'idle' });
+      setPhase('idle');
+    } catch (e) {
+      toastError(e, 'Could not update');
+      setPhase('idle');
+      void load();
+    }
+  };
+  const last = st.lastUpdate;
+  const rel = check?.available ? check.latest : null;
+  return (
+    <Card
+      title="Updates"
+      icon={<Icon name="arrowUp" size={16} />}
+      desc={`Version ${st.version}. Servify looks for a new release only when you ask.`}
+      right={
+        <Button size="sm" disabled={phase !== 'idle'} onClick={() => void doCheck()}>
+          {phase === 'checking' ? 'Checking…' : 'Check for updates'}
+        </Button>
+      }
+    >
+      {rel && (
+        <div className="col" style={{ gap: 10 }}>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <Badge tone="ok">{rel.version} available</Badge>
+            {rel.url && (
+              <a className="faint" href={rel.url} target="_blank" rel="noreferrer">
+                What’s new
+              </a>
+            )}
+          </div>
+          {st.cannotUpdate ? (
+            <div className="faint" style={{ fontSize: 12.5 }}>
+              Can’t update from here: {st.cannotUpdate}.
+            </div>
+          ) : (
+            <div>
+              <Button variant="primary" size="sm" disabled={phase !== 'idle'} onClick={() => void install(rel)}>
+                {phase === 'installing' ? 'Downloading and testing…' : phase === 'restarting' ? 'Restarting…' : last && last.to === rel.version && last.state !== 'confirmed' ? `Try ${rel.version} again` : `Update to ${rel.version} and restart`}
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+      {last && last.state !== 'switched' && (
+        <div className="faint" style={{ fontSize: 12, lineHeight: 1.6, marginTop: rel ? 10 : 0 }}>
+          {last.state === 'confirmed'
+            ? `Last update: ${last.from} → ${last.to}${last.finishedAt ? `, ${timeAgo(last.finishedAt)}` : ''}.${last.previousKeptAt ? ` The previous version is kept at ${last.previousKeptAt}.` : ''}`
+            : `The last update didn’t work: ${last.error ?? `${last.to} couldn’t be installed`}.`}
         </div>
       )}
     </Card>

@@ -32,6 +32,7 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { replicasOf } from './engine.ts';
 import * as settings from './settings.ts';
+import * as updater from './updater.ts';
 import { testChannel, recentDeliveries } from './notify.ts';
 import { recentHookDeliveries, deployHookToken } from './hooks.ts';
 import { listCertificates, retryCertificate, localCaPem } from './certs.ts';
@@ -366,6 +367,10 @@ api.post('/services/:id/upload', async (c) => {
   return c.json({ source: r.source, deployment: r.deployment ? ops.serializeDeployment(r.deployment) : null, skipped: r.skipped }, 201);
 });
 api.post('/services/:id/image-check', async (c) => c.json(await ops.checkServiceImage(c.req.param('id'))));
+api.post('/services/:id/track-image', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(await ops.trackServiceImage(actor(c), c.req.param('id'), body?.image, { allowMoved: body?.allowMoved === true }));
+});
 api.post('/services/:id/update-image', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   return c.json(await ops.updateServiceImage(actor(c), c.req.param('id'), typeof body?.tag === 'string' ? body.tag : null), 202);
@@ -521,6 +526,20 @@ function ownerOnly(c: Context<Env>) {
 }
 
 api.get('/settings', (c) => c.json(settings.publicSettings(isOwner(c))));
+// Servify's own updates (owner only; nothing is checked until asked).
+api.get('/system/update', (c) => {
+  ownerOnly(c);
+  return c.json(updater.updateStatus());
+});
+api.post('/system/update/check', async (c) => {
+  ownerOnly(c);
+  return c.json(await updater.checkForUpdate());
+});
+api.post('/system/update', async (c) => {
+  ownerOnly(c);
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(await updater.installUpdate(actor(c), typeof body?.version === 'string' ? body.version : null), 202);
+});
 // ─── start at login ───
 api.get('/settings/autostart', (c) => c.json(autostartStatus()));
 api.put('/settings/autostart', async (c) => {
