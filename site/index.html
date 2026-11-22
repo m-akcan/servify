@@ -52,6 +52,10 @@
         <symbol id="i-sun" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g></symbol>
         <symbol id="i-moon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/></symbol>
         <symbol id="i-bell" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0"/></symbol>
+        <symbol id="i-table" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M3.5 9.5h17M3.5 14.5h17M9.5 9.5v10"/></g></symbol>
+        <symbol id="i-up" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16.5v-9M8 11.5l4-4 4 4"/></g></symbol>
+        <symbol id="i-play" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="m10 9 5 3-5 3V9Z"/></g></symbol>
+        <symbol id="i-server" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7.5 7.25h.01M7.5 16.75h.01"/></g></symbol>
         <symbol id="i-search" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></g></symbol>
       </defs>
     </svg>
@@ -142,7 +146,7 @@
             <article class="card source reveal" style="--d: 160ms">
               <div class="ico"><svg><use href="#i-folder" /></svg></div>
               <h3>A folder on your disk</h3>
-              <p>Point at a project directory and deploy it as-is. Perfect for the thing you're building right now.</p>
+              <p>Point at a project directory and deploy it as-is, or run <code>servify up</code> to upload the folder you're in from any machine.</p>
               <div class="input-mock">~/code/billing-service<span class="ok">PYTHON</span></div>
             </article>
           </div>
@@ -276,13 +280,13 @@
             <article class="card prod reveal" style="--d: 60ms">
               <div class="prod-ico" data-brand="github"><svg><use href="#i-gh" /></svg></div>
               <h3>Deploy on push</h3>
-              <p>Signed GitHub, GitLab and Gitea webhooks deploy the second you push. Deploy hooks for CI.</p>
+              <p>Signed GitHub, GitLab and Gitea webhooks deploy the second you push. In a monorepo, only the services whose folders changed. Deploy hooks for CI.</p>
               <div class="prod-demo"><span class="mono faint">git push</span><span class="arrow">→</span><span class="pill-s build">building a1b2c3d</span></div>
             </article>
             <article class="card prod reveal" style="--d: 120ms">
               <div class="prod-ico"><svg><use href="#i-bell" /></svg></div>
               <h3>Alerts where you look</h3>
-              <p>Slack, Discord, Telegram, ntfy, email or a webhook when a deploy fails, a service goes down or a backup breaks.</p>
+              <p>Slack, Discord, Telegram, ntfy, email or a webhook when a deploy fails, a service goes down, a backup breaks or a server runs low on disk or memory.</p>
               <div class="prod-demo brands"><i data-brand="discord"></i><i data-brand="telegram"></i><span class="mono faint">+ Slack · email · ntfy</span></div>
             </article>
             <article class="card prod reveal">
@@ -329,6 +333,12 @@
             <div class="cell reveal"><svg class="ci"><use href="#i-disk" /></svg><h3>Volumes and backups</h3><p>Persistent volumes for your databases. Download any volume as a tarball.</p></div>
             <div class="cell reveal" style="--d: 60ms"><svg class="ci"><use href="#i-file" /></svg><h3>Projects as code</h3><p>Export a whole project to one file and import it anywhere.</p><code>servify.json</code></div>
             <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-bolt" /></svg><h3>Built-in load tester</h3><p>Send real traffic through the balancer and watch replicas and autoscaling react.</p></div>
+            <div class="cell reveal"><svg class="ci"><use href="#i-table" /></svg><h3>Database browser</h3><p>Browse tables and rows in Postgres and MySQL, and run SQL that stays read-only until you allow writes. Nothing extra to install or expose.</p></div>
+            <div class="cell reveal" style="--d: 60ms"><svg class="ci"><use href="#i-play" /></svg><h3>Pre-deploy commands</h3><p>Run migrations in a one-off container before the new version starts. If they fail, the old version keeps serving.</p><code>npm run migrate</code></div>
+            <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-key" /></svg><h3>Shared variables</h3><p>Set a value once per project or environment and use it in every service. Secrets stay masked.</p><code>${{ shared.STRIPE_KEY }}</code></div>
+            <div class="cell reveal"><svg class="ci"><use href="#i-up" /></svg><h3>Image updates</h3><p>See when a newer image or version is out and update in one click, or automatically. Moving a database to a new version takes a backup first.</p></div>
+            <div class="cell reveal" style="--d: 60ms"><svg class="ci"><use href="#i-moon" /></svg><h3>App sleeping</h3><p>Idle web apps stop after a while and wake on the next request, in about a second. Open connections keep them awake.</p></div>
+            <div class="cell reveal" style="--d: 120ms"><svg class="ci"><use href="#i-server" /></svg><h3>Several servers, one network</h3><p>Add a machine with one command and place services on it. They still reach each other by name, with no ports opened between servers.</p></div>
           </div>
         </div>
       </section>
@@ -383,6 +393,7 @@
               <button role="tab" type="button" aria-selected="true" aria-controls="qs-pnpm" id="tab-pnpm">pnpm</button>
               <button role="tab" type="button" aria-selected="false" aria-controls="qs-docker" id="tab-docker">Docker Compose</button>
               <button role="tab" type="button" aria-selected="false" aria-controls="qs-agent" id="tab-agent">Connect an agent</button>
+              <button role="tab" type="button" aria-selected="false" aria-controls="qs-cli" id="tab-cli">Command line</button>
             </div>
             <div role="tabpanel" id="qs-pnpm" aria-labelledby="tab-pnpm">
               <pre class="code"><span class="p">$ </span>git clone <span data-repo-text>https://github.com/m-akcan/servify</span>
@@ -407,6 +418,17 @@
     http://localhost:7700/mcp \
     --header "Authorization: Bearer svf_…"<button class="btn copy" type="button" data-copy><svg><use href="#i-copy" /></svg>Copy</button></pre>
               <div class="after">Any MCP client works. For stdio clients, the Agents page in the dashboard gives you the exact <code>servify mcp</code> command for your install.</div>
+            </div>
+            <div role="tabpanel" id="qs-cli" aria-labelledby="tab-cli" hidden>
+              <pre class="code"><span class="c"># from a Servify checkout, on any machine that can reach it</span>
+<span class="p">$ </span>npm i -g ./server
+<span class="p">$ </span>servify login http://your-server:7700
+
+<span class="c"># upload, build and deploy the folder you're in</span>
+<span class="p">$ </span>cd my-app
+<span class="p">$ </span>servify up --project shop --service web
+<span class="p">$ </span>servify logs -f<button class="btn copy" type="button" data-copy><svg><use href="#i-copy" /></svg>Copy</button></pre>
+              <div class="after"><code>up</code> follows your <code>.gitignore</code>. There's also <code>deploy</code>, <code>run</code> (a local command with the service's variables), <code>exec</code>, <code>status</code> and <code>open</code>.</div>
             </div>
           </div>
         </div>
@@ -438,6 +460,13 @@
             <details class="reveal">
               <summary>What happens to my services if Servify stops?<span class="plus"></span></summary>
               <div class="ans">Your containers keep running in Docker, but the <code>:8080</code> router stops with Servify, so their <code>.localhost</code> addresses go quiet. When Servify starts again it re-adopts everything and picks up where it left off.</div>
+            </details>
+            <details class="reveal">
+              <summary>Can I run services on more than one machine?<span class="plus"></span></summary>
+              <div class="ans">
+                Yes. <b>Servers → Add server</b> gives you one command for the other machine; it only needs Docker, and it connects out to Servify, so it needs no open ports.
+                Services on different servers still reach each other by name. That traffic goes through your main Servify machine, so keep an app and its database on the same server.
+              </div>
             </details>
             <details class="reveal">
               <summary>Is the canvas built on a diagram library?<span class="plus"></span></summary>
