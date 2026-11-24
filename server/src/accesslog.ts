@@ -3,9 +3,13 @@
  * for counting visitors, referrers, UTM sources and crawlers.
  *
  * Privacy: client IPs are never stored or logged. Each record carries a visitor key instead: a short hash of
- * (salt, client IP, user agent). The salt is random, rotates at midnight UTC and is kept sealed with the master key
- * in the database (so a restart doesn't double-count the day); the previous day's salt is overwritten, after which
- * that day's keys can no longer be tied to an IP by anyone.
+ * (salt, client IP, user agent). The salt is random, rotates at midnight UTC and lives only in this process's memory —
+ * never in the database, its WAL or the updater's pre-update copy — so once a day is over (or Servify restarts) that
+ * day's keys can't be tied to an IP by anyone. The price: a restart starts a new salt, so someone who visits before
+ * and after a restart counts as two visitors that day.
+ *
+ * (Keeping the salt in the database was tried: SQLite leaves stale copies of rewritten rows in free page space — in the
+ * live file and in VACUUM INTO copies — so deleting or overwriting the row doesn't reliably erase it.)
  *
  * Writes never happen on the request path: records are queued in memory and flushed in one transaction every
  * second (or sooner, deferred, once 1000 are waiting). Retention matches the runtime logs: 7 days
@@ -13,9 +17,8 @@
  * SERVIFY_ACCESS_LOG_MAX_ROWS (default 1,000,000) per service.
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { db, kv } from './db.ts';
+import { db } from './db.ts';
 import { bus } from './events.ts';
-import { sealJson, openJson } from './crypto.ts';
 import { HttpError } from './util.ts';
 
 const RETENTION_DAYS = Number(process.env.SERVIFY_ACCESS_LOG_RETENTION_DAYS ?? process.env.SERVIFY_LOG_RETENTION_DAYS ?? 7);
@@ -44,26 +47,17 @@ type Row = Omit<AccessRecord, 'ip'> & { visitor: string; bot: number; refHost: s
 // ───────────────────────────── visitor key ─────────────────────────────
 
 const utcDay = (ts: number) => new Date(ts).toISOString().slice(0, 10);
+/** Today's salt: random, in memory only, replaced at the first record of each UTC day. */
 let salt: { day: string; key: Buffer } | null = null;
 
 function saltFor(day: string): Buffer {
-  if (salt?.day === day) return salt.key;
-  let stored: { day: string; key: string } | null = null;
-  try {
-    const raw = kv.get('access_log_salt');
-    stored = raw ? openJson(raw) : null;
-  } catch {}
-  if (stored?.day === day) salt = { day, key: Buffer.from(stored.key, 'base64') };
-  else {
-    salt = { day, key: randomBytes(32) };
-    // Overwrites (and so forgets) the previous day's salt.
-    kv.set('access_log_salt', sealJson({ day, key: salt.key.toString('base64') }));
-  }
+  if (salt?.day !== day) salt = { day, key: randomBytes(32) };
   return salt.key;
 }
 
-function visitorKey(ts: number, ip: string, ua: string): string {
-  return createHash('sha256').update(saltFor(utcDay(ts))).update(ip).update('\n').update(ua).digest('base64url').slice(0, 16);
+/** Salted by the current day (not the request's start), so a request spanning midnight can't swap the salt back. */
+function visitorKey(ip: string, ua: string): string {
+  return createHash('sha256').update(saltFor(utcDay(Date.now()))).update(ip).update('\n').update(ua).digest('base64url').slice(0, 16);
 }
 
 // ───────────────────────────── classification ─────────────────────────────
@@ -104,8 +98,7 @@ let flushQueued = false;
 const cut = (s: string | undefined, n: number) => (!s ? '' : s.length > n ? s.slice(0, n) : s);
 
 /**
- * Called by the router once per finished request. Cheap: hashes and queues (the database is only touched once a day,
- * for the salt). Never throws — it runs in a socket 'close' listener, where an exception would stop the router.
+ * Called by the router once per finished request. Cheap: hashes and queues, never touches the database. Never throws — it runs in a socket 'close' listener, where an exception would stop the router.
  */
 export function recordAccess(r: AccessRecord) {
   try {
@@ -135,7 +128,7 @@ function queueRecord(r: AccessRecord) {
     referrer,
     userAgent: ua,
     replica: r.replica,
-    visitor: visitorKey(r.ts, r.ip, ua),
+    visitor: visitorKey(r.ip, ua),
     bot: isBot(ua) ? 1 : 0,
     refHost: refHostOf(referrer),
   };
@@ -389,6 +382,6 @@ export function accessSummary(serviceId: string, day?: string, top = 20) {
     topUtm,
     topUserAgents,
     topBots,
-    note: 'Paths, referrers, UTM sources and user agents count people only; bots are listed apart. Visitors are counted per UTC day.',
+    note: 'Paths, referrers, UTM sources and user agents count people only; bots are listed apart. Visitors are counted per UTC day; a Servify restart starts a new salt, so someone seen before and after it counts twice that day.',
   };
 }
