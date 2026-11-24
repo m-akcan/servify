@@ -1203,6 +1203,7 @@
   text-align: right;
 }
 .traffic-row-rate {
+  transition: color 0.4s;
   font-size: var(--fs-16);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
@@ -1259,29 +1260,60 @@
   padding: 24px 12px;
   text-align: center;
 }
-.traffic-req {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  min-width: 0;
-  padding: 6px 8px;
-  border-radius: var(--r-md);
-  text-align: left;
-  cursor: pointer;
+.traffic-req-wrap {
+  display: grid;
+  grid-template-rows: 1fr;
 }
-.traffic-req:hover {
-  background: var(--bg-2);
+/* A new request grows into place (no jump) and glows briefly. */
+.traffic-req-wrap.enter {
+  animation: traffic-enter 0.38s var(--ease-out);
 }
-.traffic-req.fresh {
-  animation: traffic-fresh 1.6s var(--ease-out);
+.traffic-req-wrap.enter .traffic-req {
+  animation: traffic-glow 1.6s var(--ease-out);
 }
-@keyframes traffic-fresh {
+@keyframes traffic-enter {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
+@keyframes traffic-glow {
   from {
     background: var(--signal-soft);
   }
   to {
     background: transparent;
+  }
+}
+.traffic-req {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+  border-radius: var(--r-md);
+  text-align: left;
+  cursor: pointer;
+}
+.traffic-req-in {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 6px 8px;
+}
+.traffic-req:hover {
+  background: var(--bg-2);
+}
+@media (prefers-reduced-motion: reduce) {
+  .traffic-req-wrap.enter,
+  .traffic-req-wrap.enter .traffic-req {
+    animation: none;
   }
 }
 .traffic-status {

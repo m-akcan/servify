@@ -5,7 +5,7 @@ import { navigate, projectPath } from '../lib/router.ts';
 import type { ProjectListItem, ProjectListService } from '../lib/types.ts';
 import { Icon } from '../components/Icon.tsx';
 import { ProjectMark } from '../components/ProjectMark.tsx';
-import { Tooltip } from '../components/ui.tsx';
+import { Tooltip, Segmented } from '../components/ui.tsx';
 import { ticker, reducedMotion } from '../motion/spring.ts';
 
 // ───────────────────────────── data ─────────────────────────────
@@ -47,7 +47,7 @@ function buildRows(projects: ProjectListItem[]): Row[] {
   });
 }
 
-type Live = { rps: number; errors: number; p95: number; history: number[] };
+type Live = { rps: number; errors: number; p95: number; history: number[]; active: boolean };
 
 function liveOf(ids: string[]): Live {
   let rps = 0;
@@ -66,7 +66,29 @@ function liveOf(ids: string[]): Live {
     for (let i = 0; i < h.length; i++) history[off + i] = (history[off + i] ?? 0) + h[i];
   }
   for (let i = 0; i < 60; i++) history[i] ??= 0;
-  return { rps, errors, p95, history };
+  return { rps, errors, p95, history, active: rps > 0 };
+}
+
+/**
+ * Rates smoothed over a few seconds (an exponential moving average, updated once per router tick), so bursty traffic
+ * glides instead of flickering between 0 and a spike. A project counts as active for 10 s after its last request.
+ */
+const smoothing = new Map<string, { rps: number; errors: number; seenAt: number; tick: number }>();
+const TAU_SEC = 4;
+const ACTIVE_FOR_MS = 10_000;
+
+function smoothed(key: string, raw: Live): Live {
+  let st = smoothing.get(key);
+  if (!st) smoothing.set(key, (st = { rps: raw.rps, errors: raw.errors, seenAt: raw.rps > 0 ? Date.now() : 0, tick: traffic.tick }));
+  else if (st.tick !== traffic.tick) {
+    const steps = Math.max(1, Math.min(10, traffic.tick - st.tick));
+    const a = 1 - Math.exp(-steps / TAU_SEC);
+    st.rps += (raw.rps - st.rps) * a;
+    st.errors += (raw.errors - st.errors) * a;
+    if (raw.rps > 0) st.seenAt = Date.now();
+    st.tick = traffic.tick;
+  }
+  return { ...raw, rps: st.rps < 0.005 ? 0 : st.rps, errors: st.errors < 0.005 ? 0 : st.errors, active: Date.now() - st.seenAt < ACTIVE_FOR_MS };
 }
 
 function totalsOf(ids: string[], totals: Record<string, Totals>): Totals {
@@ -160,26 +182,39 @@ export function TrafficView() {
   const [showInternal, setShowInternal] = useState(false);
 
   const rows = useMemo(() => buildRows(projects), [projects]);
-  const live = new Map(rows.map((r) => [r.project.id, liveOf(r.httpIds)]));
+  const live = new Map(rows.map((r) => [r.project.id, smoothed(r.project.id, liveOf(r.httpIds))]));
   const day = new Map(rows.map((r) => [r.project.id, totalsOf(r.httpIds, totals)]));
 
-  // Busiest first; idle ones keep a stable alphabetical order so rows don't jump around every second.
-  const order = useRef<string[]>([]);
+  // The order is fixed while you watch: worked out once (busiest over 24 h, or A–Z) when the page has its numbers,
+  // and again only when you change the sort. New projects join at the end, deleted ones drop out.
+  const [sort, setSort] = useState<'busiest' | 'az'>('busiest');
+  const [waited, setWaited] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setWaited(true), 3000);
+    return () => clearTimeout(t);
+  }, []);
+  const order = useRef<string[] | null>(null);
   const visible = rows.filter((r) => showInternal || !r.internal);
-  const rank = (r: Row) => (live.get(r.project.id)!.rps > 0.05 ? 2 : day.get(r.project.id)!.requests > 0 ? 1 : 0);
-  const sorted = [...visible].sort((a, b) => rank(b) - rank(a) || (day.get(b.project.id)!.requests - day.get(a.project.id)!.requests) || a.label.localeCompare(b.label));
-  // Only re-order when the set of busy projects changes, not on every small rate change.
-  const key = sorted.map((r) => `${r.project.id}:${rank(r)}`).join('|');
-  const stableKey = useRef('');
-  if (stableKey.current !== key || order.current.length !== sorted.length) {
-    stableKey.current = key;
-    order.current = sorted.map((r) => r.project.id);
-  }
-  const shown = order.current.map((id) => sorted.find((r) => r.project.id === id)).filter(Boolean) as Row[];
+  const byName = (a: Row, b: Row) => a.label.localeCompare(b.label);
+  const sortRows = (list: Row[]) => [...list].sort(sort === 'az' ? byName : (a, b) => day.get(b.project.id)!.requests - day.get(a.project.id)!.requests || byName(a, b));
+  const ready = loaded && (totalsRes.since > 0 || waited);
+  if (ready && order.current === null) order.current = sortRows(visible).map((r) => r.project.id);
+  let shown: Row[];
+  if (order.current) {
+    const ids = new Set(visible.map((r) => r.project.id));
+    const kept = order.current.filter((id) => ids.has(id));
+    const added = visible.filter((r) => !kept.includes(r.project.id)).sort(byName).map((r) => r.project.id);
+    order.current = [...kept, ...added];
+    const byId = new Map(visible.map((r) => [r.project.id, r]));
+    shown = order.current.map((id) => byId.get(id)!);
+  } else shown = [...visible].sort(byName);
+  const resort = () => {
+    order.current = null;
+  };
   const hiddenInternal = rows.filter((r) => r.internal).length;
 
   const allHttp = rows.flatMap((r) => r.httpIds);
-  const liveAll = liveOf(allHttp);
+  const liveAll = smoothed('__all', liveOf(allHttp));
   const dayAll = totalsOf(allHttp, totals);
   const domainCount = new Set(rows.flatMap((r) => r.domains)).size;
 
@@ -203,8 +238,26 @@ export function TrafficView() {
               Every request that reaches Servify passes through its router. Each string is a project that's reachable from outside; it thickens and fills with requests as traffic flows, and turns red on server errors.
             </p>
           </div>
+          <Segmented
+            size="sm"
+            value={sort}
+            onChange={(v) => {
+              resort();
+              setSort(v);
+            }}
+            options={[
+              { value: 'busiest', label: 'Busiest (24 h)' },
+              { value: 'az', label: 'A–Z' },
+            ]}
+          />
           {hiddenInternal > 0 && (
-            <button className={`btn btn-sm ${showInternal ? 'active' : 'btn-ghost'}`} onClick={() => setShowInternal((v) => !v)}>
+            <button
+              className={`btn btn-sm ${showInternal ? 'active' : 'btn-ghost'}`}
+              onClick={() => {
+                resort();
+                setShowInternal((v) => !v);
+              }}
+            >
               <Icon name={showInternal ? 'eyeOff' : 'eye'} size={14} />
               {showInternal ? 'Hide' : 'Show'} {hiddenInternal} without a route
             </button>
@@ -212,8 +265,8 @@ export function TrafficView() {
         </div>
 
         <div className="traffic-stats rise-in" style={{ animationDelay: '40ms' }}>
-          <Stat label="Right now" value={`${fmtRate(liveAll.rps)}`} unit="req/s" tone={liveAll.rps > 0.05 ? 'live' : undefined} />
-          <Stat label="Server errors" value={fmtRate(liveAll.errors)} unit="/s" tone={liveAll.errors > 0 ? 'err' : undefined} />
+          <Stat label="Right now" value={`${fmtRate(liveAll.rps)}`} unit="req/s" tone={liveAll.active ? 'live' : undefined} />
+          <Stat label="Server errors" value={fmtRate(liveAll.errors)} unit="/s" tone={liveAll.errors > 0.01 ? 'err' : undefined} />
           <Stat label="Requests · 24 h" value={fmtCount(dayAll.requests)} />
           <Stat label="People · 24 h" value={fmtCount(dayAll.visitors)} hint="Unique visitors per site, added up (someone on two sites counts twice). No IP addresses are stored." />
           <Stat label="Bots · 24 h" value={fmtCount(dayAll.bots)} hint="Crawlers and AI bots (GPTBot, ClaudeBot, PerplexityBot…), recognised by user agent." />
@@ -229,7 +282,7 @@ export function TrafficView() {
               <div className="faint">Give a service a domain or a public port and it shows up here.</div>
             </div>
           ) : (
-            <Board rows={shown} live={live} day={day} edge={{ rps: liveAll.rps, domains: domainCount, projects: rows.filter((r) => !r.internal).length, https: system?.proxy.httpsPort, http: system?.proxy.port, connected }} />
+            <Board rows={shown} live={live} day={day} edge={{ rps: liveAll.rps, active: liveAll.active, domains: domainCount, projects: rows.filter((r) => !r.internal).length, https: system?.proxy.httpsPort, http: system?.proxy.port, connected }} />
           )}
           <Feed where={where} />
         </div>
@@ -254,7 +307,7 @@ function Stat({ label, value, unit, tone, hint }: { label: string; value: string
   return hint ? <Tooltip label={hint}>{body}</Tooltip> : body;
 }
 
-type EdgeInfo = { rps: number; domains: number; projects: number; https?: number; http?: number; connected: boolean };
+type EdgeInfo = { rps: number; active: boolean; domains: number; projects: number; https?: number; http?: number; connected: boolean };
 
 function Board({ rows, live, day, edge }: { rows: Row[]; live: Map<string, Live>; day: Map<string, Totals>; edge: EdgeInfo }) {
   const boardRef = useRef<HTMLDivElement>(null);
@@ -399,15 +452,15 @@ function Board({ rows, live, day, edge }: { rows: Row[]; live: Map<string, Live>
             const c = geo.curves[r.project.id];
             if (!c) return null;
             const l = live.get(r.project.id)!;
-            const active = l.rps > 0.01;
-            const err = active && l.errors / l.rps > 0.05;
+            const active = l.active;
+            const err = active && l.errors > 0.01 && l.errors / Math.max(l.rps, 0.01) > 0.05;
             const tcpOnly = r.httpIds.length === 0;
             return (
               <path
                 key={r.project.id}
                 d={pathOf(c)}
                 className={`traffic-string ${active ? 'live' : ''} ${err ? 'err' : ''} ${tcpOnly ? 'tcp' : ''} ${day.get(r.project.id)!.requests === 0 && !active ? 'idle' : ''}`}
-                strokeWidth={strokeFor(l.rps)}
+                style={{ strokeWidth: strokeFor(l.rps) }}
               />
             );
           })}
@@ -429,7 +482,7 @@ function Board({ rows, live, day, edge }: { rows: Row[]; live: Map<string, Live>
             {edge.https && edge.http ? ' · ' : ''}
             {edge.http ? `:${edge.http} HTTP` : ''}
           </div>
-          <div className={`traffic-edge-rate ${edge.rps > 0.05 ? 'live' : ''}`}>
+          <div className={`traffic-edge-rate ${edge.active ? 'live' : ''}`}>
             {fmtRate(edge.rps)}
             <span>req/s</span>
           </div>
@@ -471,8 +524,8 @@ function Spark({ data, tone }: { data: number[]; tone: string }) {
 }
 
 function ProjectRow({ row, live, day, anchorRef }: { row: Row; live: Live; day: Totals; anchorRef: (el: HTMLElement | null) => void }) {
-  const active = live.rps > 0.01;
-  const errs = active && live.errors > 0;
+  const active = live.active;
+  const errs = active && live.errors > 0.01;
   const idle = !active && day.requests === 0;
   const extra = row.domains.length - 2;
   return (
@@ -524,10 +577,23 @@ function Feed({ where }: { where: Map<string, { row: Row; service: ProjectListSe
   const [entries, setEntries] = useState<Recent[]>([]);
   const [hideBots, setHideBots] = useState(false);
   const last = useRef<number | undefined>(undefined);
-  const [fresh, setFresh] = useState<Set<number>>(new Set());
+  const entering = useRef(new Set<number>());
 
   useEffect(() => {
     let alive = true;
+    // Requests arrive in batches every 2 s; let them in one at a time, spread over the next 2 s, so the list flows.
+    const queue: Recent[] = [];
+    let drip: ReturnType<typeof setTimeout> | undefined;
+    const release = () => {
+      drip = undefined;
+      if (!alive || !queue.length) return;
+      // Under heavy traffic, let several in per step rather than falling behind.
+      const take = Math.max(1, Math.ceil(queue.length / 25));
+      const batch = queue.splice(0, take);
+      for (const e of batch) entering.current.add(e.id);
+      setEntries((prev) => [...batch.reverse(), ...prev].slice(0, 80));
+      if (queue.length) drip = setTimeout(release, Math.max(60, Math.min(400, 1800 / Math.max(1, queue.length / take))));
+    };
     const load = async () => {
       try {
         const r = await api.get<{ entries: Recent[]; last: number }>(`/access-log/recent?limit=60${last.current !== undefined ? `&after=${last.current}` : ''}`);
@@ -535,8 +601,13 @@ function Feed({ where }: { where: Map<string, { row: Row; service: ProjectListSe
         const first = last.current === undefined;
         last.current = r.last;
         if (!r.entries.length) return;
-        setEntries((prev) => [...r.entries, ...prev].slice(0, 80));
-        if (!first) setFresh(new Set(r.entries.map((e) => e.id)));
+        if (first) {
+          setEntries(r.entries);
+          return;
+        }
+        queue.push(...[...r.entries].reverse()); // oldest first
+        if (queue.length > 120) queue.splice(0, queue.length - 120);
+        if (!drip) release();
       } catch {}
     };
     void load();
@@ -544,6 +615,7 @@ function Feed({ where }: { where: Map<string, { row: Row; service: ProjectListSe
     return () => {
       alive = false;
       clearInterval(t);
+      if (drip) clearTimeout(drip);
     };
   }, []);
 
@@ -567,12 +639,9 @@ function Feed({ where }: { where: Map<string, { row: Row; service: ProjectListSe
             const w = where.get(e.serviceId);
             const cls = e.status >= 500 ? 'err' : e.status >= 400 ? 'warn' : e.status >= 300 ? 'redir' : 'ok';
             return (
-              <button
-                key={e.id}
-                className={`traffic-req ${fresh.has(e.id) ? 'fresh' : ''}`}
-                onClick={() => w && navigate(projectPath(w.row.project.slug))}
-                title={`${e.method} ${e.host}${e.path} — ${e.status} in ${Math.round(e.ms)} ms`}
-              >
+              <div key={e.id} className={`traffic-req-wrap ${entering.current.has(e.id) ? 'enter' : ''}`} onAnimationEnd={() => entering.current.delete(e.id)}>
+              <button className="traffic-req" onClick={() => w && navigate(projectPath(w.row.project.slug))} title={`${e.method} ${e.host}${e.path} — ${e.status} in ${Math.round(e.ms)} ms`}>
+                <span className="traffic-req-in">
                 <span className={`traffic-status ${cls}`}>{e.status}</span>
                 <span className="traffic-req-main">
                   <span className="traffic-req-path truncate">
@@ -587,7 +656,9 @@ function Feed({ where }: { where: Map<string, { row: Row; service: ProjectListSe
                   </span>
                 </span>
                 {e.bot && <span className="traffic-bot">{e.botName ?? 'bot'}</span>}
+                </span>
               </button>
+              </div>
             );
           })
         )}
