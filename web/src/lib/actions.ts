@@ -5,10 +5,14 @@ import { openVolumeDialog } from './volumes.tsx';
 import { navigate, projectPath } from './router.ts';
 import { store } from './store.ts';
 
-export async function deploy(s: ServiceView) {
+export async function deploy(s: ServiceView, opts: { useCachedImage?: boolean } = {}) {
   try {
-    await api.post<Deployment>(`/services/${s.id}/deploy`);
-    toast({ title: `Deploying ${s.name}`, body: s.pendingChanges.length ? `Applying ${s.pendingChanges.join(', ')}` : undefined, tone: 'build' });
+    await api.post<Deployment>(`/services/${s.id}/deploy`, opts.useCachedImage ? { useCachedImage: true } : undefined);
+    toast({
+      title: `Deploying ${s.name}`,
+      body: opts.useCachedImage ? 'With the image already on the server, without pulling' : s.pendingChanges.length ? `Applying ${s.pendingChanges.join(', ')}` : undefined,
+      tone: 'build',
+    });
   } catch (e) {
     toastError(e, 'Deploy failed to start');
   }

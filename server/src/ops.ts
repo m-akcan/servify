@@ -913,19 +913,23 @@ export async function scaleService(actor: Actor, serviceId: string, replicas: nu
   return out;
 }
 
-export function deployService(actor: Actor, serviceId: string, trigger: 'manual' | 'agent' | 'git' | 'config' = actor.type === 'agent' ? 'agent' : 'manual') {
+/**
+ * Deploy the service's current settings. A registry image is pulled when it isn't on the server yet or is `:latest`,
+ * and a failed pull fails the deployment. `useCachedImage` deploys the copy already on the server instead (registry down).
+ */
+export function deployService(actor: Actor, serviceId: string, trigger: 'manual' | 'agent' | 'git' | 'config' = actor.type === 'agent' ? 'agent' : 'manual', opts: { useCachedImage?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'deploy');
   if (svc.stopped) {
     svc.stopped = false;
     servicesTable.put(svc);
   }
-  return serializeDeployment(queueDeployment(svc, trigger, actor));
+  return serializeDeployment(queueDeployment(svc, trigger, actor, opts.useCachedImage && svc.source.type === 'image' ? { useCachedImage: true } : {}));
 }
 
 /**
  * Update an image service: pull its image again (a new image under the same tag) or switch to another tag first,
- * then deploy. Unlike a normal deploy, a failed pull fails the deployment instead of falling back to the cache.
+ * then deploy. It always pulls, even an image that only exists on this server, and a failed pull fails the deployment.
  */
 export async function updateServiceImage(actor: Actor, serviceId: string, tag?: string | null) {
   const svc = getServiceOrThrow(serviceId);

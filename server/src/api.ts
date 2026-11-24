@@ -260,7 +260,10 @@ api.delete('/services/:id', async (c) => {
   return c.json({ ok: true });
 });
 api.post('/services/:id/duplicate', async (c) => c.json(await ops.duplicateService(actor(c), c.req.param('id')), 201));
-api.post('/services/:id/deploy', (c) => c.json(ops.deployService(actor(c), c.req.param('id'))));
+api.post('/services/:id/deploy', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(ops.deployService(actor(c), c.req.param('id'), undefined, { useCachedImage: body?.useCachedImage === true }));
+});
 api.post('/services/:id/restart', (c) => c.json(ops.restartService(actor(c), c.req.param('id'))));
 api.post('/services/:id/stop', async (c) => c.json(await ops.stopService(actor(c), c.req.param('id'))));
 api.post('/services/:id/start', (c) => c.json(ops.startService(actor(c), c.req.param('id'))));

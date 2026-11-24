@@ -143,10 +143,14 @@ export function buildMcpServer(principal: Principal): McpServer {
 
   server.registerTool(
     'deploy_service',
-    { description: 'Build (if needed) and deploy the service with its current settings. Zero-downtime for stateless services.', inputSchema: { service: svcRef } },
-    wrap(({ service }: { service: string }) => {
+    {
+      description:
+        'Build (if needed) and deploy the service with its current settings. Zero-downtime for stateless services. A registry image is pulled when it is `:latest` or not on the server yet; if that pull fails the deployment fails ("pull failed: …") and the running version stays. useCachedImage: true deploys the copy already on the server instead (only when the registry is down and an older image is acceptable).',
+      inputSchema: { service: svcRef, useCachedImage: z.boolean().optional() },
+    },
+    wrap(({ service, useCachedImage }: { service: string; useCachedImage?: boolean }) => {
       guard();
-      return ops.deployService(actor, service, 'agent');
+      return ops.deployService(actor, service, 'agent', { useCachedImage: useCachedImage === true });
     }),
   );
 

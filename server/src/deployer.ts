@@ -4,6 +4,8 @@
  */
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { parseRepo, sameRepo } from './imageupdates.ts';
 import { databaseOf, demuxLines, normalizeImageRef, type DockerClient } from './docker.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
@@ -45,20 +47,80 @@ import { iconForStack, referencedServicesOn } from './ops.ts';
 
 const lock = new KeyedLock();
 
-/** `docker pull` through the CLI, which uses the user's credential store. */
-function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promise<boolean> {
+/** `docker pull` through the CLI, which uses the user's credential store. Resolves null on success, else why it failed. */
+function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promise<string | null> {
   return new Promise((resolve) => {
     log(`▸ Retrying pull with the docker CLI (uses your docker login credentials)`);
     const child = spawn('docker', ['pull', ref], { env: { ...process.env, DOCKER_HOST: d.hostEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
-    const onData = (b: Buffer) => {
-      for (const l of b.toString('utf8').split(/\r?\n/)) if (l.trim() && !/Downloading|Extracting|Waiting/.test(l)) log(l);
+    let last = '';
+    const onData = (err: boolean) => (b: Buffer) => {
+      for (const l of b.toString('utf8').split(/\r?\n/)) {
+        if (!l.trim() || /Downloading|Extracting|Waiting/.test(l)) continue;
+        log(l);
+        if (err) last = l.trim();
+      }
     };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
-    child.on('error', () => resolve(false));
-    child.on('close', (code) => resolve(code === 0));
+    child.stdout.on('data', onData(false));
+    child.stderr.on('data', onData(true));
+    child.on('error', (e) => resolve(`docker CLI: ${e.message}`));
+    child.on('close', (code) => resolve(code === 0 ? null : last || `docker pull exited with ${code}`));
   });
 }
+
+/** Pull through the Engine API, then the CLI (the Engine API doesn't see `docker login`). Null on success, else the reason. */
+async function pull(d: DockerClient, ref: string, log: (l: string) => void): Promise<string | null> {
+  try {
+    await d.pullImage(ref, (l) => log(l));
+    return null;
+  } catch (e) {
+    log(`! ${(e as Error).message}`);
+    return await cliPull(d, ref, log);
+  }
+}
+
+/** Registries the docker CLI has a saved login for (what `docker login` wrote), as plain host names. */
+function savedLogins(): Set<string> {
+  const out = new Set<string>();
+  try {
+    const dir = process.env.DOCKER_CONFIG || join(homedir(), '.docker');
+    const cfg = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+    for (const k of [...Object.keys(cfg.auths ?? {}), ...Object.keys(cfg.credHelpers ?? {})]) {
+      const host = k.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+      out.add(/^(index|registry-1)\.docker\.io$/.test(host) ? 'docker.io' : host);
+    }
+  } catch {}
+  return out;
+}
+
+/** Docker Hub's answer for a name with no account part (library/…), which can't be private: it doesn't exist there. */
+function notOnDockerHub(raw: string, ref: string): boolean {
+  const r = parseRepo(ref);
+  return !!r && r.registry === 'docker.io' && r.repo.startsWith('library/') && /repository does not exist/i.test(raw);
+}
+
+/** A failed pull in a few words: what went wrong and with which registry (the raw message stays in the log). */
+export function pullProblem(raw: string, ref: string): string {
+  const r = parseRepo(ref);
+  const host = r?.registry ?? 'the registry';
+  const login = () => (savedLogins().has(host) ? `${host} refused the saved login` : `no credentials for ${host}`);
+  if (/toomanyrequests|rate limit/i.test(raw)) return `rate limited by ${host}`;
+  if (notOnDockerHub(raw, ref)) return `not found — ${r!.repo.replace(/^library\//, '')} is not on Docker Hub`;
+  if (/repository does not exist or may require/i.test(raw)) return `not found or private — ${login()}`;
+  if (/no such host|connection refused|timed? ?out|deadline exceeded|unreachable|network|dial tcp|\bEOF\b|x509|certificate|tls/i.test(raw)) return `registry unreachable — ${host}`;
+  if (/unauthori[sz]ed|authentication required|denied|forbidden|\b40[13]\b/i.test(raw)) return `unauthorized — ${login()}`;
+  if (/manifest unknown|name unknown|not found/i.test(raw)) return `not found — ${ref}`;
+  return raw.split('\n')[0].replace(/^Error response from daemon:\s*/, '').slice(0, 160);
+}
+
+/** The local image came from a registry under this name. Without it the name only exists here (built or tagged locally). */
+function pulledFromRegistry(img: any, ref: string): boolean {
+  const r = parseRepo(ref);
+  if (!r) return true;
+  // The classic image store records a digest only for pulled or pushed repositories; the containerd store records one
+  // for every tag, so there this is always true and the registry's answer decides (see notOnDockerHub).
+  return ((img?.RepoDigests as string[] | undefined) ?? []).some((dg) => sameRepo(dg.split('@')[0], r));
+}
+
 const logStreams = new Map<string, WriteStream>();
 
 export function deploymentLogPath(depId: string) {
@@ -162,7 +224,7 @@ export function queueDeployment(
   svc: Service,
   trigger: DeployTrigger,
   actor: Actor,
-  opts: { image?: string; port?: number | null; fromDeployment?: Deployment } = {},
+  opts: { image?: string; port?: number | null; fromDeployment?: Deployment; useCachedImage?: boolean } = {},
 ): Deployment {
   // A deploy (or restart, rollback…) wakes a sleeping service: its new replicas must run.
   if (svc.sleeping) {
@@ -213,6 +275,7 @@ export function queueDeployment(
           source: structuredClone(svc.source),
           schedule: svc.schedule ?? null,
         } as any,
+    ...(opts.useCachedImage ? { useCachedImage: true } : {}),
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,
@@ -255,6 +318,8 @@ async function runDeployment(depId: string, actor: Actor) {
     if (node !== LOCAL) log(`▸ Deploying on server ${nodeName(node)}`);
     const crossRefs = referencedServicesOn(svc);
     if (crossRefs.length) log(`▸ ${crossRefs.join(', ')} run${crossRefs.length === 1 ? 's' : ''} on another server — reached over Servify's private network relay (main port only)`);
+    // Set by restarts, rollbacks and moves: they bring back an image that ran before rather than a fresh pull.
+    const reusing = !!dep.image;
     // Images live per server: after a move, a rollback or restart may find its image elsewhere.
     if (dep.image && !(await d.inspectImage(dep.image))) {
       if (src.type === 'image' && !dep.image.startsWith('servify/')) {
@@ -279,16 +344,29 @@ async function runDeployment(depId: string, actor: Actor) {
         const ref = normalizeImageRef(src.image);
         const local = await d.inspectImage(ref);
         const update = dep.trigger === 'update';
-        if (!local || ref.endsWith(':latest') || update) {
+        if (local && !update && !pulledFromRegistry(local, ref)) {
+          log(`▸ Using local image ${ref} (made on this server, not pulled from a registry)`);
+        } else if (!local || ref.endsWith(':latest') || update) {
           log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`);
-          try {
-            await d.pullImage(ref, (l) => log(l));
-          } catch (e) {
-            // The Engine API doesn't see `docker login` credentials; the CLI does (private registries).
-            const viaCli = await cliPull(d, ref, log);
-            if (!viaCli) {
-              if (!local || update) throw e;
-              log(`! pull failed (${(e as Error).message}); using cached image`);
+          const raw = await pull(d, ref, log);
+          if (raw) {
+            const reason = pullProblem(raw, ref);
+            if (local && !update && notOnDockerHub(raw, ref)) {
+              log(`▸ ${ref} is not on Docker Hub — using the local image (made on this server)`);
+            } else if (local && !update && reusing) {
+              // Restarts, rollbacks and moves bring back a version that ran before: a registry hiccup mustn't stop them.
+              log(`! pull failed (${reason}); using the copy on this server`);
+            } else if (local && !update && dep.useCachedImage) {
+              log(`! pull failed (${reason}); deploying the copy already on this server, as asked — it may be older than the registry's`);
+            } else {
+              dep.cachedImageAvailable = !!local;
+              const stays = svc.activeDeploymentId ? 'Nothing changed: the running version stays.' : 'Nothing was started.';
+              log(
+                local
+                  ? `▸ ${stays} To deploy the copy already on this server anyway (it may be older), use "Deploy cached image" on this deployment (API: POST /api/services/:id/deploy {"useCachedImage": true}).`
+                  : `▸ ${stays}`,
+              );
+              throw new Error(`pull failed: ${reason}`);
             }
           }
         } else {

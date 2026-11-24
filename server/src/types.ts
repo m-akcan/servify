@@ -219,6 +219,10 @@ export interface Deployment {
   repoDigests?: string[] | null;
   /** The server it was rolled out on (null = this machine). */
   nodeId?: string | null;
+  /** Asked for: if the registry pull fails, deploy the copy of the image already on the server instead of failing. */
+  useCachedImage?: boolean;
+  /** Set when the pull failed: whether a copy of the image is on the server (so "deploy the cached image" can work). */
+  cachedImageAvailable?: boolean;
   /** Detected/used port for this image. */
   port: number | null;
   sourceLabel: string;
