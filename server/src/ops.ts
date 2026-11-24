@@ -47,6 +47,7 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.url = project && s.protocol === 'http' && s.publicHttp ? publicUrl(s, project) : null;
   out.tcpAddress = s.publicTcpPort ? `${config.proxyHost === '0.0.0.0' ? 'localhost' : config.proxyHost}:${s.publicTcpPort}` : null;
   out.pendingChanges = pendingChanges(s);
+  out.accessLog = s.accessLog !== false;
   const iu = imageUpdateOf(s.id);
   out.imageUpdate = iu && s.source.type === 'image' && iu.ref === normalizeImageRef(s.source.image) ? iu : null; // stale once the image changes
   const httpsOn = getSettings().https.enabled;
@@ -467,6 +468,7 @@ export async function createService(actor: Actor, projectId: string, raw: Create
     buildCommand: input.buildCommand ?? null,
     resources: { cpus: null, memoryMb: null },
     autoDeploy: source.type === 'git',
+    accessLog: true,
     nodeId: nodeId === LOCAL ? null : nodeId,
     x: pos.x,
     y: pos.y,
@@ -572,6 +574,7 @@ export const updateServiceInput = z.object({
   buildArgs: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'build arg names are letters, digits and _'), z.string()).nullable().optional().describe('Docker build arguments; values may use ${VAR} from the service variables'),
   buildTarget: z.string().max(64).nullable().optional().describe('Multi-stage build target'),
   sleepAfterMinutes: z.number().int().min(1).max(1440).nullable().optional().describe('HTTP services: stop after this many idle minutes; the next request starts it again (takes a few seconds)'),
+  accessLog: z.boolean().optional().describe('HTTP services: record the router access log (requests, referrers, user agents; no IPs). On by default; takes effect immediately'),
   imageAutoUpdate: z.boolean().optional().describe('Image services: redeploy automatically when a new image is published under the same tag (not for databases or clusters)'),
   watchPaths: z.array(z.string().min(1).max(200)).max(50).nullable().optional().describe('Git: deploy only when a push changes files matching these globs (e.g. apps/web/**, !**/*.md)'),
   preDeployCommand: z.string().max(2000).nullable().optional().describe('Runs once per new deploy (e.g. migrations) in a one-off container from the new image; a failure stops the deploy'),
@@ -722,6 +725,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (!patch.sleepAfterMinutes && svc.sleeping) void wake(svc.id, 'sleeping being turned off');
   }
   if (patch.imageAutoUpdate !== undefined) set('imageAutoUpdate', patch.imageAutoUpdate, 'image auto-update');
+  if (patch.accessLog !== undefined) set('accessLog', patch.accessLog, 'access log');
   if (patch.watchPaths !== undefined) set('watchPaths', patch.watchPaths?.map((p) => p.trim()).filter(Boolean).length ? patch.watchPaths.map((p) => p.trim()).filter(Boolean) : null, 'watch paths');
   if (patch.preDeployCommand !== undefined) set('preDeployCommand', patch.preDeployCommand?.trim() || null, 'pre-deploy command');
   if (patch.resources) set('resources', { ...svc.resources, ...patch.resources } as Service['resources'], 'resources');
@@ -1400,7 +1404,7 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input);
   if (s.type === 'upload' && s.uploadId) copyUpload(src.id, r.service.id, s);
-  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, accessLog: src.accessLog !== false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -1422,7 +1426,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'accessLog', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1495,6 +1499,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       buildTarget: raw.buildTarget ?? null,
       watchPaths: raw.watchPaths ?? null,
       imageAutoUpdate: raw.imageAutoUpdate ?? false,
+      accessLog: raw.accessLog !== false,
       sleepAfterMinutes: raw.sleepAfterMinutes ?? null,
       preDeployCommand: raw.preDeployCommand ?? null,
       resources: { ...svc.resources, ...(raw.resources ?? {}) },

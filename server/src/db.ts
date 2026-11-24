@@ -27,6 +27,8 @@ CREATE INDEX IF NOT EXISTS logs_cid_ts ON logs(cid, ts);
 CREATE TABLE IF NOT EXISTS volumes (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS volumes_project ON volumes(project_id);
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS access_log (id INTEGER PRIMARY KEY AUTOINCREMENT, service_id TEXT NOT NULL, ts INTEGER NOT NULL, host TEXT NOT NULL, method TEXT NOT NULL, path TEXT NOT NULL, status INTEGER NOT NULL, bytes INTEGER NOT NULL, ms REAL NOT NULL, referrer TEXT NOT NULL, ref_host TEXT NOT NULL, ua TEXT NOT NULL, visitor TEXT NOT NULL, bot INTEGER NOT NULL, replica INTEGER);
+CREATE INDEX IF NOT EXISTS access_log_service_ts ON access_log(service_id, ts);
 CREATE TABLE IF NOT EXISTS metrics (service_id TEXT NOT NULL, t INTEGER NOT NULL, rps REAL, p50 REAL, p95 REAL, errors REAL, cpu REAL, mem REAL, replicas INTEGER, PRIMARY KEY (service_id, t));
 `);
 
@@ -167,6 +169,22 @@ export function migrateSealing(): number {
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     db.exec('VACUUM');
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  }
+  return n;
+}
+
+/**
+ * Boot migration: services created before the access log existed get the switch written out (on), so every
+ * stored service says whether its requests are recorded.
+ */
+export function migrateAccessLog(): number {
+  let n = 0;
+  for (const { id } of db.prepare(`SELECT id FROM services WHERE json_extract(data, '$.accessLog') IS NULL`).all() as { id: string }[]) {
+    const s = services.get(id);
+    if (s) {
+      services.put({ ...s, accessLog: true });
+      n++;
+    }
   }
   return n;
 }

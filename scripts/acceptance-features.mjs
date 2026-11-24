@@ -2,7 +2,9 @@
 /**
  * End-to-end checks for the platform features (real Docker, owner access needed for settings):
  * secrets at rest, notifications, git webhooks, HTTPS, backups + restore, persistent logs/metrics,
- * Docker Compose import, environments and pull-request previews.
+ * Docker Compose import, environments and pull-request previews, the router access log.
+ *
+ * The access-log checks need the instance started with SERVIFY_TRUSTED_PROXIES=127.0.0.1.
  *
  *   SERVIFY_URL=http://localhost:7700 SERVIFY_PROXY_PORT=8080 SERVIFY_HTTPS_PORT=8443 \
  *   SERVIFY_DATA_DIR=~/.servify SERVIFY_COOKIE='servify_session=…' node scripts/acceptance-features.mjs
@@ -271,6 +273,10 @@ async function main() {
   check('log search across history', found.some((l) => l.text.startsWith('line 2')));
   const m = await api('GET', `/services/${web.id}/metrics?seconds=3600`);
   check('metrics answer for a 1-hour window', Array.isArray(m.points));
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ access log');
+  await accessLogChecks(P, web);
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ rollback when the image tag moves');
@@ -761,6 +767,143 @@ services:
     const envs = await api('GET', `/projects/${P.id}/environments`);
     return !envs.some((e) => e.preview) && envs.some((e) => e.name === 'staging');
   }, 60_000, 'preview removal')));
+}
+
+/** Router access log: one record per request, no IPs, read-only tokens over REST and MCP, filters, paging, on/off. */
+async function accessLogChecks(P, web) {
+  await running(P.id, 'web');
+  const host = `web.${P.slug}.localhost`;
+  const ua = 'Mozilla/5.0 (Macintosh) AccessLogTest/1.0';
+  // A canary client address behind a "trusted proxy": needs SERVIFY_TRUSTED_PROXIES=127.0.0.1 on the instance.
+  const canaryIp = '203.0.113.' + (10 + Math.floor(Math.random() * 200));
+  const send = (path, headers = {}) =>
+    new Promise((resolve) => {
+      const req = http.get({ host: '127.0.0.1', port: PROXY, path, headers: { host, 'user-agent': ua, ...headers }, agent: false, timeout: 8000 }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      });
+      req.on('error', () => resolve(0));
+    });
+  const t0 = Date.now();
+  await send('/al-home?utm_source=newsletter&utm_medium=email', { referer: 'https://news.example.org/post/1', 'x-forwarded-for': canaryIp });
+  await send('/al-home', { 'x-forwarded-for': canaryIp });
+  await send('/al-about', { 'x-forwarded-for': '198.51.100.7' });
+  await send('/al-home', { 'user-agent': 'Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)' });
+  await send('/al-home', { 'user-agent': 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)' });
+
+  const svcView = await api('GET', `/services/${web.id}`);
+  check('the access log is on by default', svcView.accessLog === true);
+
+  const { token: readToken } = await api('POST', '/tokens', { name: 'access-log-reader', scope: 'read' });
+  const asReader = async (path) => {
+    const r = await fetch(BASE + '/api' + path, { headers: { authorization: `Bearer ${readToken}` } });
+    return { status: r.status, json: await r.json().catch(() => ({})) };
+  };
+  const page1 = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&limit=100`);
+  check('a read-only token can read the access log', page1.status === 200 && Array.isArray(page1.json.entries), `${page1.status}`);
+  const mine = (page1.json.entries ?? []).filter((e) => e.path.startsWith('/al-'));
+  check('one record per request', mine.length === 5, `${mine.length} records`);
+  const first = mine.find((e) => e.path.includes('utm_source'));
+  check(
+    'records carry time, host, method, path+query, status, bytes, duration, referrer, user agent and replica',
+    first && first.host === host && first.method === 'GET' && first.status === 200 && first.bytes > 0 && typeof first.ms === 'number' && first.referrer === 'https://news.example.org/post/1' && first.userAgent === ua && first.replica === 0 && !Number.isNaN(Date.parse(first.time)),
+    JSON.stringify(first),
+  );
+  const homes = mine.filter((e) => !e.bot && e.path.startsWith('/al-home'));
+  const about = mine.find((e) => e.path === '/al-about');
+  check('same address + user agent → same visitor key', homes.length === 2 && homes[0].visitor === homes[1].visitor);
+  check('another address → another visitor key', about && about.visitor !== homes[0]?.visitor);
+  check('no IP address in any record', !JSON.stringify(page1.json).includes(canaryIp) && !JSON.stringify(page1.json).includes('198.51.100.7'));
+  check('crawlers are flagged as bots', mine.filter((e) => e.bot).length === 2);
+
+  const p404 = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-about&status=2xx`);
+  check('path and status filters', p404.json.entries?.length === 1 && p404.json.entries[0].path === '/al-about');
+  const qf = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&q=GPTBot`);
+  check('text search over user agents', qf.json.entries?.length === 1);
+  const pageA = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=2`);
+  const pageB = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=2&before=${pageA.json.next}`);
+  const pageC = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=2&before=${pageB.json.next}`);
+  const paged = [...pageA.json.entries, ...pageB.json.entries, ...pageC.json.entries].map((e) => e.id);
+  check('paging walks every record once', new Set(paged).size === 5 && paged.length === 5 && pageC.json.next === null, JSON.stringify(paged));
+
+  const sum = await asReader(`/services/${web.id}/access-log/summary`);
+  const S = sum.json;
+  check('summary: requests with bots apart', sum.status === 200 && S.requests.humans >= 3 && S.requests.bots >= 2, JSON.stringify(S.requests));
+  check('summary: unique visitors', S.uniqueVisitors?.humans >= 2, JSON.stringify(S.uniqueVisitors));
+  check('summary: top paths, referrers, UTM sources, user agents and bots', S.topPaths.some((p) => p.path === '/al-home' && p.requests >= 2) && S.topReferrers.some((r) => r.host === 'news.example.org') && S.topUtm.some((u) => u.source.startsWith('newsletter')) && S.topUserAgents.some((u) => u.userAgent === ua) && S.topBots.some((b) => b.name === 'GPTBot') && S.topBots.some((b) => b.name === 'ClaudeBot'), JSON.stringify(S).slice(0, 300));
+  check('summary: a bad day is a clean 400', (await asReader(`/services/${web.id}/access-log/summary?day=yesterday`)).status === 400);
+  check('a read-only token cannot switch the log off', (await fetch(BASE + `/api/services/${web.id}`, { method: 'PATCH', headers: { authorization: `Bearer ${readToken}`, 'content-type': 'application/json' }, body: '{"accessLog":false}' })).status === 403);
+
+  // MCP with the same read-only token.
+  const mcp = async (name, args) => {
+    const r = await fetch(BASE + '/mcp', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${readToken}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+    });
+    const j = await r.json().catch(() => ({}));
+    const text = j.result?.content?.[0]?.text ?? '';
+    try {
+      return { error: j.result?.isError ? text : null, data: JSON.parse(text) };
+    } catch {
+      return { error: text || JSON.stringify(j).slice(0, 200), data: null };
+    }
+  };
+  const ml = await mcp('get_access_log', { service: `${P.slug}/web`, since_minutes: 10, path: '/al-', bot: false });
+  check('MCP get_access_log works with a read-only token and filters', !ml.error && ml.data?.entries?.length === 3, ml.error ?? '');
+  const ms = await mcp('get_access_summary', { service: web.id });
+  check('MCP get_access_summary works with a read-only token', !ms.error && ms.data?.requests?.bots >= 2, ms.error ?? '');
+
+  // Scoping: another service's log never shows these requests.
+  const other = (await api('POST', `/projects/${P.id}/services`, { image: 'traefik/whoami', name: 'other-site' })).service;
+  const otherLog = await asReader(`/services/${other.id}/access-log?since=${t0 - 1000}`);
+  check("a service's log holds only its own requests", otherLog.status === 200 && otherLog.json.entries.length === 0);
+  const early = (await hit(`other-site.${P.slug}.localhost`, '/too-early')).status;
+  const earlyLog = (await asReader(`/services/${other.id}/access-log?path=/too-early`)).json.entries?.[0];
+  check("Servify's own answers are recorded too (503 while starting)", early === 503 ? earlyLog?.status === 503 && earlyLog.bytes > 0 : true, `${early} ${JSON.stringify(earlyLog)}`);
+  await api('DELETE', `/services/${other.id}`).catch(() => {});
+
+  // WebSocket upgrade (whoami's /echo): one record with the upstream's 101, written when the socket closes.
+  const ws = await new Promise((resolve) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port: PROXY,
+      path: '/echo',
+      headers: { host, connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'user-agent': ua },
+    });
+    req.on('upgrade', (res, socket) => {
+      socket.end();
+      resolve(res.statusCode);
+    });
+    req.on('response', (res) => resolve(res.statusCode));
+    req.on('error', () => resolve(0));
+    req.end();
+  });
+  const wsLog = await waitFor(async () => (await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/echo`)).json.entries, 10_000, 'websocket record');
+  check('WebSocket upgrades are recorded', ws === 101 && wsLog?.length === 1 && wsLog[0].status === 101, `${ws} ${JSON.stringify(wsLog)}`);
+
+  // Redirect services.
+  const redir = (await api('POST', `/projects/${P.id}/services`, { redirect: 'https://example.com', name: 'old-name' })).service;
+  const rhost = new URL((await api('GET', `/services/${redir.id}`)).url).hostname;
+  const rs = (await hit(rhost, '/old?x=1')).status;
+  const rlog = (await asReader(`/services/${redir.id}/access-log`)).json.entries ?? [];
+  check('redirect services are recorded', rs === 308 && rlog.length === 1 && rlog[0].status === 308 && rlog[0].path === '/old?x=1', `${rs} ${JSON.stringify(rlog)}`);
+
+  // Switch off: nothing recorded; on again: recorded.
+  await api('PATCH', `/services/${web.id}`, { accessLog: false });
+  check('the switch is PATCH-able', (await api('GET', `/services/${web.id}`)).accessLog === false);
+  await send('/al-off');
+  await api('PATCH', `/services/${web.id}`, { accessLog: true });
+  await send('/al-on');
+  const after = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-o`);
+  check('switched off records nothing, back on records again', after.json.entries?.length === 1 && after.json.entries[0].path === '/al-on', JSON.stringify(after.json.entries?.map((e) => e.path)));
+
+  if (DATA) {
+    await sleep(1500);
+    const files = ['servify.db', 'servify.db-wal'].map((f) => join(DATA, f)).filter(existsSync);
+    const leaked = files.filter((f) => readFileSync(f).includes(canaryIp));
+    check('no client IP in the database files', leaked.length === 0, leaked.join(', '));
+  }
 }
 
 main()

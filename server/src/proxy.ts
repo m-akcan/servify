@@ -19,6 +19,7 @@ import type { Service } from './types.ts';
 import { publicDomain } from './vars.ts';
 import { challengeResponse, hasPublicCert, sniCallback, defaultContextOptions } from './certs.ts';
 import { getSettings } from './settings.ts';
+import { recordAccess } from './accesslog.ts';
 
 type Upstream = ReturnType<typeof upstreamsFor>[number];
 
@@ -143,6 +144,65 @@ function visitorProto(req: http.IncomingMessage, proto: 'http' | 'https'): strin
   return said && (said === 'http' || said === 'https') && fromTrustedProxy(req.socket.remoteAddress) ? said : proto;
 }
 
+/**
+ * The visitor's address: the socket peer, or — when that peer is a trusted proxy — the nearest X-Forwarded-For hop
+ * (walking right to left) that isn't one of SERVIFY_TRUSTED_PROXIES. Only ever hashed into the access log's
+ * visitor key: never stored, never logged.
+ */
+export function clientIpOf(req: http.IncomingMessage): string {
+  const peer = req.socket.remoteAddress ?? '';
+  const xff = req.headers['x-forwarded-for'];
+  if (!xff || !fromTrustedProxy(peer)) return ipv4(peer);
+  const hops = (Array.isArray(xff) ? xff.join(',') : xff).split(',').map((h) => h.trim().replace(/^(\d+\.\d+\.\d+\.\d+):\d+$/, '$1')).filter(Boolean);
+  for (let i = hops.length - 1; i >= 0; i--) if (!fromTrustedProxy(hops[i])) return ipv4(hops[i]);
+  return ipv4(hops[0] ?? peer);
+}
+
+// ───────────────────────────── access log ─────────────────────────────
+
+type Access = { ts: number; t0: number; replica: number | null; bytes: number };
+const ACCESS = Symbol('servify.access');
+const one = (h: string | string[] | undefined) => (Array.isArray(h) ? h[0] : h) ?? '';
+
+/**
+ * Start the access record of a proxied request (once, even when handle() runs again after a wake). It is written when
+ * the response closes — finished or abandoned — so every request yields exactly one record.
+ */
+function trackAccess(req: http.IncomingMessage, res: http.ServerResponse, svc: Service): Access | null {
+  const prev = (req as any)[ACCESS] as Access | undefined;
+  if (prev !== undefined) return prev;
+  if (svc.accessLog === false) return ((req as any)[ACCESS] = null);
+  const a: Access = { ts: Date.now(), t0: performance.now(), replica: null, bytes: 0 };
+  (req as any)[ACCESS] = a;
+  (res as any)[ACCESS] = a;
+  res.once('close', () =>
+    recordAccess({
+      serviceId: svc.id,
+      ts: a.ts,
+      host: hostOnly(req.headers.host),
+      method: req.method ?? '',
+      path: req.url ?? '',
+      status: res.headersSent ? res.statusCode : 499, // 499: the client left before an answer (as in Nginx)
+      bytes: a.bytes,
+      ms: performance.now() - a.t0,
+      referrer: one(req.headers.referer),
+      userAgent: one(req.headers['user-agent']),
+      replica: a.replica,
+      ip: clientIpOf(req),
+    }),
+  );
+  return a;
+}
+
+/** A page Servify answers itself (404/502/503): sized, so the access log knows its bytes. */
+function sendHtml(res: http.ServerResponse, status: number, headers: http.OutgoingHttpHeaders, html: string) {
+  const len = Buffer.byteLength(html);
+  const a = (res as any)[ACCESS] as Access | undefined;
+  if (a) a.bytes += len;
+  res.writeHead(status, { ...headers, 'content-length': len });
+  res.end(html);
+}
+
 function forwardHeaders(req: http.IncomingMessage, svc: Service, proto: 'http' | 'https' = 'http') {
   const h: http.OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) h[k] = v;
@@ -166,16 +226,15 @@ function page(status: number, title: string, body: string, refresh = false) {
 
 function unavailable(res: http.ServerResponse, svc: Service | null, host: string) {
   if (!svc) {
-    res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(page(404, 'No service here', `Nothing is routed to <code>${escapeHtml(host)}</code>. Check the domain in the Servify dashboard.`));
+    sendHtml(res, 404, { 'content-type': 'text/html; charset=utf-8' }, page(404, 'No service here', `Nothing is routed to <code>${escapeHtml(host)}</code>. Check the domain in the Servify dashboard.`));
     return;
   }
   const starting = anyReplicaStarting(svc) || svc.status === 'building' || svc.status === 'deploying';
-  res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'retry-after': '3', 'cache-control': 'no-store' });
-  if (svc.stopped) res.end(page(503, `${escapeHtml(svc.name)} is stopped`, 'Start it from the dashboard to bring it back online.'));
-  else if (svc.sleeping) res.end(page(503, `${escapeHtml(svc.name)} is waking up`, 'It was asleep after a while without visitors. This page refreshes automatically.', true));
-  else if (starting) res.end(page(503, `${escapeHtml(svc.name)} is starting`, 'A deploy is in progress. This page refreshes automatically.', true));
-  else res.end(page(503, `${escapeHtml(svc.name)} has no healthy replicas`, 'All replicas are failing their health checks. Check the logs in the dashboard.', true));
+  const h = { 'content-type': 'text/html; charset=utf-8', 'retry-after': '3', 'cache-control': 'no-store' };
+  if (svc.stopped) sendHtml(res, 503, h, page(503, `${escapeHtml(svc.name)} is stopped`, 'Start it from the dashboard to bring it back online.'));
+  else if (svc.sleeping) sendHtml(res, 503, h, page(503, `${escapeHtml(svc.name)} is waking up`, 'It was asleep after a while without visitors. This page refreshes automatically.', true));
+  else if (starting) sendHtml(res, 503, h, page(503, `${escapeHtml(svc.name)} is starting`, 'A deploy is in progress. This page refreshes automatically.', true));
+  else sendHtml(res, 503, h, page(503, `${escapeHtml(svc.name)} has no healthy replicas`, 'All replicas are failing their health checks. Check the logs in the dashboard.', true));
 }
 
 function escapeHtml(s: string) {
@@ -241,6 +300,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
   const svc = lookup(req.headers.host);
   const clientIp = req.socket.remoteAddress ?? '';
   if (!svc) return unavailable(res, null, req.headers.host ?? '');
+  const access = trackAccess(req, res, svc);
   if (svc.source.type === 'redirect') {
     count(svc.id, null, 0, false);
     res.writeHead(svc.source.code, { location: redirectLocation(svc, req.url), 'content-length': '0' });
@@ -268,6 +328,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
       return unavailable(res, svc, req.headers.host ?? '');
     }
     tried.add(up.containerId);
+    if (access) access.replica = up.index;
     noteConn(up.containerId, 1);
     let released = false;
     const release = () => {
@@ -284,6 +345,7 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
         for (const k of Object.keys(headers)) if (HOP.has(k)) delete headers[k];
         headers['x-servify-replica'] = String(up.index);
         res.writeHead(pres.statusCode ?? 502, headers);
+        if (access) pres.on('data', (c: Buffer) => (access.bytes += c.length));
         pres.pipe(res);
         pres.on('end', () => {
           finished = true;
@@ -307,10 +369,8 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
       const connectFail = err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' || err.code === 'EHOSTUNREACH';
       if (retry && connectFail && !sentBody && !res.headersSent) return attempt(false);
       count(svc.id, up.containerId, performance.now() - t0, true);
-      if (!res.headersSent) {
-        res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' });
-        res.end(page(502, 'Bad gateway', `Replica ${up.index} of ${escapeHtml(svc.name)} did not respond (${err.code ?? err.message}).`));
-      } else res.destroy();
+      if (!res.headersSent) sendHtml(res, 502, { 'content-type': 'text/html; charset=utf-8' }, page(502, 'Bad gateway', `Replica ${up.index} of ${escapeHtml(svc.name)} did not respond (${err.code ?? err.message}).`));
+      else res.destroy();
     });
     if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
       // Bodyless requests can be retried safely.
@@ -324,24 +384,72 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
   attempt(true);
 }
 
+type UpgradeAccess = { replica: number | null; done: (status: number) => void };
+
+/**
+ * Access record of a WebSocket (or other) upgrade, written once the handshake is answered — by the upstream (101
+ * normally) or by Servify (redirect, 503) — or when the socket closes before that. Not at the end of the
+ * connection: sockets can stay open for hours, and a restart would lose them. `ms` is the time to the answer.
+ */
+function trackUpgrade(req: http.IncomingMessage, socket: net.Socket, svc: Service): UpgradeAccess | null {
+  const prev = (req as any)[ACCESS] as UpgradeAccess | undefined;
+  if (prev !== undefined) return prev;
+  if (svc.accessLog === false) return ((req as any)[ACCESS] = null);
+  const ts = Date.now();
+  const t0 = performance.now();
+  let written = false;
+  const a: UpgradeAccess = {
+    replica: null,
+    done(status) {
+      if (written) return;
+      written = true;
+      recordAccess({
+        serviceId: svc.id,
+        ts,
+        host: hostOnly(req.headers.host),
+        method: req.method ?? '',
+        path: req.url ?? '',
+        status,
+        bytes: 0,
+        ms: performance.now() - t0,
+        referrer: one(req.headers.referer),
+        userAgent: one(req.headers['user-agent']),
+        replica: a.replica,
+        ip: clientIpOf(req),
+      });
+    },
+  };
+  (req as any)[ACCESS] = a;
+  socket.once('close', () => a.done(499)); // the client left before any answer
+  return a;
+}
+
 function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer, proto: 'http' | 'https' = 'http') {
   const svc = lookup(req.headers.host);
   if (!svc) return socket.destroy();
+  const access = trackUpgrade(req, socket, svc);
   if (svc.source.type === 'redirect') {
+    access?.done(svc.source.code);
     socket.end(`HTTP/1.1 ${svc.source.code} Redirect\r\nLocation: ${redirectLocation(svc, req.url)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
     return;
   }
   touch(svc.id);
   if (svc.sleeping) {
     socket.pause();
-    void wake(svc.id).then((ok) => (ok ? handleUpgrade(req, socket, head, proto) : socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n')));
+    void wake(svc.id).then((ok) => {
+      if (ok) return handleUpgrade(req, socket, head, proto);
+      access?.done(503);
+      socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+    });
     return;
   }
   const up = pickUpstream(svc, socket.remoteAddress ?? '');
   if (!up) {
+    access?.done(503);
     socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n');
     return;
   }
+  if (access) access.replica = up.index;
   let counted = false;
   const upstream = net.connect(up.port!, up.host!, () => {
     counted = true;
@@ -356,6 +464,7 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
     }
     upstream.write(raw + '\r\n');
     if (head?.length) upstream.write(head);
+    if (access) upstream.once('data', (c: Buffer) => access.done(Number(/^HTTP\/\d(?:\.\d)? (\d{3})/.exec(c.toString('latin1', 0, 16))?.[1]) || 502));
     upstream.pipe(socket);
     socket.pipe(upstream);
     count(svc.id, up.containerId, 0, false);
@@ -368,6 +477,7 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
   const onClose = () => {
     if (closed) return;
     closed = true;
+    access?.done(counted ? 499 : 502); // no answer yet: the client left first / the upstream was unreachable
     if (counted) noteConn(up.containerId, -1);
     close();
   };

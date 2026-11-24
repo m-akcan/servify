@@ -17,7 +17,7 @@ import { startEngine } from './engine.ts';
 import { startProxy } from './proxy.ts';
 import { startMetrics } from './metrics.ts';
 import { startBackgroundJobs } from './jobs.ts';
-import { sessionsTable, migrateSealing } from './db.ts';
+import { sessionsTable, migrateSealing, migrateAccessLog } from './db.ts';
 import { SealError, keySource, keyPath } from './crypto.ts';
 import { recoverInterrupted } from './deployer.ts';
 import { startScheduler } from './cronjobs.ts';
@@ -25,6 +25,7 @@ import { handleGitWebhook, handleDeployHook, MAX_HOOK_BODY } from './hooks.ts';
 import { startCertificates } from './certs.ts';
 import { startBackups } from './backups.ts';
 import { startLogCollector, flushLogs } from './logstore.ts';
+import { startAccessLog, flushAccessLog } from './accesslog.ts';
 import { startEnvironments } from './envs.ts';
 import { acquireLock } from './lock.ts';
 import { settleUpdate } from './updater.ts';
@@ -62,6 +63,7 @@ async function main() {
   try {
     const sealed = migrateSealing();
     (await import('./volumes.ts')).migrateVolumes();
+    migrateAccessLog();
     if (sealed) console.log(`  [secrets] encrypted ${sealed} stored record(s) at rest`);
     if (keySource === 'created') console.log(`  [secrets] created master key ${keyPath} — back it up; secrets can't be recovered without it`);
   } catch (e) {
@@ -141,6 +143,7 @@ async function main() {
   startCertificates();
   startBackups();
   startLogCollector();
+  startAccessLog();
   startEnvironments();
   (await import('./volumes.ts')).startVolumes();
   (await import('./pgcluster.ts')).startClusters();
@@ -171,6 +174,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
     try {
       flushLogs();
+      flushAccessLog();
     } catch {}
     process.exit(0);
   });

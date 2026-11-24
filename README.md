@@ -45,9 +45,10 @@ Servify is a self-hosted PaaS in the spirit of Railway and Coolify, built to be 
 - **Shared variables** per project (and per environment), referenced as `${{ shared.NAME }}`, with secrets masked.
 - **Watch paths** for monorepos: a push only deploys the services whose folders it touched.
 - **Image updates.** Registry images are checked for a newer image under the same tag and for newer tags (the same major and the next one), with one-click updates and opt-in automatic ones. Uses manifest HEAD requests, which don't count against Docker Hub's pull limit. A service running a pinned local copy can be pointed back at its registry image without a restart (`POST /api/services/:id/track-image`), but only when the registry tag is byte-identical to what runs.
+- **Access log.** The router records every HTTP request to a service (WebSocket upgrades and redirects too): time, host, method, path and query, status, bytes, duration, referrer, user agent and replica — without IP addresses. Visitors are told apart by a key hashed from the IP, the user agent and a salt that changes every UTC day, so they can be counted per day but never traced back. A daily summary gives requests and unique visitors with crawlers and AI bots (GPTBot, ClaudeBot, PerplexityBot…) apart from people, plus top pages, referrers, UTM sources and user agents. Kept for 7 days, on by default, switchable per service; readable with a read-only token.
 - **App sleeping.** An HTTP service can stop after a while without requests and wake on the next one (about a second for a small app).
 - **Usage alerts** when a server's disk, memory or CPU stays high, and again when it's back to normal.
-- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 48 tools. Everything an agent does is attributed to its token.
+- **Agent access.** Scoped API tokens, a REST API and an MCP server (Streamable HTTP + stdio) with 50 tools. Everything an agent does is attributed to its token.
 
 ## Quick start
 
@@ -127,7 +128,7 @@ claude mcp add --transport http servify http://localhost:7700/mcp --header "Auth
 { "mcpServers": { "servify": { "command": "node", "args": ["/path/to/servify/server/bin/servify.mjs", "mcp"], "env": { "SERVIFY_URL": "http://localhost:7700", "SERVIFY_TOKEN": "svf_…" } } } }
 ```
 
-Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `import_compose`, `load_test`, `run_job`, `list_runs`, `backup_service`, `list_backups`, `restore_backup`, `list_environments`, `create_environment`, `set_previews`, `list_certificates`, `list_volumes`, `create_volume`, `attach_volume`, `detach_volume`, `delete_volume`, `cluster_status`, `switchover`.
+Tools: `overview`, `create_project`, `get_project`, `delete_project`, `list_templates`, `create_service`, `get_service`, `update_service`, `deploy_service`, `wait_for_deployment`, `scale_service`, `restart_service`, `stop_service`, `start_service`, `delete_service`, `rollback_service`, `set_variables`, `delete_variable`, `list_deployments`, `get_deployment_logs`, `get_service_logs`, `get_access_log`, `get_access_summary`, `get_metrics`, `exec_command`, `get_activity`, `export_project`, `import_project`, `import_compose`, `load_test`, `run_job`, `list_runs`, `backup_service`, `list_backups`, `restore_backup`, `list_environments`, `create_environment`, `set_previews`, `list_certificates`, `list_volumes`, `create_volume`, `attach_volume`, `detach_volume`, `delete_volume`, `cluster_status`, `switchover`.
 
 Example — an agent can create a full stack in one call with `import_project`:
 
@@ -157,7 +158,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
   -d '{"replicas":5}' http://localhost:7700/api/services/<service>/scale
 ```
 
-Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/import-compose`, `/api/projects/:id/environments`, `/api/projects/:id/previews`, `/api/services/:id/backups`, `/api/backups/:id/{restore,download}`, `/api/projects/:id/volumes`, `/api/volumes/:id/{attach,detach}`, `/api/certs`, `/api/settings` (owner only for writes), `/api/hooks/git`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest,run}`, `/api/services/:id/runs`, `/api/services/:id/volumes/:name/download`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
+Main routes: `/api/projects`, `/api/projects/import`, `/api/projects/import-compose`, `/api/projects/:id/environments`, `/api/projects/:id/previews`, `/api/services/:id/backups`, `/api/backups/:id/{restore,download}`, `/api/projects/:id/volumes`, `/api/volumes/:id/{attach,detach}`, `/api/certs`, `/api/settings` (owner only for writes), `/api/hooks/git`, `/api/projects/:id/export`, `/api/projects/:id/services`, `/api/services/:id` (`GET`/`PATCH`/`DELETE`), `/api/services/:id/{deploy,restart,stop,start,scale,rollback,exec,duplicate,loadtest,run}`, `/api/services/:id/runs`, `/api/services/:id/volumes/:name/download`, `/api/services/:id/variables`, `/api/services/:id/{logs,metrics,deployments}`, `/api/services/:id/access-log` (`?since=&until=&path=&status=&q=&bot=&limit=&before=`) and `/api/services/:id/access-log/summary?day=YYYY-MM-DD`, `/api/deployments/:id/logs`, `/api/events` (SSE), `/api/activity`, `/api/templates`.
 
 ## HTTPS and custom domains
 
@@ -207,7 +208,7 @@ Some things aren't HTTP and don't fit the TCP proxy: game servers, voice chat (U
 
 ## Behind another proxy
 
-When something else terminates HTTPS in front of Servify (Nginx Proxy Manager, a cloud load balancer), set `SERVIFY_TRUSTED_PROXIES` to its address or network (e.g. `172.28.0.0/16`): requests from there keep their `X-Forwarded-Proto: https`, so apps build `https://` links and sign-in callbacks. From anywhere else the header is replaced with what Servify actually saw. The router has no overall request deadline, so long uploads and downloads finish.
+When something else terminates HTTPS in front of Servify (Nginx Proxy Manager, a cloud load balancer), set `SERVIFY_TRUSTED_PROXIES` to its address or network (e.g. `172.28.0.0/16`): requests from there keep their `X-Forwarded-Proto: https`, so apps build `https://` links and sign-in callbacks. From anywhere else the header is replaced with what Servify actually saw. The access log reads the visitor's address from `X-Forwarded-For` the same way (only from trusted proxies, nearest untrusted hop first) — it is hashed into the visitor key and never stored. The router has no overall request deadline, so long uploads and downloads finish.
 
 ## PostgreSQL clusters
 
@@ -295,10 +296,11 @@ The **production ▾** menu next to the project name creates environments: a ful
 | `SERVIFY_ALLOWED_HOSTS` | | Extra hostnames allowed to reach the dashboard |
 | `SERVIFY_AGENT_HOST` / `SERVIFY_AGENT_PORT` | `0.0.0.0` / `7701` | Where servers' agents connect (TLS). Only started once a server is added |
 | `SERVIFY_AGENT_PUBLIC_HOST` | first LAN IPv4 | Address shown in the join command |
-| `SERVIFY_TRUSTED_PROXIES` | | Proxies in front of Servify (IPs / IPv4 CIDRs) whose `X-Forwarded-Proto` is kept |
+| `SERVIFY_TRUSTED_PROXIES` | | Proxies in front of Servify (IPs / IPv4 CIDRs) whose `X-Forwarded-Proto` and `X-Forwarded-For` (visitor key of the access log) are believed |
 | `SERVIFY_HOST_MOUNTS` | | Folders services may mount from the host (comma-separated). Empty = host folders off |
 | `SERVIFY_AUTH` | `password` | `none` disables the dashboard password (single-user machines only) |
 | `SERVIFY_LOG_RETENTION_DAYS` / `SERVIFY_LOG_MAX_LINES` | `7` / `200000` | Runtime log history per service |
+| `SERVIFY_ACCESS_LOG_RETENTION_DAYS` / `SERVIFY_ACCESS_LOG_MAX_ROWS` | `7` / `1000000` | HTTP access log history per service |
 | `SERVIFY_METRICS_RETENTION_DAYS` | `7` | Metrics history |
 | `SERVIFY_JOB_MAX_SECONDS` | `3600` | Cron runs are killed after this |
 | `DOCKER_HOST` | auto | Docker endpoint |

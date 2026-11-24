@@ -43,6 +43,7 @@ import { keySource, keyPath } from './crypto.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume, unmanagedDockerVolumes, adoptVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, rebuildMember } from './pgcluster.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
+import { queryAccessLog, accessSummary } from './accesslog.ts';
 
 type Env = { Variables: { principal: Principal } };
 
@@ -299,6 +300,34 @@ api.get('/services/:id/logs', async (c) => {
     }),
   );
 });
+/** A time filter: epoch milliseconds, or anything Date.parse understands (ISO 8601). */
+function timeParam(v: string | undefined, name: string): number | undefined {
+  if (!v) return undefined;
+  const n = /^\d+$/.test(v) ? Number(v) : Date.parse(v);
+  if (!Number.isFinite(n)) throw new HttpError(400, `${name} must be epoch milliseconds or an ISO date`);
+  return n;
+}
+// Router access log (no IPs: a daily-salted visitor key). Read-only tokens may read it.
+api.get('/services/:id/access-log', (c) => {
+  const q = (k: string) => c.req.query(k) || undefined;
+  const bot = q('bot');
+  return c.json(
+    queryAccessLog(ops.getServiceOrThrow(c.req.param('id')).id, {
+      since: timeParam(q('since'), 'since'),
+      until: timeParam(q('until'), 'until'),
+      path: q('path'),
+      status: q('status'),
+      q: q('q'),
+      bot: bot === undefined ? undefined : bot === 'true' || bot === '1',
+      visitor: q('visitor'),
+      limit: q('limit') ? Number(q('limit')) : undefined,
+      before: q('before'),
+    }),
+  );
+});
+api.get('/services/:id/access-log/summary', (c) =>
+  c.json(accessSummary(ops.getServiceOrThrow(c.req.param('id')).id, c.req.query('day') || undefined, Number(c.req.query('top') ?? 20) || 20)),
+);
 api.get('/services/:id/volumes/:name/download', async (c) => {
   if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot download volume data');
   const svc = ops.getServiceOrThrow(c.req.param('id'));

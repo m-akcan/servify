@@ -143,6 +143,8 @@ export interface Service {
   sleeping?: boolean;
   /** Image services: redeploy automatically when a new image is published under the same tag. */
   imageAutoUpdate?: boolean;
+  /** Record the router's HTTP access log for this service (on unless set to false; no IPs, only a daily-salted visitor key). */
+  accessLog?: boolean;
   /** Docker-style overrides (e.g. from Compose): replace only CMD / only ENTRYPOINT. Ignored when startCommand is set. */
   cmd?: string[] | null;
   entrypoint?: string[] | null;

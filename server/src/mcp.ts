@@ -17,6 +17,7 @@ import { listCertificates } from './certs.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, clusterStatus } from './pgcluster.ts';
 import { listServers } from './nodes.ts';
+import { queryAccessLog, accessSummary } from './accesslog.ts';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
 
@@ -41,7 +42,8 @@ const INSTRUCTIONS = `Servify is a local-first PaaS running on this machine. It 
 - Deploys are async: call wait_for_deployment after create_service/deploy_service to get the outcome and build log tail.
 - Services can be referred to by id, slug, or "project/service".
 - Projects can have environments (staging, pr-12 previews…): full copies with their own URLs and data. Use list_environments / create_environment.
-- Databases and volumes can be backed up (backup_service) and restored (restore_backup). Logs and metrics are kept for 7 days.
+- Databases and volumes can be backed up (backup_service) and restored (restore_backup). Logs, metrics and the HTTP access log are kept for 7 days.
+- get_access_summary / get_access_log answer "how many visitors, from where, which crawlers" for an HTTP service (no IPs are stored).
 - import_compose turns a docker-compose.yml into a project (use dry_run first to see the mapping and warnings).`;
 
 export function buildMcpServer(principal: Principal): McpServer {
@@ -286,6 +288,48 @@ export function buildMcpServer(principal: Principal): McpServer {
       const lines = await ops.serviceLogs(service, { tail: tail ?? 100, search, since: since_minutes ? Date.now() - since_minutes * 60_000 : undefined, deploymentId: deployment_id });
       return lines.map((l) => `[#${l.replica}] ${new Date(l.ts).toISOString()} ${l.text}`).join('\n') || '(no logs)';
     }),
+  );
+
+  server.registerTool(
+    'get_access_log',
+    {
+      description:
+        'HTTP access log of a service from the router, newest first, kept for 7 days: time, host, method, path+query, status, bytes, ms, referrer, user agent, replica, bot flag and a visitor key (a daily-salted hash; no IPs are stored). Page with `before` = the previous `next`.',
+      inputSchema: {
+        service: svcRef,
+        since: z.string().optional().describe('ISO time or epoch ms'),
+        until: z.string().optional().describe('ISO time or epoch ms'),
+        since_minutes: z.number().min(1).max(10080).optional().describe('Only requests from the last N minutes'),
+        path: z.string().optional().describe('Path prefix ("/blog"), or a glob with * ("*.php")'),
+        status: z.string().optional().describe('404, 4xx, or a list like "301,302,5xx"'),
+        q: z.string().optional().describe('Substring of path, referrer, user agent or host'),
+        bot: z.boolean().optional().describe('true = only bots/crawlers, false = only people'),
+        visitor: z.string().optional().describe('Only one visitor key'),
+        limit: z.number().int().min(1).max(1000).optional().describe('Default 100'),
+        before: z.string().optional().describe('Paging cursor: `next` from the previous call'),
+      },
+    },
+    wrap((a: { service: string; since?: string; until?: string; since_minutes?: number; path?: string; status?: string; q?: string; bot?: boolean; visitor?: string; limit?: number; before?: string }) => {
+      const time = (v?: string) => (v ? (/^\d+$/.test(v) ? Number(v) : Date.parse(v)) : undefined);
+      const since = a.since_minutes ? Date.now() - a.since_minutes * 60_000 : time(a.since);
+      const until = time(a.until);
+      if (Number.isNaN(since) || Number.isNaN(until)) throw new Error('since/until must be ISO times or epoch ms');
+      return queryAccessLog(ops.getServiceOrThrow(a.service).id, { since, until, path: a.path, status: a.status, q: a.q, bot: a.bot, visitor: a.visitor, limit: a.limit, before: a.before });
+    }),
+  );
+
+  server.registerTool(
+    'get_access_summary',
+    {
+      description:
+        'One UTC day of a service’s HTTP traffic: requests and unique visitors with bots/crawlers (GPTBot, ClaudeBot, PerplexityBot, Googlebot…) counted apart from people, status classes, top paths, top referrer hosts, top UTM sources, top user agents and top bots.',
+      inputSchema: {
+        service: svcRef,
+        day: z.string().optional().describe('YYYY-MM-DD in UTC; default today'),
+        top: z.number().int().min(1).max(100).optional().describe('Entries per top list (default 20)'),
+      },
+    },
+    wrap(({ service, day, top }: { service: string; day?: string; top?: number }) => accessSummary(ops.getServiceOrThrow(service).id, day, top ?? 20)),
   );
 
   server.registerTool(

@@ -22,6 +22,7 @@ import { HttpError } from './util.ts';
 import { recordActivity, SYSTEM, type Actor } from './events.ts';
 import { notify } from './notify.ts';
 import { flushLogs } from './logstore.ts';
+import { flushAccessLog } from './accesslog.ts';
 import { restoresRunning } from './backups.ts';
 
 /** Run a command without blocking the router (it keeps serving every site meanwhile). */
@@ -229,6 +230,7 @@ export async function installUpdate(actor: Actor, wanted?: string | null): Promi
     setTimeout(() => {
       try {
         flushLogs();
+        flushAccessLog();
       } catch {}
       process.exit(75); // not a clean exit: systemd (Restart=on-failure) and launchd (KeepAlive) start us again
     }, 800).unref();
