@@ -4,7 +4,8 @@
  * secrets at rest, notifications, git webhooks, HTTPS, backups + restore, persistent logs/metrics,
  * Docker Compose import, environments and pull-request previews, the router access log.
  *
- * The access-log checks need the instance started with SERVIFY_TRUSTED_PROXIES=127.0.0.1.
+ * Access log: pass this script the instance's SERVIFY_TRUSTED_PROXIES. With 127.0.0.1 in it, X-Forwarded-For must tell
+ * visitors apart; without, it must be ignored.
  *
  *   SERVIFY_URL=http://localhost:7700 SERVIFY_PROXY_PORT=8080 SERVIFY_HTTPS_PORT=8443 \
  *   SERVIFY_DATA_DIR=~/.servify SERVIFY_COOKIE='servify_session=…' node scripts/acceptance-features.mjs
@@ -25,6 +26,8 @@ const PROXY = Number(process.env.SERVIFY_PROXY_PORT ?? 8080);
 const HTTPS_PORT = Number(process.env.SERVIFY_HTTPS_PORT ?? 8443);
 const DATA = process.env.SERVIFY_DATA_DIR?.replace(/^~/, process.env.HOME);
 const COOKIE = process.env.SERVIFY_COOKIE;
+/** Mirror of the instance's SERVIFY_TRUSTED_PROXIES (pass the same value to both): does it believe X-Forwarded-For from us? */
+const TRUSTS_LOCAL = (process.env.SERVIFY_TRUSTED_PROXIES ?? '').split(',').some((t) => ['127.0.0.1', '127.0.0.0/8', '0.0.0.0/0'].includes(t.trim()));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 const projectsToDelete = [];
@@ -787,7 +790,10 @@ async function accessLogChecks(P, web) {
   const t0 = Date.now();
   await send('/al-home?utm_source=newsletter&utm_medium=email', { referer: 'https://news.example.org/post/1', 'x-forwarded-for': canaryIp });
   await send('/al-home', { 'x-forwarded-for': canaryIp });
-  await send('/al-about', { 'x-forwarded-for': '198.51.100.7' });
+  await send('/al-about', { 'x-forwarded-for': '198.51.100.7', 'user-agent': 'Mozilla/5.0 (X11; Linux) AccessLogTest/2.0' });
+  // Same agent, two forwarded addresses: told apart only when the instance trusts 127.0.0.1 as a proxy.
+  await send('/al-xff-a', { 'x-forwarded-for': '198.51.100.21', 'user-agent': 'AccessLogTest-Xff/1.0 Mozilla/5.0' });
+  await send('/al-xff-b', { 'x-forwarded-for': '198.51.100.22', 'user-agent': 'AccessLogTest-Xff/1.0 Mozilla/5.0' });
   await send('/al-home', { 'user-agent': 'Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)' });
   await send('/al-home', { 'user-agent': 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)' });
 
@@ -802,7 +808,7 @@ async function accessLogChecks(P, web) {
   const page1 = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&limit=100`);
   check('a read-only token can read the access log', page1.status === 200 && Array.isArray(page1.json.entries), `${page1.status}`);
   const mine = (page1.json.entries ?? []).filter((e) => e.path.startsWith('/al-'));
-  check('one record per request', mine.length === 5, `${mine.length} records`);
+  check('one record per request', mine.length === 7, `${mine.length} records`);
   const first = mine.find((e) => e.path.includes('utm_source'));
   check(
     'records carry time, host, method, path+query, status, bytes, duration, referrer, user agent and replica',
@@ -812,19 +818,23 @@ async function accessLogChecks(P, web) {
   const homes = mine.filter((e) => !e.bot && e.path.startsWith('/al-home'));
   const about = mine.find((e) => e.path === '/al-about');
   check('same address + user agent → same visitor key', homes.length === 2 && homes[0].visitor === homes[1].visitor);
-  check('another address → another visitor key', about && about.visitor !== homes[0]?.visitor);
-  check('no IP address in any record', !JSON.stringify(page1.json).includes(canaryIp) && !JSON.stringify(page1.json).includes('198.51.100.7'));
+  check('another visitor → another visitor key', about && about.visitor !== homes[0]?.visitor);
+  const xa = mine.find((e) => e.path === '/al-xff-a');
+  const xb = mine.find((e) => e.path === '/al-xff-b');
+  if (TRUSTS_LOCAL) check('X-Forwarded-For from a trusted proxy tells visitors apart', xa && xb && xa.visitor !== xb.visitor);
+  else check('X-Forwarded-For from an untrusted peer is ignored (no spoofed visitors)', xa && xb && xa.visitor === xb.visitor);
+  check('no IP address in any record', !JSON.stringify(page1.json).includes(canaryIp) && !/198\.51\.100\./.test(JSON.stringify(page1.json)));
   check('crawlers are flagged as bots', mine.filter((e) => e.bot).length === 2);
 
   const p404 = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-about&status=2xx`);
   check('path and status filters', p404.json.entries?.length === 1 && p404.json.entries[0].path === '/al-about');
   const qf = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&q=GPTBot`);
   check('text search over user agents', qf.json.entries?.length === 1);
-  const pageA = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=2`);
-  const pageB = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=2&before=${pageA.json.next}`);
-  const pageC = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=2&before=${pageB.json.next}`);
+  const pageA = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=3`);
+  const pageB = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=3&before=${pageA.json.next}`);
+  const pageC = await asReader(`/services/${web.id}/access-log?since=${t0 - 1000}&path=/al-&limit=3&before=${pageB.json.next}`);
   const paged = [...pageA.json.entries, ...pageB.json.entries, ...pageC.json.entries].map((e) => e.id);
-  check('paging walks every record once', new Set(paged).size === 5 && paged.length === 5 && pageC.json.next === null, JSON.stringify(paged));
+  check('paging walks every record once', new Set(paged).size === 7 && paged.length === 7 && pageC.json.next === null, JSON.stringify(paged));
 
   const sum = await asReader(`/services/${web.id}/access-log/summary`);
   const S = sum.json;
@@ -850,7 +860,7 @@ async function accessLogChecks(P, web) {
     }
   };
   const ml = await mcp('get_access_log', { service: `${P.slug}/web`, since_minutes: 10, path: '/al-', bot: false });
-  check('MCP get_access_log works with a read-only token and filters', !ml.error && ml.data?.entries?.length === 3, ml.error ?? '');
+  check('MCP get_access_log works with a read-only token and filters', !ml.error && ml.data?.entries?.length === 5, ml.error ?? '');
   const ms = await mcp('get_access_summary', { service: web.id });
   check('MCP get_access_summary works with a read-only token', !ms.error && ms.data?.requests?.bots >= 2, ms.error ?? '');
 
@@ -860,7 +870,8 @@ async function accessLogChecks(P, web) {
   check("a service's log holds only its own requests", otherLog.status === 200 && otherLog.json.entries.length === 0);
   const early = (await hit(`other-site.${P.slug}.localhost`, '/too-early')).status;
   const earlyLog = (await asReader(`/services/${other.id}/access-log?path=/too-early`)).json.entries?.[0];
-  check("Servify's own answers are recorded too (503 while starting)", early === 503 ? earlyLog?.status === 503 && earlyLog.bytes > 0 : true, `${early} ${JSON.stringify(earlyLog)}`);
+  if (early === 503) check("Servify's own answers are recorded too (503 while starting)", earlyLog?.status === 503 && earlyLog.bytes > 0, JSON.stringify(earlyLog));
+  else console.log(`  – skipped the 503 check (the new service answered ${early} already)`);
   await api('DELETE', `/services/${other.id}`).catch(() => {});
 
   // WebSocket upgrade (whoami's /echo): one record with the upstream's 101, written when the socket closes.

@@ -103,8 +103,20 @@ let flushQueued = false;
 
 const cut = (s: string | undefined, n: number) => (!s ? '' : s.length > n ? s.slice(0, n) : s);
 
-/** Called by the router once per finished request. Cheap: hashes and queues, never touches the database. */
+/**
+ * Called by the router once per finished request. Cheap: hashes and queues (the database is only touched once a day,
+ * for the salt). Never throws — it runs in a socket 'close' listener, where an exception would stop the router.
+ */
 export function recordAccess(r: AccessRecord) {
+  try {
+    queueRecord(r);
+  } catch (e) {
+    dropped++;
+    console.error('[access-log] record skipped:', (e as Error).message);
+  }
+}
+
+function queueRecord(r: AccessRecord) {
   if (queue.length >= MAX_QUEUE) {
     dropped++; // the writer can't keep up: drop rather than slow the router down (O(1), unlike shifting the queue)
     return;
