@@ -58,7 +58,13 @@ function FailureHint({ d, s }: { d: Deployment; s: ServiceView }) {
   if (/health check timed out/.test(e) && s.protocol !== 'none')
     text = `Replicas never accepted connections on port ${d.port ?? '?'}. If your app listens elsewhere, set the container port in Settings → Networking (Servify injects PORT=${d.port ?? '…'}), or switch to Worker if it serves no traffic.`;
   else if (/exited during startup/.test(e)) text = 'The process exited right after starting. Check the output below — a missing variable or a wrong start command are the usual causes.';
-  else if (/pull access denied|manifest unknown|not found: manifest|error from registry|denied/i.test(e)) text = 'The image could not be pulled. Check the name and tag; for private registries run docker login on this machine (Servify retries with your CLI credentials).';
+  else if (/^pull failed: (unauthorized|not found or private)/.test(e)) {
+    const stays = s.activeDeploymentId ? 'nothing changed and the running version stays' : 'nothing was started';
+    const m = /credentials for (\S+)|(\S+) refused the saved login/.exec(e);
+    const host = m?.[1] ?? m?.[2] ?? 'the registry';
+    text = `The registry refused the pull, so ${stays}. Log in on the server as the user Servify runs as (docker login ${host}), then retry.${d.cachedImageAvailable ? ' Deploy cached image uses the copy already on the server instead — it may be older.' : ''}`;
+  } else if (/^pull failed: registry unreachable/.test(e)) text = `The registry could not be reached, so ${s.activeDeploymentId ? 'nothing changed and the running version stays' : 'nothing was started'}. Retry once it is back.${d.cachedImageAvailable ? ' Deploy cached image uses the copy already on the server instead — it may be older.' : ''}`;
+  else if (/^pull failed|pull access denied|manifest unknown|not found: manifest|error from registry|denied/i.test(e)) text = `The image could not be pulled, so ${s.activeDeploymentId ? 'nothing changed and the running version stays' : 'nothing was started'}. Check the name and tag; for private registries run docker login on the server (Servify pulls with your CLI credentials).`;
   else if (/git clone failed/.test(e)) text = 'The repository could not be cloned. Check the URL and branch; private repositories need an access token in Settings → Source.';
   else if (/could not detect how to build/.test(e)) text = 'No Dockerfile and no recognised project files. Add a Dockerfile, or point Root directory at the app folder.';
   if (!text) return null;
@@ -166,6 +172,13 @@ function DeploymentRow({ d, s, expanded, onToggle, prev }: { d: Deployment; s: S
             <Tooltip label="Redeploy this version">
               <Button size="sm" variant="ghost" icon="history" onClick={() => void rollback(s, d)}>
                 Rollback
+              </Button>
+            </Tooltip>
+          )}
+          {d.status === 'failed' && d.cachedImageAvailable && /^pull failed/.test(d.error ?? '') && (
+            <Tooltip label="Deploy the copy of the image already on the server, without pulling (it may be older than the registry's)">
+              <Button size="sm" variant="ghost" icon="history" onClick={() => void deploy(s, { useCachedImage: true })}>
+                Deploy cached image
               </Button>
             </Tooltip>
           )}

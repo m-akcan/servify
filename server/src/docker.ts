@@ -279,9 +279,10 @@ export function createDockerClient(target: DockerTarget) {
         throw e;
       }
     },
-    async pullImage(ref: string, onLine?: (line: string) => void): Promise<void> {
+    /** `auth`: an X-Registry-Auth value (only ever passed for this machine's daemon, never a remote server's). */
+    async pullImage(ref: string, onLine?: (line: string) => void, auth?: string | null): Promise<void> {
       let [image, tag] = splitImageRef(ref);
-      const res = await stream('POST', '/images/create', { query: { fromImage: image, tag } });
+      const res = await stream('POST', '/images/create', { query: { fromImage: image, tag }, ...(auth ? { headers: { 'X-Registry-Auth': auth } } : {}) });
       const lastStatus = new Map<string, string>();
       for await (const msg of jsonLines(res)) {
         if (msg.errorDetail || msg.error) throw new Error(msg.errorDetail?.message ?? msg.error);
