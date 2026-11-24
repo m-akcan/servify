@@ -4,8 +4,8 @@
  */
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { parseRepo, sameRepo } from './imageupdates.ts';
+import { engineAuthHeader, savedLoginHosts } from './registryauth.ts';
 import { databaseOf, demuxLines, normalizeImageRef, type DockerClient } from './docker.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
@@ -67,29 +67,21 @@ function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promis
   });
 }
 
-/** Pull through the Engine API, then the CLI (the Engine API doesn't see `docker login`). Null on success, else the reason. */
-async function pull(d: DockerClient, ref: string, log: (l: string) => void): Promise<string | null> {
+/**
+ * Pull through the Engine API — on this machine with the registry login of the user Servify runs as — then, if that
+ * fails, through the docker CLI. Null on success, else the reason. Logins never go to remote servers.
+ */
+async function pull(d: DockerClient, ref: string, log: (l: string) => void, local: boolean): Promise<string | null> {
   try {
-    await d.pullImage(ref, (l) => log(l));
+    const host = parseRepo(ref)?.registry;
+    const auth = local && host ? await engineAuthHeader(host).catch(() => null) : null;
+    if (auth) log(`▸ Using the saved docker login for ${host}`);
+    await d.pullImage(ref, (l) => log(l), auth);
     return null;
   } catch (e) {
     log(`! ${(e as Error).message}`);
     return await cliPull(d, ref, log);
   }
-}
-
-/** Registries the docker CLI has a saved login for (what `docker login` wrote), as plain host names. */
-function savedLogins(): Set<string> {
-  const out = new Set<string>();
-  try {
-    const dir = process.env.DOCKER_CONFIG || join(homedir(), '.docker');
-    const cfg = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
-    for (const k of [...Object.keys(cfg.auths ?? {}), ...Object.keys(cfg.credHelpers ?? {})]) {
-      const host = k.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-      out.add(/^(index|registry-1)\.docker\.io$/.test(host) ? 'docker.io' : host);
-    }
-  } catch {}
-  return out;
 }
 
 /** Docker Hub's answer for a name with no account part (library/…), which can't be private: it doesn't exist there. */
@@ -99,10 +91,10 @@ function notOnDockerHub(raw: string, ref: string): boolean {
 }
 
 /** A failed pull in a few words: what went wrong and with which registry (the raw message stays in the log). */
-export function pullProblem(raw: string, ref: string): string {
+export function pullProblem(raw: string, ref: string, local = true): string {
   const r = parseRepo(ref);
   const host = r?.registry ?? 'the registry';
-  const login = () => (savedLogins().has(host) ? `${host} refused the saved login` : `no credentials for ${host}`);
+  const login = () => (!local ? `no credentials for ${host} on that server` : savedLoginHosts().has(host) ? `${host} refused the saved login` : `no credentials for ${host}`);
   if (/toomanyrequests|rate limit/i.test(raw)) return `rate limited by ${host}`;
   if (notOnDockerHub(raw, ref)) return `not found — ${r!.repo.replace(/^library\//, '')} is not on Docker Hub`;
   if (/repository does not exist or may require/i.test(raw)) return `not found or private — ${login()}`;
@@ -348,9 +340,9 @@ async function runDeployment(depId: string, actor: Actor) {
           log(`▸ Using local image ${ref} (made on this server, not pulled from a registry)`);
         } else if (!local || ref.endsWith(':latest') || update) {
           log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`);
-          const raw = await pull(d, ref, log);
+          const raw = await pull(d, ref, log, node === LOCAL);
           if (raw) {
-            const reason = pullProblem(raw, ref);
+            const reason = pullProblem(raw, ref, node === LOCAL);
             if (local && !update && notOnDockerHub(raw, ref)) {
               log(`▸ ${ref} is not on Docker Hub — using the local image (made on this server)`);
             } else if (local && !update && reusing) {

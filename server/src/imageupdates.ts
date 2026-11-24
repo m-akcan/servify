@@ -7,6 +7,7 @@
  * registry not answering) — unknown never notifies and never updates. Notifications and automatic updates happen
  * at most once per published image.
  */
+import { credentialsFor, savedLoginHosts } from './registryauth.ts';
 import { createHash } from 'node:crypto';
 import { deployments as deploymentsTable, kv, services as servicesTable } from './db.ts';
 import { dockerFor, nodeOf } from './nodes.ts';
@@ -90,28 +91,46 @@ export function sameRepo(name: string, r: Repo): boolean {
 
 const tokens = new Map<string, { token: string; until: number }>();
 
-/** A request to the registry, following the anonymous Bearer-token challenge (Docker Hub, ghcr.io, most others). */
+/**
+ * A request to the registry, answering its challenge: a Bearer token (Docker Hub, ghcr.io, most others) or Basic
+ * auth (a plain `registry:2` with htpasswd). With a saved docker login for the registry it is used — sent only to that
+ * registry or the token service it names, and kept in memory; without one the request stays anonymous.
+ */
 async function registryFetch(r: Repo, url: string, init: RequestInit = {}): Promise<Response> {
   const key = `${r.registry}/${r.repo}`;
   const cached = tokens.get(key);
-  const go = (token?: string) =>
-    fetch(url, { ...init, headers: { ...(init.headers as Record<string, string>), 'user-agent': 'servify', ...(token ? { authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(TIMEOUT) });
-  let res = await go(cached && cached.until > Date.now() ? cached.token : undefined);
+  const go = (authorization?: string) =>
+    fetch(url, { ...init, headers: { ...(init.headers as Record<string, string>), 'user-agent': 'servify', ...(authorization ? { authorization } : {}) }, signal: AbortSignal.timeout(TIMEOUT) });
+  let res = await go(cached && cached.until > Date.now() ? `Bearer ${cached.token}` : undefined);
   if (res.status !== 401) return res;
   const challenge = res.headers.get('www-authenticate') ?? '';
+  const creds = await credentialsFor(r.registry).catch(() => null);
+  if (/^basic /i.test(challenge)) {
+    if (!creds || !('username' in creds)) return res;
+    return go(`Basic ${Buffer.from(`${creds.username}:${creds.password}`).toString('base64')}`);
+  }
   if (!/^bearer /i.test(challenge)) return res;
   const params = Object.fromEntries([...challenge.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1].toLowerCase(), m[2]]));
   if (!params.realm) return res;
   const t = new URL(params.realm);
-  if (params.service) t.searchParams.set('service', params.service);
-  t.searchParams.set('scope', params.scope || `repository:${r.repo}:pull`);
-  const tr = await fetch(t, { headers: { 'user-agent': 'servify' }, signal: AbortSignal.timeout(TIMEOUT) });
+  const scope = params.scope || `repository:${r.repo}:pull`;
+  let tr: Response;
+  if (creds && 'identitytoken' in creds) {
+    // An identity token is an OAuth refresh token: exchange it at the token endpoint.
+    const form = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: creds.identitytoken, client_id: 'servify', scope, ...(params.service ? { service: params.service } : {}) });
+    tr = await fetch(t, { method: 'POST', headers: { 'user-agent': 'servify', 'content-type': 'application/x-www-form-urlencoded' }, body: form, signal: AbortSignal.timeout(TIMEOUT) });
+  } else {
+    if (params.service) t.searchParams.set('service', params.service);
+    t.searchParams.set('scope', scope);
+    const basic = creds ? { authorization: `Basic ${Buffer.from(`${creds.username}:${creds.password}`).toString('base64')}` } : {};
+    tr = await fetch(t, { headers: { 'user-agent': 'servify', ...basic }, signal: AbortSignal.timeout(TIMEOUT) });
+  }
   if (!tr.ok) return res;
   const body = (await tr.json()) as { token?: string; access_token?: string; expires_in?: number };
   const token = body.token ?? body.access_token;
   if (!token) return res;
   tokens.set(key, { token, until: Date.now() + Math.max(30, (body.expires_in ?? 300) - 30) * 1000 });
-  res = await go(token);
+  res = await go(`Bearer ${token}`);
   return res;
 }
 
@@ -119,7 +138,7 @@ async function registryFetch(r: Repo, url: string, init: RequestInit = {}): Prom
 async function remoteDigest(r: Repo): Promise<string> {
   const url = `${r.base}/manifests/${encodeURIComponent(r.tag)}`;
   let res = await registryFetch(r, url, { method: 'HEAD', headers: { accept: ACCEPT } });
-  if (res.status === 401 || res.status === 403) throw new Error('the registry needs credentials');
+  if (res.status === 401 || res.status === 403) throw new Error(savedLoginHosts().has(r.registry) ? `${r.registry} refused the saved login` : `the registry needs credentials (no docker login for ${r.registry})`);
   if (res.status === 404) throw new Error(`the tag ${r.tag} is no longer in the registry`);
   if (!res.ok) throw new Error(`the registry answered ${res.status}`);
   const header = res.headers.get('docker-content-digest');

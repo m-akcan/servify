@@ -9,12 +9,14 @@
  *
  * Use SERVIFY_COOKIE (a logged-in dashboard session) or run the instance with SERVIFY_AUTH=none.
  * SERVIFY_DATA_DIR enables the "no plaintext secrets on disk" check.
+ * DOCKER_CONFIG (a scratch folder, never ~/.docker; Servify must run with the same one) enables the registry-login
+ * checks: the test writes a login for a local password-protected registry there.
  */
 import { execSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 
@@ -475,6 +477,56 @@ async function main() {
     const d6 = await finished((await api('POST', `/services/${pulled.id}/deploy`, { useCachedImage: true })).id);
     check('useCachedImage deploys the copy on the server', d6?.status === 'active' && /deploying the copy already on this server, as asked/.test(await logOf(d6.id)), d6?.error ?? d6?.status);
     await api('POST', `/services/${pulled.id}/scale`, { replicas: 1 });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ registry logins (a private registry with a password)');
+  const DC = process.env.DOCKER_CONFIG?.replace(/^~/, process.env.HOME);
+  if (!DC || resolve(DC) === resolve(join(process.env.HOME, '.docker'))) console.log('  – skipped (set DOCKER_CONFIG to a scratch folder for Servify and this script)');
+  else {
+    const PORT = 15057;
+    const NAME = 'servify-acc-registry-auth';
+    const USER = 'acc';
+    const PW = 'svf-acc-Rq7w-registry';
+    const HASH = '$2y$05$HSSyz7LzJrGSKh3qaewOsuqlyCFzBfBNRDWrjh68PBJ.txKgtIPVy'; // htpasswd -nbB acc <PW>
+    const ref = `localhost:${PORT}/acc/private:1.0`;
+    const sh = (c) => execSync(c, { stdio: 'pipe' }).toString().trim();
+    const authDir = mkdtempSync(join(tmpdir(), 'servify-regauth-'));
+    writeFileSync(join(authDir, 'htpasswd'), `${USER}:${HASH}\n`);
+    sh(`docker rm -f ${NAME} 2>/dev/null || true`);
+    sh(`docker run -d --name ${NAME} -p ${PORT}:5000 -v ${authDir}:/auth -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=acc -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2`);
+    const cfgPath = join(DC, 'config.json');
+    const cfgBefore = existsSync(cfgPath) ? readFileSync(cfgPath, 'utf8') : null;
+    cleanups.push(async () => {
+      execSync(`docker rm -f ${NAME}; docker rmi ${ref} || true`, { stdio: 'ignore' });
+      rmSync(authDir, { recursive: true, force: true });
+      if (cfgBefore === null) rmSync(cfgPath, { force: true });
+      else writeFileSync(cfgPath, cfgBefore);
+    });
+    check('the registry refuses anonymous requests', !!(await waitFor(async () => (await fetch(`http://localhost:${PORT}/v2/`).catch(() => null))?.status === 401, 30_000, 'registry')));
+    // What `docker login` writes without a credential store (a scratch config, never the user's).
+    const cfg = cfgBefore ? JSON.parse(cfgBefore) : {};
+    cfg.auths = { ...(cfg.auths ?? {}), [`localhost:${PORT}`]: { auth: Buffer.from(`${USER}:${PW}`).toString('base64') } };
+    writeFileSync(cfgPath, JSON.stringify(cfg));
+    sh(`docker tag alpine:3.20 ${ref} && docker push -q ${ref} && docker rmi ${ref}`);
+    const priv = (await api('POST', `/projects/${P.id}/services`, { image: ref, name: 'private', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    const ok = await running(P.id, 'private');
+    const dep = ok ? await api('GET', `/deployments/${ok.activeDeploymentId}`) : null;
+    const log = dep ? (await api('GET', `/deployments/${dep.id}/logs`)).map((l) => (typeof l === 'string' ? l : l.text ?? l.line ?? '')).join('\n') : '';
+    check('a private image deploys', dep?.status === 'active', dep?.error ?? '');
+    check('pulled through the Engine API with the saved login', log.includes(`Using the saved docker login for localhost:${PORT}`) && !/Retrying pull with the docker CLI/.test(log), log.split('\n').filter((l) => /pull|login|Retrying/i.test(l)).join(' | '));
+    let st = await api('POST', `/services/${priv.id}/image-check`);
+    check('the update check reaches the private registry', st?.status === 'current', JSON.stringify(st));
+    sh(`docker tag busybox:1.36 ${ref} && docker push -q ${ref} && docker rmi ${ref}`);
+    st = await api('POST', `/services/${priv.id}/image-check`);
+    check('and sees a new image under the same tag', st?.status === 'changed', JSON.stringify(st));
+    const b64 = Buffer.from(`${USER}:${PW}`).toString('base64');
+    if (DATA) {
+      const hits = sh(`grep -rlaF -e '${PW}' -e '${b64}' ${JSON.stringify(DATA)} || true`);
+      check('the password is nowhere in the data folder (database, logs)', hits === '', hits);
+    }
+    const acts = JSON.stringify(await api('GET', '/activity').catch(() => []));
+    check('nor in the activity, deployment log or notifications', !log.includes(PW) && !acts.includes(PW) && !received.some((r) => r.body.includes(PW) || r.body.includes(b64)));
   }
 
   // ─────────────────────────────────────────────────────────────
