@@ -79,8 +79,11 @@ async function pull(d: DockerClient, ref: string, log: (l: string) => void, loca
     await d.pullImage(ref, (l) => log(l), auth);
     return null;
   } catch (e) {
-    log(`! ${(e as Error).message}`);
-    return await cliPull(d, ref, log);
+    const engine = (e as Error).message;
+    log(`! ${engine}`);
+    const cli = await cliPull(d, ref, log);
+    // The CLI's answer is the better one (it has every login); if it couldn't even start, keep the Engine's.
+    return cli === null ? null : cli.startsWith('docker CLI: ') ? engine : cli;
   }
 }
 
@@ -91,10 +94,10 @@ function notOnDockerHub(raw: string, ref: string): boolean {
 }
 
 /** A failed pull in a few words: what went wrong and with which registry (the raw message stays in the log). */
-export function pullProblem(raw: string, ref: string, local = true): string {
+export function pullProblem(raw: string, ref: string): string {
   const r = parseRepo(ref);
   const host = r?.registry ?? 'the registry';
-  const login = () => (!local ? `no credentials for ${host} on that server` : savedLoginHosts().has(host) ? `${host} refused the saved login` : `no credentials for ${host}`);
+  const login = () => (savedLoginHosts().has(host) ? `${host} refused the saved login` : `no credentials for ${host}`);
   if (/toomanyrequests|rate limit/i.test(raw)) return `rate limited by ${host}`;
   if (notOnDockerHub(raw, ref)) return `not found — ${r!.repo.replace(/^library\//, '')} is not on Docker Hub`;
   if (/repository does not exist or may require/i.test(raw)) return `not found or private — ${login()}`;
@@ -342,7 +345,7 @@ async function runDeployment(depId: string, actor: Actor) {
           log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`);
           const raw = await pull(d, ref, log, node === LOCAL);
           if (raw) {
-            const reason = pullProblem(raw, ref, node === LOCAL);
+            const reason = pullProblem(raw, ref);
             if (local && !update && notOnDockerHub(raw, ref)) {
               log(`▸ ${ref} is not on Docker Hub — using the local image (made on this server)`);
             } else if (local && !update && reusing) {
