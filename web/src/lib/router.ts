@@ -5,6 +5,7 @@ export type Route =
   | { name: 'project'; project: string; service?: string; tab?: string }
   | { name: 'agents' }
   | { name: 'servers' }
+  | { name: 'traffic' }
   | { name: 'settings'; section?: string };
 
 function parse(path: string): Route {
@@ -12,6 +13,7 @@ function parse(path: string): Route {
   if (parts[0] === 'p' && parts[1]) return { name: 'project', project: parts[1], service: parts[2], tab: parts[3] };
   if (parts[0] === 'agents') return { name: 'agents' };
   if (parts[0] === 'servers') return { name: 'servers' };
+  if (parts[0] === 'traffic') return { name: 'traffic' };
   if (parts[0] === 'settings') return { name: 'settings', section: parts[1] };
   return { name: 'home' };
 }

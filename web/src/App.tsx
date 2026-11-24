@@ -12,6 +12,7 @@ import { EventToasts } from './components/EventToasts.tsx';
 import { Shortcuts } from './components/Shortcuts.tsx';
 import { SettingsView } from './views/SettingsView.tsx';
 import { ServersView } from './views/Servers.tsx';
+import { TrafficView } from './views/Traffic.tsx';
 
 export function App() {
   const auth = useStore((s) => s.auth);
@@ -41,6 +42,7 @@ export function App() {
         {route.name === 'project' && <ProjectView key={route.project} slug={route.project} serviceSlug={route.service} tab={route.tab} />}
         {route.name === 'agents' && <AgentsView />}
         {route.name === 'servers' && <ServersView />}
+        {route.name === 'traffic' && <TrafficView />}
         {route.name === 'settings' && <SettingsView section={route.section} />}
       </Shell>
       <CommandPalette />

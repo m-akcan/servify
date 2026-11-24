@@ -63,7 +63,21 @@ export type ProjectListItem = Project & {
   lastDeployAt?: number | null;
   /** The servers its services run on ('local' = this machine). */
   servers?: { id: string; name: string }[];
-  services: { id: string; name: string; icon: string; status: Service['status']; server?: string }[];
+  services: ProjectListService[];
+};
+
+/** A service as the project list (and the traffic board) sees it. */
+export type ProjectListService = {
+  id: string;
+  name: string;
+  icon: string;
+  status: Service['status'];
+  server?: string;
+  kind?: Service['source']['type'];
+  protocol?: Service['protocol'];
+  publicHttp?: boolean;
+  domains?: string[];
+  publicTcpPort?: number | null;
 };
 
 export type Snapshot = {

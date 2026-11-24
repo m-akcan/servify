@@ -85,7 +85,7 @@ export function Shell({ children }: { children: ReactNode }) {
           </>
         ) : (
           <button className={`crumb ${route.name === 'home' ? 'active' : ''}`} onClick={() => navigate('/')}>
-            {route.name === 'agents' ? 'Agents & API' : route.name === 'servers' ? 'Servers' : route.name === 'settings' ? 'Settings' : 'Projects'}
+            {route.name === 'agents' ? 'Agents & API' : route.name === 'servers' ? 'Servers' : route.name === 'traffic' ? 'Traffic' : route.name === 'settings' ? 'Settings' : 'Projects'}
           </button>
         )}
         <div className="spacer" />
@@ -98,6 +98,12 @@ export function Shell({ children }: { children: ReactNode }) {
         <div className="topbar-right">
           <Tooltip label={connected ? 'Live — connected to Servify' : 'Reconnecting…'} side="bottom">
             <span className={`conn ${connected ? 'on' : ''}`} />
+          </Tooltip>
+          <Tooltip label="Traffic — every request through the router, live" side="bottom">
+            <button className={`btn btn-ghost btn-sm ${route.name === 'traffic' ? 'active' : ''}`} onClick={() => navigate('/traffic')}>
+              <Icon name="pulse" size={15} />
+              Traffic
+            </button>
           </Tooltip>
           <Tooltip label="Servers — run services on other machines" side="bottom">
             <button className={`btn btn-ghost btn-sm ${route.name === 'servers' ? 'active' : ''}`} onClick={() => navigate('/servers')}>

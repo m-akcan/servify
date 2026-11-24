@@ -122,7 +122,19 @@ export function listProjects() {
       running: svcs.filter((s) => s.status === 'running').length,
       lastDeployAt: lastDeploy.get(p.id) ?? null,
       servers: serverIds.map((id) => ({ id, name: id === LOCAL ? 'This machine' : nodeName(id) })),
-      services: svcs.map((s) => ({ id: s.id, name: s.name, icon: s.icon, status: s.status, server: nodeOf(s) })),
+      services: svcs.map((s) => ({
+        id: s.id,
+        name: s.name,
+        icon: s.icon,
+        status: s.status,
+        server: nodeOf(s),
+        // How it's reached from outside (the traffic board): its domains, a public TCP port, or nothing.
+        kind: s.source.type,
+        protocol: s.protocol,
+        publicHttp: s.publicHttp,
+        domains: s.domains,
+        publicTcpPort: s.publicTcpPort,
+      })),
     };
   });
 }

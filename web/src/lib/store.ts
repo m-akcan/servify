@@ -274,7 +274,21 @@ function applyEvent(ev: ServerEvent) {
         projects: s.projects.map((p) => {
           if (p.id !== svc.projectId) return p;
           const others = p.services.filter((x) => x.id !== svc.id);
-          const services = [...others, { id: svc.id, name: svc.name, icon: svc.icon, status: svc.status }];
+          const services = [
+            ...others,
+            {
+              id: svc.id,
+              name: svc.name,
+              icon: svc.icon,
+              status: svc.status,
+              server: svc.server?.id ?? 'local',
+              kind: svc.source.type,
+              protocol: svc.protocol,
+              publicHttp: svc.publicHttp,
+              domains: svc.domains,
+              publicTcpPort: svc.publicTcpPort,
+            },
+          ];
           return { ...p, services, serviceCount: services.length, running: services.filter((x) => x.status === 'running').length };
         }),
       });

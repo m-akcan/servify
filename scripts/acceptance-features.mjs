@@ -969,6 +969,20 @@ async function accessLogChecks(P, web) {
   check('summary: unique visitors', S.uniqueVisitors?.humans >= 2, JSON.stringify(S.uniqueVisitors));
   check('summary: top paths, referrers, UTM sources, user agents and bots', S.topPaths.some((p) => p.path === '/al-home' && p.requests >= 2) && S.topReferrers.some((r) => r.host === 'news.example.org') && S.topUtm.some((u) => u.source.startsWith('newsletter')) && S.topUserAgents.some((u) => u.userAgent === ua) && S.topBots.some((b) => b.name === 'GPTBot') && S.topBots.some((b) => b.name === 'ClaudeBot'), JSON.stringify(S).slice(0, 300));
   check('summary: a bad day is a clean 400', (await asReader(`/services/${web.id}/access-log/summary?day=yesterday`)).status === 400);
+  // The traffic board: newest requests across services (no visitor key) and 24-hour totals per service.
+  const recent = await asReader('/access-log/recent?limit=200');
+  const feed = (recent.json.entries ?? []).filter((e) => e.serviceId === web.id);
+  check('traffic board: a read-only token reads the cross-service feed', recent.status === 200 && feed.length >= 5 && typeof recent.json.last === 'number', `${recent.status} ${feed.length}`);
+  check('traffic board: the feed carries no visitor key, IP or user agent', feed.every((e) => !('visitor' in e) && !('ip' in e) && !('userAgent' in e)) && feed.some((e) => e.botName === 'GPTBot'));
+  const newer = await asReader(`/access-log/recent?after=${recent.json.last}`);
+  check('traffic board: polling with after= returns only newer requests', newer.status === 200 && newer.json.entries.every((e) => e.id > recent.json.last));
+  // Totals are cached for 15 s (the board polls them), so give them one refresh.
+  let wt = null;
+  for (let i = 0; i < 20 && !(wt && wt.requests >= 5 && wt.bots >= 2 && wt.visitors >= 2); i++) {
+    if (i) await new Promise((r) => setTimeout(r, 1000));
+    wt = (await asReader('/access-log/totals?hours=24')).json.services?.[web.id] ?? null;
+  }
+  check('traffic board: 24-hour totals per service', wt && wt.requests >= 5 && wt.bots >= 2 && wt.visitors >= 2, JSON.stringify(wt));
   check('a read-only token cannot switch the log off', (await fetch(BASE + `/api/services/${web.id}`, { method: 'PATCH', headers: { authorization: `Bearer ${readToken}`, 'content-type': 'application/json' }, body: '{"accessLog":false}' })).status === 403);
 
   // MCP with the same read-only token.

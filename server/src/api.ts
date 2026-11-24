@@ -43,7 +43,7 @@ import { keySource, keyPath } from './crypto.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume, unmanagedDockerVolumes, adoptVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, rebuildMember } from './pgcluster.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
-import { queryAccessLog, accessSummary } from './accesslog.ts';
+import { queryAccessLog, accessSummary, recentAccess, accessTotals } from './accesslog.ts';
 
 type Env = { Variables: { principal: Principal } };
 
@@ -331,6 +331,12 @@ api.get('/services/:id/access-log', (c) => {
 api.get('/services/:id/access-log/summary', (c) =>
   c.json(accessSummary(ops.getServiceOrThrow(c.req.param('id')).id, c.req.query('day') || undefined, Number(c.req.query('top') ?? 20) || 20)),
 );
+// The traffic board: newest requests across all services, and per-service totals. Read-only tokens may read them.
+api.get('/access-log/recent', (c) => {
+  const after = c.req.query('after');
+  return c.json(recentAccess(after ? Number(after) : undefined, Number(c.req.query('limit') ?? 50) || 50));
+});
+api.get('/access-log/totals', (c) => c.json(accessTotals(Number(c.req.query('hours') ?? 24) || 24)));
 api.get('/services/:id/volumes/:name/download', async (c) => {
   if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot download volume data');
   const svc = ops.getServiceOrThrow(c.req.param('id'));

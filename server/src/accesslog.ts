@@ -17,7 +17,7 @@
  * SERVIFY_ACCESS_LOG_MAX_ROWS (default 1,000,000) per service.
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { db } from './db.ts';
+import { db, services as servicesTable } from './db.ts';
 import { bus } from './events.ts';
 import { HttpError } from './util.ts';
 
@@ -384,4 +384,65 @@ export function accessSummary(serviceId: string, day?: string, top = 20) {
     topBots,
     note: 'Paths, referrers, UTM sources and user agents count people only; bots are listed apart. Visitors are counted per UTC day; a Servify restart starts a new salt, so someone seen before and after it counts twice that day.',
   };
+}
+
+// ───────────────────────────── across services (the traffic board) ─────────────────────────────
+
+export type RecentAccess = Pick<AccessEntry, 'id' | 'ts' | 'host' | 'method' | 'path' | 'status' | 'ms' | 'bot'> & { serviceId: string; refHost: string; botName: string | null };
+
+/**
+ * The newest requests across every service, newest first — the traffic board's live feed. `after` is the highest id
+ * the caller already has (the response's `last`), so polling only returns what's new. Leaves out the visitor key,
+ * full referrer and user agent: the board shows where requests go, not who sent them.
+ */
+export function recentAccess(after?: number, limit = 50): { entries: RecentAccess[]; last: number } {
+  flushAccessLog();
+  const n = Math.max(1, Math.min(Number.isFinite(limit) ? Math.floor(limit) : 50, 200));
+  const rows = (
+    after !== undefined && Number.isFinite(after)
+      ? db.prepare('SELECT id, service_id, ts, host, method, path, status, ms, bot, ref_host, ua FROM access_log WHERE id > ? ORDER BY id DESC LIMIT ?').all(after, n)
+      : db.prepare('SELECT id, service_id, ts, host, method, path, status, ms, bot, ref_host, ua FROM access_log ORDER BY id DESC LIMIT ?').all(n)
+  ) as any[];
+  const entries = rows.map((r) => ({
+    id: r.id,
+    serviceId: r.service_id,
+    ts: r.ts,
+    host: r.host,
+    method: r.method,
+    path: r.path,
+    status: r.status,
+    ms: r.ms,
+    bot: !!r.bot,
+    botName: r.bot ? botName(r.ua) : null,
+    refHost: r.ref_host && r.ref_host !== r.host ? r.ref_host : '',
+  }));
+  const top = (db.prepare('SELECT MAX(id) AS id FROM access_log').get() as { id: number | null }).id ?? 0;
+  return { entries, last: Math.max(after ?? 0, top) };
+}
+
+export type AccessTotals = { requests: number; errors: number; bots: number; visitors: number };
+let totalsCache: { key: string; at: number; value: { since: number; services: Record<string, AccessTotals> } } | null = null;
+
+/**
+ * Requests, server errors (5xx), bot requests and unique visitors per service over the last `hours`. One indexed range
+ * query per service that has rows; cached for 15 s because the board polls it.
+ */
+export function accessTotals(hours = 24): { since: number; services: Record<string, AccessTotals> } {
+  const h = Math.max(1, Math.min(Number.isFinite(hours) ? hours : 24, 24 * 7));
+  const key = String(h);
+  if (totalsCache && totalsCache.key === key && Date.now() - totalsCache.at < 15_000) return totalsCache.value;
+  flushAccessLog();
+  const since = Date.now() - h * 3600_000;
+  const ids = servicesTable.all().map((s) => s.id); // deleted services' rows are removed with them
+  const q = db.prepare(
+    'SELECT COUNT(*) AS requests, COALESCE(SUM(status >= 500), 0) AS errors, COALESCE(SUM(bot), 0) AS bots, COUNT(DISTINCT CASE WHEN bot = 0 THEN visitor END) AS visitors FROM access_log WHERE service_id = ? AND ts >= ?',
+  );
+  const services: Record<string, AccessTotals> = {};
+  for (const id of ids) {
+    const r = q.get(id, since) as AccessTotals;
+    if (r.requests) services[id] = { requests: r.requests, errors: r.errors, bots: r.bots, visitors: r.visitors };
+  }
+  const value = { since, services };
+  totalsCache = { key, at: Date.now(), value };
+  return value;
 }
