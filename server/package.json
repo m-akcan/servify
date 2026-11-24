@@ -2,7 +2,7 @@
   "name": "@servify/server",
   "private": true,
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "bin": {
     "servify": "./bin/servify.mjs"
   },
