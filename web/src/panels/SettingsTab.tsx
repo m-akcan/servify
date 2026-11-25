@@ -543,6 +543,95 @@ function ImageUpdates({ service: s }: { service: ServiceView }) {
   );
 }
 
+/** Builds: updates of the base image their Dockerfile starts from. Applying one rebuilds; never automatic. */
+function BaseImageUpdates({ service: s }: { service: ServiceView }) {
+  const [checking, setChecking] = useState(false);
+  const [updating, setUpdating] = useState<string | null>(null);
+  if (!s.baseImage) return null;
+  const u = s.imageUpdate?.base ? s.imageUpdate : null;
+  const ref = s.baseImage;
+  const repo = ref.replace(/:[^:/]+$/, '');
+  const check = async () => {
+    setChecking(true);
+    try {
+      const r = await api.post<{ status: string; reason?: string } | null>(`/services/${s.id}/image-check`);
+      if (r?.status === 'unknown') toast({ title: 'Could not check the base image', body: r.reason, tone: 'warn' });
+    } catch (e) {
+      toastError(e, 'Check failed');
+    } finally {
+      setChecking(false);
+    }
+  };
+  const stateful = !!s.backupMethod;
+  const update = async (tag: string | null, major = false) => {
+    if (tag) {
+      const ok = await confirmDialog({
+        title: `Rebuild ${s.name} on ${repo}:${tag}?`,
+        body: `Sets the build argument ${u?.tagArg} to ${tag} and rebuilds.${major ? ' A new major version can change behaviour — check its release notes first.' : ''}${stateful ? ` It may upgrade ${s.name}’s data in place: Servify backs it up first and only rebuilds if the backup succeeds.` : ''}`,
+        confirm: stateful ? 'Back up and rebuild' : 'Rebuild',
+      });
+      if (!ok) return;
+    }
+    setUpdating(tag ?? 'same');
+    try {
+      await api.post(`/services/${s.id}/update-image`, tag ? { tag } : {});
+      toast({ title: tag ? `Rebuilding ${s.name} on ${repo}:${tag}` : `Pulling ${ref} and rebuilding ${s.name}`, tone: 'build' });
+    } catch (e) {
+      toastError(e, 'Update failed');
+    } finally {
+      setUpdating(null);
+    }
+  };
+  const tags = [u?.newerTag, u?.newerMajor].filter(Boolean) as string[];
+  // Follows "Base image <ref>".
+  const status = !u
+    ? ' · not checked yet.'
+    : tags.length
+      ? ` → ${tags.join(', ')} available${u.status === 'changed' ? '; a newer image was also published under the same tag' : ''}.`
+      : u.status === 'changed'
+        ? ': a newer image was published under the same tag.'
+        : u.status === 'unknown'
+          ? ` · can't tell: ${u.reason ?? 'unknown'}.`
+          : ' · up to date.';
+  const pending = !!u && (u.status === 'changed' || tags.length > 0);
+  return (
+    <div className="image-updates">
+      <div className="row" style={{ gap: 8 }}>
+        <Icon name={pending ? 'arrowUp' : u?.status === 'current' ? 'check' : 'refresh'} size={13} />
+        <span className="grow">
+          <span className="faint">Base image </span>
+          <span className="mono">{ref}</span>
+          {status}
+          {u && <span className="faint"> Checked {timeAgo(u.checkedAt)}.</span>}
+        </span>
+        <Button size="sm" variant="ghost" icon="refresh" loading={checking} onClick={() => void check()}>
+          Check now
+        </Button>
+      </div>
+      {pending && (
+        <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+          {u!.status === 'changed' && (
+            <Button size="sm" variant="primary" icon="download" loading={updating === 'same'} onClick={() => void update(null)}>
+              Pull {ref.replace(/^.*\//, '')} and rebuild
+            </Button>
+          )}
+          {u!.tagArg && u!.newerTag && (
+            <Button size="sm" variant={u!.status === 'changed' ? 'secondary' : 'primary'} loading={updating === u!.newerTag} onClick={() => void update(u!.newerTag!)}>
+              Rebuild on {u!.newerTag}
+            </Button>
+          )}
+          {u!.tagArg && u!.newerMajor && (
+            <Button size="sm" variant="ghost" loading={updating === u!.newerMajor} onClick={() => void update(u!.newerMajor!, true)}>
+              {u!.newerMajor} (new major)
+            </Button>
+          )}
+          {!u!.tagArg && tags.length > 0 && <span className="faint" style={{ fontSize: 12 }}>The tag is written in the Dockerfile: change it there to switch.</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DeployHook({ serviceId }: { serviceId: string }) {
   const [path, setPath] = useState<string | null>(null);
   const system = useStore((st) => st.system);
@@ -689,6 +778,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
             </Field>
           </div>
         )}
+        {src.type !== 'image' && <BaseImageUpdates service={s} />}
         {src.type === 'git' && (
           <Field label="Watch paths" hint="Deploy on push only when files matching these globs change — one per line, ! excludes (e.g. apps/web/**, !**/*.md). Empty: every push deploys.">
             <CommitLines value={s.watchPaths ?? []} placeholder={'apps/web/**\npackages/shared/**\n!**/*.md'} onCommit={(v) => void patch(id, { watchPaths: v.length ? v : null })} />

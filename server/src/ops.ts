@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { cannotSleep, wake } from './sleep.ts';
 import { removeUploads, uploadPath } from './uploads.ts';
-import { imageUpdateOf, checkService, parseRepo, remoteDigestOf, sameRepo } from './imageupdates.ts';
+import { imageUpdateOf, checkService, checkTarget, isBuild, parseRepo, remoteDigestOf, sameRepo } from './imageupdates.ts';
 import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
 import type { Project, Service, Deployment, Source, SourceUpload, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
@@ -49,7 +49,10 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.pendingChanges = pendingChanges(s);
   out.accessLog = s.accessLog !== false;
   const iu = imageUpdateOf(s.id);
-  out.imageUpdate = iu && s.source.type === 'image' && iu.ref === normalizeImageRef(s.source.image) ? iu : null; // stale once the image changes
+  // Stale once the image (or, for a build, the base image of the running build) changes.
+  const target = iu || isBuild(s) ? checkTarget(s) : null;
+  out.imageUpdate = iu && target && iu.ref === target.ref && !!iu.base === target.base ? iu : null;
+  out.baseImage = target?.base ? target.ref : null; // builds: the registry image the running build started from
   const httpsOn = getSettings().https.enabled;
   out.domainInfo = s.domains.map((d) => {
     const c = certsTable.get(d);
@@ -950,6 +953,7 @@ export function deployService(actor: Actor, serviceId: string, trigger: 'manual'
 export async function updateServiceImage(actor: Actor, serviceId: string, tag?: string | null) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'update');
+  if (isBuild(svc)) return updateBuildBase(actor, svc, tag ?? null);
   if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run a registry image`);
   if (tag) {
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag)) throw new HttpError(400, 'not a valid tag');
@@ -963,6 +967,35 @@ export async function updateServiceImage(actor: Actor, serviceId: string, tag?: 
     recordActivity(actor, 'service.updated', `Updating ${svc.name} to ${image}:${tag}`, svc.projectId, svc.id);
   } else recordActivity(actor, 'service.updated', `Updating ${svc.name}: pulling ${svc.source.image} again`, svc.projectId, svc.id);
   const fresh = getServiceOrThrow(serviceId);
+  if (fresh.stopped) {
+    fresh.stopped = false;
+    servicesTable.put(fresh);
+  }
+  return serializeDeployment(queueDeployment(fresh, 'update', actor));
+}
+
+/**
+ * Update a build's base image: rebuild on a freshly pulled base (a new image under the same tag), or first set the
+ * build argument its tag comes from (`FROM nextcloud:${NEXTCLOUD_TAG}`) to a newer tag. A tag written into the
+ * Dockerfile itself is the user's to change there.
+ */
+async function updateBuildBase(actor: Actor, svc: Service, tag: string | null) {
+  const b = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.baseImage : null;
+  if (!b) throw new HttpError(409, `${svc.name}'s running build has no recorded base image — deploy it once`);
+  if (tag) {
+    if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag)) throw new HttpError(400, 'not a valid tag');
+    if (!b.tagArg) throw new HttpError(409, `the base image tag is written in the Dockerfile (FROM ${b.ref}) — change it there and deploy`);
+    const current = svc.buildArgs?.[b.tagArg];
+    if (current?.includes('${')) throw new HttpError(409, `the build argument ${b.tagArg} comes from a variable (${current}) — change that instead`);
+    if (backupMethod(svc)) {
+      const bk = await backupService(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
+      if (bk.status !== 'succeeded') throw new HttpError(409, `the safety backup ${bk.status}${bk.error ? ` (${bk.error})` : ''} — ${svc.name} was not switched`);
+    }
+    await updateService(actor, svc.id, { buildArgs: { ...(svc.buildArgs ?? {}), [b.tagArg]: tag } }, { quiet: true });
+    const [image] = splitImageRef(b.ref);
+    recordActivity(actor, 'service.updated', `Rebuilding ${svc.name} on ${image}:${tag} (build argument ${b.tagArg})`, svc.projectId, svc.id);
+  } else recordActivity(actor, 'service.updated', `Rebuilding ${svc.name} on a freshly pulled ${b.ref}`, svc.projectId, svc.id);
+  const fresh = getServiceOrThrow(svc.id);
   if (fresh.stopped) {
     fresh.stopped = false;
     servicesTable.put(fresh);
@@ -1078,7 +1111,8 @@ export async function trackServiceImage(actor: Actor, serviceId: string, image: 
 
 export async function checkServiceImage(serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
-  if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run a registry image`);
+  if (svc.source.type !== 'image' && !isBuild(svc)) throw new HttpError(400, `${svc.name} doesn't run a registry image or a build`);
+  if (isBuild(svc) && !checkTarget(svc)) throw new HttpError(409, svc.activeDeploymentId ? `${svc.name}'s running build has no recorded base image (a FROM scratch, a generated Dockerfile, or a build from before base image checks: deploy it once)` : `${svc.name} isn't deployed yet`);
   return checkService(svc.id);
 }
 

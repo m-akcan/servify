@@ -411,6 +411,90 @@ async function main() {
     check('a tag that moved on is refused by default', /→ 409.*moved on/.test(await api('POST', `/services/${pin2.id}/track-image`, { image: `${reg}:track` }).then(() => 'ok', (e) => String(e.message))));
     const tr2 = await api('POST', `/services/${pin2.id}/track-image`, { image: `${reg}:track`, allowMoved: true });
     check('the tag it was pulled as can be tracked after it moved (and reports the update)', tr2.sameImage === false && tr2.imageUpdate?.status === 'changed', JSON.stringify(tr2.imageUpdate));
+
+    // ─── builds: the base image their Dockerfile starts from ───
+    console.log('\n▸ base image update checks (builds)');
+    const baseRepo = `localhost:${REG_PORT}/acc/base`;
+    const builderRepo = `localhost:${REG_PORT}/acc/builder`;
+    cleanups.push(async () => execSync(`docker rmi ${baseRepo}:1.0 ${baseRepo}:1.1 ${baseRepo}:2.0 ${baseRepo}:moved ${builderRepo}:1.0 ${builderRepo}:1.1 ${builderRepo}:moved || true`, { stdio: 'ignore' }));
+    // Pushed, then pulled back: the copy on the server is then the registry's image (pushing a multi-platform image
+    // from the containerd store uploads only one platform, so the local copy would be a different image).
+    const pushTo = (from, repo, tag) => sh(`docker tag ${from} ${repo}:${tag} && docker push -q ${repo}:${tag} && docker rmi ${repo}:${tag} && docker pull -q ${repo}:${tag}`);
+    sh('docker pull -q busybox:1.36-musl'); // static: runs in a FROM scratch image
+    /** Point a tag at another image in the registry only (the copy on the server keeps the old one). */
+    const moveTag = async (repoPath, tag, fromTag) => {
+      const m = await fetch(`http://localhost:${REG_PORT}/v2/${repoPath}/manifests/${fromTag}`, { headers: { accept } });
+      const body = Buffer.from(await m.arrayBuffer());
+      const r = await fetch(`http://localhost:${REG_PORT}/v2/${repoPath}/manifests/${tag}`, { method: 'PUT', headers: { 'content-type': m.headers.get('content-type') }, body });
+      if (!r.ok) throw new Error(`moving ${repoPath}:${tag} → ${r.status}`);
+    };
+    pushTo('alpine:3.20', baseRepo, '1.0'); // stays on the server too: a plain rebuild uses that copy, like a real host
+    pushTo('busybox:1.36', baseRepo, 'moved');
+    pushTo('busybox:1.36-musl', builderRepo, '1.0');
+    pushTo('alpine:3.20', builderRepo, 'moved');
+    const buildService = async (name, dockerfile) => {
+      const dir = mkdtempSync(join(tmpdir(), `servify-base-${name}-`));
+      cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+      writeFileSync(join(dir, 'Dockerfile'), dockerfile);
+      const svc = (await api('POST', `/projects/${P.id}/services`, { name, path: dir, protocol: 'none', deploy: false })).service;
+      const d = await api('POST', `/services/${svc.id}/deploy`);
+      await waitFor(async () => ['active', 'failed'].includes((await api('GET', `/deployments/${d.id}`)).status), 240_000, `${name} build`);
+      const dep = await api('GET', `/deployments/${d.id}`);
+      check(`${name}: the build deploys`, dep.status === 'active', dep.error ?? dep.status);
+      return svc;
+    };
+    const notesFor = (id) => received.map((r) => JSON.parse(r.body)).filter((b) => b.event === 'image.update' && b.serviceId === id);
+    const isAlpine = async (id) => (await exec(id, 'test -f /etc/alpine-release && echo alpine || echo busybox').catch(() => null))?.output?.trim() === 'alpine';
+
+    const app = await buildService('base-app', `ARG BASE_TAG=1.0\nFROM ${baseRepo}:\${BASE_TAG}\nRUN echo built > /built\nCMD ["sleep", "1d"]\n`);
+    const multi = await buildService('base-multi', `FROM ${builderRepo}:1.0 AS build\nRUN echo hi > /out\nFROM ${baseRepo}:moved AS final\nCOPY --from=build /out /out\nCMD ["sleep", "1d"]\n`);
+    const scratch = await buildService('base-scratch', `FROM ${builderRepo}:1.0 AS build\nFROM scratch\nCOPY --from=build /bin/busybox /busybox\nCMD ["/busybox", "sleep", "86400"]\n`);
+    const appView = await api('GET', `/services/${app.id}`);
+    check('a build records the base image of its last stage (ARG default filled in)', appView.baseImage === `${baseRepo}:1.0`, String(appView.baseImage));
+    st = await api('POST', `/services/${app.id}/image-check`);
+    check('a fresh build is up to date with its base', st?.base === true && st.status === 'current' && st.tagArg === 'BASE_TAG' && !st.newerTag && !st.newerMajor, JSON.stringify(st));
+    check('multi-stage: the final stage\'s base is checked, not the builder\'s', (await api('GET', `/services/${multi.id}`)).baseImage === `${baseRepo}:moved`);
+    const sc = await api('GET', `/services/${scratch.id}`);
+    check('FROM scratch: nothing to check', sc.baseImage === null && !sc.imageUpdate && /→ 409/.test(await api('POST', `/services/${scratch.id}/image-check`).then(() => 'ok', (e) => String(e.message))));
+
+    // The base gets newer tags and a rebuild under its own tag; the builder stage's image changes too.
+    pushTo('alpine:3.20', baseRepo, '1.1');
+    pushTo('alpine:3.20', baseRepo, '2.0');
+    await moveTag('acc/base', '1.0', 'moved');
+    pushTo('busybox:1.36-musl', builderRepo, '1.1');
+    await moveTag('acc/builder', '1.0', 'moved');
+    st = await api('POST', `/services/${app.id}/image-check`);
+    check('a rebuilt base image under the same tag is found', st?.base === true && st.status === 'changed', JSON.stringify(st));
+    check('newer base tags are found (same major and next major)', st?.newerTag === '1.1' && st?.newerMajor === '2.0', JSON.stringify(st));
+    check('the service shows the base image update', (await api('GET', `/services/${app.id}`)).imageUpdate?.base === true);
+    await waitFor(() => notesFor(app.id).length > 0, 10_000, 'base update notification');
+    await api('POST', `/services/${app.id}/image-check`);
+    await sleep(1000);
+    const appNotes = notesFor(app.id);
+    check('notified once, naming the base image', appNotes.length === 1 && /base image/i.test(appNotes[0]?.message ?? '') && appNotes[0].message.includes('1.1'), JSON.stringify(appNotes.map((n) => n.message)));
+    const ms = await api('POST', `/services/${multi.id}/image-check`);
+    check('multi-stage: a newer builder image is no base update', ms?.status === 'current' && !ms.newerTag && !ms.newerMajor && notesFor(multi.id).length === 0, JSON.stringify(ms));
+    check('a plain build keeps using the copy on the server', await isAlpine(app.id));
+    // Update: pull the base and rebuild.
+    const before2 = (await api('GET', `/services/${app.id}`)).activeDeploymentId;
+    await api('POST', `/services/${app.id}/update-image`, {});
+    const upDep = await waitFor(async () => {
+      const s2 = await api('GET', `/services/${app.id}`);
+      return s2.activeDeploymentId !== before2 && s2.activeDeploymentId;
+    }, 240_000, 'base update rebuild');
+    check('updating rebuilds on the freshly pulled base', !!upDep && (await api('GET', `/deployments/${upDep}`)).trigger === 'update' && !(await isAlpine(app.id)));
+    st = await waitFor(async () => {
+      const x = (await api('GET', `/services/${app.id}`)).imageUpdate;
+      return x?.status === 'current' ? x : null;
+    }, 30_000, 'recheck after the rebuild');
+    check('after the rebuild the base is up to date again', st?.status === 'current' && st.newerTag === '1.1', JSON.stringify(st));
+    // A newer tag: sets the build argument and rebuilds.
+    await api('POST', `/services/${app.id}/update-image`, { tag: '1.1' });
+    check('switching to a newer base tag sets the build argument and rebuilds', !!(await waitFor(async () => {
+      const s2 = await api('GET', `/services/${app.id}`);
+      return s2.buildArgs?.BASE_TAG === '1.1' && s2.baseImage === `${baseRepo}:1.1` && (await isAlpine(app.id));
+    }, 240_000, 'base tag switch')));
+    check('a base tag written in the Dockerfile is not switched', /→ 409/.test(await api('POST', `/services/${multi.id}/update-image`, { tag: '2.0' }).then(() => 'ok', (e) => String(e.message))));
   }
 
   // ─────────────────────────────────────────────────────────────

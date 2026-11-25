@@ -310,9 +310,9 @@ export function createDockerClient(target: DockerTarget) {
     },
     listImages: (labels: string[] = []) => call<any[]>('GET', '/images/json', { query: { filters: filtersParam({ label: labels }) } }),
 
-    async buildFromTar(tar: Readable, tag: string, dockerfile: string, onLine: (l: string) => void, labels: Record<string, string> = {}, opts: { args?: Record<string, string>; target?: string | null } = {}) {
+    async buildFromTar(tar: Readable, tag: string, dockerfile: string, onLine: (l: string) => void, labels: Record<string, string> = {}, opts: { args?: Record<string, string>; target?: string | null; pull?: boolean } = {}) {
       const res = await stream('POST', '/build', {
-        query: { t: tag, dockerfile, rm: true, forcerm: true, labels: JSON.stringify(labels), ...(opts.args && Object.keys(opts.args).length ? { buildargs: JSON.stringify(opts.args) } : {}), ...(opts.target ? { target: opts.target } : {}) },
+        query: { t: tag, dockerfile, rm: true, forcerm: true, ...(opts.pull ? { pull: '1' } : {}), labels: JSON.stringify(labels), ...(opts.args && Object.keys(opts.args).length ? { buildargs: JSON.stringify(opts.args) } : {}), ...(opts.target ? { target: opts.target } : {}) },
         rawBody: tar,
         headers: { 'Content-Type': 'application/x-tar' },
       });

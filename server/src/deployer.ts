@@ -251,6 +251,7 @@ export function queueDeployment(
     commitMessage: base?.commitMessage ?? null,
     builder: base?.builder ?? null,
     repoDigests: base?.repoDigests ?? null,
+    baseImage: base?.baseImage ?? null,
     trigger,
     actor: actor.name,
     config: base
@@ -390,6 +391,7 @@ async function runDeployment(depId: string, actor: Actor) {
         dep.commitSha = result.commitSha;
         dep.commitMessage = result.commitMessage;
         dep.builder = result.builder;
+        dep.baseImage = result.baseImage;
         if (result.commitSha) dep.sourceLabel = `${sourceLabel(svc)} · ${result.commitSha.slice(0, 7)}`;
         // Swap the generic git/folder icon for the detected language once we know it.
         const fresh = servicesTable.get(svc.id);

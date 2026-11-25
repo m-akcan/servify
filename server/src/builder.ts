@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { uploadPath } from './uploads.ts';
-import { existsSync, mkdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import type { DockerClient } from './docker.ts';
 import { dockerFor, nodeOf } from './nodes.ts';
@@ -8,10 +8,13 @@ import { config } from './config.ts';
 import { detect, DEFAULT_IGNORE } from './detect.ts';
 import type { Deployment, Project, Service } from './types.ts';
 import { INSTANCE_ID } from './engine.ts';
+import { baseImageOf, fromDigestsInLog } from './baseimage.ts';
+import { parseRepo, sameRepo } from './imageupdates.ts';
+import { normalizeImageRef } from './docker.ts';
 
 type Log = (line: string) => void;
 
-export type BuildResult = { image: string; commitSha: string | null; commitMessage: string | null; builder: string };
+export type BuildResult = { image: string; commitSha: string | null; commitMessage: string | null; builder: string; baseImage: NonNullable<Deployment['baseImage']> | null };
 
 function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; onLine?: Log; mask?: string[] } = {}): Promise<{ code: number; out: string }> {
   return new Promise((resolvePromise, reject) => {
@@ -79,7 +82,8 @@ export function imageTag(project: Project, svc: Service, dep: Deployment) {
 
 let cliBuildAvailable: boolean | null = null;
 
-type BuildOpts = { args: Record<string, string>; target: string | null };
+/** `pull`: fetch the base images again (`--pull`); `fromLines` collects BuildKit's `FROM ref@digest` lines. */
+type BuildOpts = { args: Record<string, string>; target: string | null; pull: boolean; fromLines: string[] };
 
 /** The service's build arguments with ${VAR} filled in from its own variables. */
 function buildArgsFor(svc: Service): Record<string, string> {
@@ -94,12 +98,14 @@ async function cliBuild(d: DockerClient, ctx: string, dockerfile: string, tag: s
   for (const [k, v] of Object.entries(labels)) args.push('--label', `${k}=${v}`);
   for (const [k, v] of Object.entries(opts.args)) args.push('--build-arg', `${k}=${v}`);
   if (opts.target) args.push('--target', opts.target);
+  if (opts.pull) args.push('--pull');
   args.push(ctx);
   let missingBuildx = false;
   const r = await run('docker', args, {
     env: { DOCKER_HOST: d.hostEnv, DOCKER_BUILDKIT: '1', BUILDKIT_PROGRESS: 'plain' },
     onLine: (l) => {
       if (/buildx component is missing|unknown flag: --progress|docker: not found/i.test(l)) missingBuildx = true;
+      if (/^#\d+ \[[^\]]*\] FROM /.test(l)) opts.fromLines.push(l);
       // Drop BuildKit's per-chunk download/extract progress; keep the "done" lines.
       if (/^#\d+ (sha256:[0-9a-f]+|extracting sha256:[0-9a-f]+) /.test(l) && !/ done$/.test(l)) return;
       log(l);
@@ -130,7 +136,30 @@ async function apiBuild(d: DockerClient, ctx: string, dockerfile: string, tag: s
     args.push('-C', dir, dfName);
   }
   const tar = spawn('tar', args, { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, COPYFILE_DISABLE: '1' } });
-  await d.buildFromTar(tar.stdout, tag, dfName, log, labels, opts);
+  await d.buildFromTar(tar.stdout, tag, dfName, log, labels, { args: opts.args, target: opts.target, pull: opts.pull });
+}
+
+/**
+ * The registry image the build started from and the digest it used, for update checks. BuildKit logs the digest it
+ * resolved (`FROM ref@sha256:…`) — that is what the build really used, even after `--pull`, which leaves the local
+ * tag alone. The classic builder logs none; it builds from the local tag, so that tag's registry digest is it.
+ */
+async function recordBaseImage(d: DockerClient, dockerfile: string, opts: BuildOpts, log: Log): Promise<BuildResult['baseImage']> {
+  const base = baseImageOf(dockerfile, opts.args, opts.target);
+  const r = base && parseRepo(base.ref);
+  if (!base || !r) return null;
+  const same = (ref: string) => {
+    const x = parseRepo(ref);
+    return !!x && x.registry === r.registry && x.repo === r.repo && x.tag === r.tag;
+  };
+  let digests = [...fromDigestsInLog(opts.fromLines)].filter(([ref]) => same(ref)).flatMap(([, ds]) => ds);
+  if (!digests.length) {
+    const info = await d.inspectImage(base.ref).catch(() => null);
+    digests = ((info?.RepoDigests as string[] | undefined) ?? []).filter((x) => sameRepo(x.split('@')[0], r)).map((x) => x.split('@')[1]);
+  }
+  const ref = normalizeImageRef(base.ref);
+  log(`▸ Base image ${ref}${digests.length ? ` (${digests[0].slice(7, 19)})` : ''}`);
+  return { ref, tagArg: base.tagArg, digests };
 }
 
 export async function buildSource(svc: Service, project: Project, dep: Deployment, log: Log): Promise<BuildResult> {
@@ -200,13 +229,17 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     const t0 = Date.now();
     // Builds run on the service's server (the context is streamed to its Docker).
     const d = dockerFor(nodeOf(svc));
-    const opts: BuildOpts = { args: buildArgsFor(svc), target: svc.buildTarget ?? null };
+    // An update rebuilds on a freshly pulled base image (a plain build reuses the copy already on the server).
+    const opts: BuildOpts = { args: buildArgsFor(svc), target: svc.buildTarget ?? null, pull: dep.trigger === 'update', fromLines: [] };
     if (Object.keys(opts.args).length) log(`▸ Build arguments: ${Object.keys(opts.args).join(', ')}`);
     if (opts.target) log(`▸ Build target: ${opts.target}`);
+    if (opts.pull) log('▸ Pulling the base image again (update)');
     const usedCli = await cliBuild(d, ctx, dockerfile, tag, labels, log, opts);
     if (!usedCli) await apiBuild(d, ctx, dockerfile, tag, labels, log, opts);
     log(`✓ Built in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    return { image: tag, commitSha, commitMessage, builder: usedCli ? `${builder} · buildkit` : builder };
+    // Generated Dockerfiles pick their own base, which the user can't change: only their own Dockerfiles are checked.
+    const baseImage = builder === 'dockerfile' ? await recordBaseImage(d, readFileSync(dockerfile, 'utf8'), opts, log) : null;
+    return { image: tag, commitSha, commitMessage, builder: usedCli ? `${builder} · buildkit` : builder, baseImage };
   } finally {
     if (cleanup) rmSync(workDir, { recursive: true, force: true });
     else rmSync(workDir, { recursive: true, force: true });

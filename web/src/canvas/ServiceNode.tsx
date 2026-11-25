@@ -325,7 +325,7 @@ export const ServiceNode = memo(function ServiceNode({ service: s, replicas, lat
             {statusText}
           </span>
           {!busy && s.imageUpdate && (s.imageUpdate.status === 'changed' || s.imageUpdate.newerTag) && (
-            <span className="node-pending node-update" title={s.imageUpdate.status === 'changed' ? `A newer ${s.imageUpdate.ref} image was published` : `${s.imageUpdate.newerTag} is available`}>
+            <span className="node-pending node-update" title={`${s.imageUpdate.base ? 'Base image: ' : ''}${s.imageUpdate.status === 'changed' ? `a newer ${s.imageUpdate.ref} image was published` : `${s.imageUpdate.ref.replace(/:[^:/]+$/, '')}:${s.imageUpdate.newerTag} is available`}`}>
               <Icon name="arrowUp" size={10} /> update
             </span>
           )}

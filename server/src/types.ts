@@ -219,6 +219,8 @@ export interface Deployment {
   database?: DatabaseKind | null;
   /** Registry digests of a pulled image (repo@sha256:…), recorded at deploy time — Docker's own list follows the tags. */
   repoDigests?: string[] | null;
+  /** Built deployments: the registry image their Dockerfile starts from and the digest(s) the build used (update checks). */
+  baseImage?: { ref: string; tagArg: string | null; digests: string[] } | null;
   /** The server it was rolled out on (null = this machine). */
   nodeId?: string | null;
   /** Asked for: if the registry pull fails, deploy the copy of the image already on the server instead of failing. */

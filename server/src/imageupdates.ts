@@ -1,11 +1,14 @@
 /**
- * Image update checks for services that run a registry image. Two questions, answered with the registry's
+ * Image update checks for services that run a registry image, and for builds the base image their Dockerfile starts
+ * from (recorded on the deployment at build time: the ref and the digest the build used). Two questions, answered with the registry's
  * HTTP API (manifest HEAD requests and the tag list — no pulls):
  *   1. Was a different image published under the same tag (postgres:16 got a patch release)?
  *   2. Is there a newer tag of the same shape (1.25-alpine → 1.27-alpine, 16 → 17)?
  * The answer is "unknown" whenever Servify can't be sure (a local-only or copied image, a private registry, the
- * registry not answering) — unknown never notifies and never updates. Notifications and automatic updates happen
- * at most once per published image.
+ * registry not answering) — unknown never notifies of a same-tag image and never updates (a build whose base digest
+ * wasn't recorded still hears of newer tags, which don't depend on it). Notifications and automatic updates happen
+ * at most once per published image. Builds are never updated automatically: a newer base needs a rebuild, which the
+ * service's "update" does on request (a pull of the base, or a build argument set to the new tag).
  */
 import { credentialsFor, savedLoginHosts } from './registryauth.ts';
 import { createHash } from 'node:crypto';
@@ -19,6 +22,10 @@ import type { Service } from './types.ts';
 
 export type ImageUpdate = {
   ref: string;
+  /** Set for builds: `ref` is the base image of the Dockerfile, not an image the service runs. */
+  base?: boolean;
+  /** Builds: the build argument that sets the base image's tag, so a newer tag can be applied by setting it. */
+  tagArg?: string | null;
   checkedAt: number;
   status: 'current' | 'changed' | 'unknown';
   /** Why it is unknown. */
@@ -201,7 +208,16 @@ export function newerTags(current: string, tags: string[]): { newerTag: string |
 
 // ─── checks ───
 
-export const checkable = (s: Service) => s.source.type === 'image' && !s.source.image.includes('@') && !!s.activeDeploymentId;
+export const isBuild = (s: Service) => s.source.type === 'git' || s.source.type === 'local' || s.source.type === 'upload';
+export const checkable = (s: Service) => !!s.activeDeploymentId && ((s.source.type === 'image' && !s.source.image.includes('@')) || isBuild(s));
+
+/** What a service's update check looks at: its image, or the base image its active build was made from. */
+export function checkTarget(s: Service): { ref: string; base: boolean } | null {
+  if (!checkable(s)) return null;
+  if (s.source.type === 'image') return { ref: normalizeImageRef(s.source.image), base: false };
+  const b = deploymentsTable.get(s.activeDeploymentId!)?.baseImage;
+  return b ? { ref: b.ref, base: true } : null;
+}
 
 type Remote = { digest: string; tags: string[] } | { error: string };
 
@@ -230,16 +246,18 @@ export async function remoteDigestOf(r: Repo): Promise<{ digest: string } | { er
 async function checkServices(list: Service[]): Promise<void> {
   const remotes = new Map<string, Promise<Remote>>();
   for (const svc of list) {
-    if (!checkable(svc) || svc.source.type !== 'image') {
+    const target = checkTarget(svc);
+    if (!target) {
       store(svc.id, null);
       continue;
     }
-    const ref = normalizeImageRef(svc.source.image);
+    const { ref } = target;
     const prev = imageUpdateOf(svc.id);
-    const keep = prev?.ref === ref ? { notifiedFor: prev.notifiedFor, autoUpdatedTo: prev.autoUpdatedTo } : {};
+    const keep = prev?.ref === ref && !!prev.base === target.base ? { notifiedFor: prev.notifiedFor, autoUpdatedTo: prev.autoUpdatedTo } : {};
     const r = parseRepo(ref);
+    const dep = deploymentsTable.get(svc.activeDeploymentId!);
     const save = (u: Omit<ImageUpdate, 'ref' | 'checkedAt'>) => {
-      const next: ImageUpdate = { ref, checkedAt: Date.now(), ...keep, ...u };
+      const next: ImageUpdate = { ref, checkedAt: Date.now(), ...(target.base ? { base: true, tagArg: dep?.baseImage?.tagArg ?? null } : {}), ...keep, ...u };
       store(svc.id, next);
       return next;
     };
@@ -247,8 +265,24 @@ async function checkServices(list: Service[]): Promise<void> {
       save({ status: 'unknown', reason: 'pinned by digest' });
       continue;
     }
+    if (target.base) {
+      // A build: compare the base image's tag in the registry with the digest the build used. Newer tags are worth
+      // reporting even when that digest isn't known (an older build, a base that only exists on the server).
+      if (!remotes.has(ref)) remotes.set(ref, remoteFacts(r));
+      const remote = await remotes.get(ref)!;
+      if ('error' in remote) {
+        save({ status: 'unknown', reason: remote.error });
+        continue;
+      }
+      const used = dep?.baseImage?.digests ?? [];
+      const tags = newerTags(r.tag, remote.tags);
+      const u = used.length
+        ? save({ status: used.includes(remote.digest) ? 'current' : 'changed', remoteDigest: remote.digest, ...tags })
+        : save({ status: 'unknown', reason: 'the build did not record which image of the base it used', remoteDigest: remote.digest, ...tags });
+      await act(svc, u, null);
+      continue;
+    }
     // What runs now: the deployment's pinned copy, and the registry digests Docker recorded when it was pulled.
-    const dep = deploymentsTable.get(svc.activeDeploymentId!);
     const recorded = dep?.repoDigests ?? (dep?.image ? (await dockerFor(nodeOf(svc)).inspectImage(dep.image).catch(() => null))?.RepoDigests : null) ?? [];
     const local: string[] = recorded.filter((d: string) => sameRepo(d.split('@')[0], r)).map((d: string) => d.split('@')[1]);
     if (!local.length) {
@@ -272,7 +306,8 @@ async function act(svc: Service, u: ImageUpdate, database: string | null) {
   const fresh = servicesTable.get(svc.id);
   if (!fresh) return;
   const what = [u.status === 'changed' && `a new ${u.ref} image`, u.newerTag, u.newerMajor].filter(Boolean) as string[];
-  const autoOk = fresh.imageAutoUpdate && u.status === 'changed' && !database && !fresh.cluster && !fresh.stopped;
+  // Never for builds (a service switched from an image to a build may still have imageAutoUpdate set).
+  const autoOk = fresh.source.type === 'image' && fresh.imageAutoUpdate && u.status === 'changed' && !database && !fresh.cluster && !fresh.stopped;
   if (autoOk && u.autoUpdatedTo !== u.remoteDigest) {
     store(svc.id, { ...u, autoUpdatedTo: u.remoteDigest });
     recordActivity(SYSTEM, 'service.deployed', `Updating ${fresh.name}: a new ${u.ref} image was published`, fresh.projectId, fresh.id);
@@ -286,12 +321,21 @@ async function act(svc: Service, u: ImageUpdate, database: string | null) {
       event: 'image.update',
       level: 'info',
       title: `Update available for ${fresh.name}`,
-      message: `${what.join(', ')} ${what.length > 1 ? 'are' : 'is'} available (running ${u.ref}).`,
+      message: u.base ? baseUpdateText(u) : `${what.join(', ')} ${what.length > 1 ? 'are' : 'is'} available (running ${u.ref}).`,
       serviceId: fresh.id,
       projectId: fresh.projectId,
     } as any);
   }
   bus.publish({ type: 'service.updated', service: fresh });
+}
+
+/** "base image nextcloud:35.0.3 → 35.0.4 available (36.0.1 is the next major)" / "… was republished under the same tag". */
+export function baseUpdateText(u: ImageUpdate): string {
+  const tags = [u.newerTag, u.newerMajor && `${u.newerMajor}${u.newerTag ? ' (next major)' : ''}`].filter(Boolean);
+  const parts: string[] = [];
+  if (tags.length) parts.push(`base image ${u.ref} → ${tags.join(', ')} available`);
+  if (u.status === 'changed') parts.push(`${tags.length ? '' : `base image ${u.ref}: `}a newer image was published under the same tag — rebuild to use it`);
+  return `${parts.join('; ')}.`.replace(/^./, (c) => c.toUpperCase());
 }
 
 export async function checkService(serviceId: string): Promise<ImageUpdate | null> {
@@ -302,7 +346,7 @@ export async function checkService(serviceId: string): Promise<ImageUpdate | nul
 }
 
 export async function checkAll() {
-  const list = servicesTable.all().filter((s) => s.source.type === 'image');
+  const list = servicesTable.all().filter((s) => s.source.type === 'image' || isBuild(s));
   await checkServices(list);
   for (const id of Object.keys(all())) if (!servicesTable.get(id)) store(id, null);
 }
@@ -311,9 +355,10 @@ export function startImageChecks() {
   const hours = Number(process.env.SERVIFY_IMAGE_CHECK_HOURS) || 6;
   setTimeout(() => void checkAll().catch((e) => console.error('[image-updates]', e)), 2 * 60_000).unref();
   setInterval(() => void checkAll().catch((e) => console.error('[image-updates]', e)), hours * 3_600_000).unref();
-  // After a deploy of an image service, look again so the badge reflects what now runs.
+  // After a deploy, look again so the badge reflects what now runs (or, for a build, the base it was built on).
   bus.subscribe((ev) => {
-    if (ev.type !== 'deployment.updated' || ev.deployment.status !== 'active' || ev.deployment.builder !== 'image') return;
+    if (ev.type !== 'deployment.updated' || ev.deployment.status !== 'active') return;
+    if (ev.deployment.builder !== 'image' && !ev.deployment.baseImage) return;
     if (!imageUpdateOf(ev.deployment.serviceId)) return;
     // Wait until the service points at the new deployment (it switches after the replicas are healthy).
     const { id: depId, serviceId } = ev.deployment;
