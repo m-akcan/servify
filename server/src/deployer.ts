@@ -44,6 +44,7 @@ function rollingOrder(svc: Service, want: number): number[] {
   return rollingOrderHook?.(svc, want) ?? Array.from({ length: want }, (_, i) => i);
 }
 import { iconForStack, referencedServicesOn } from './ops.ts';
+import { betterIcon } from './icons.ts';
 
 const lock = new KeyedLock();
 
@@ -393,10 +394,11 @@ async function runDeployment(depId: string, actor: Actor) {
         dep.builder = result.builder;
         dep.baseImage = result.baseImage;
         if (result.commitSha) dep.sourceLabel = `${sourceLabel(svc)} · ${result.commitSha.slice(0, 7)}`;
-        // Swap the generic git/folder icon for the detected language once we know it.
+        // Swap the generic git/folder icon for the detected language, or the logo of the image the Dockerfile starts from.
         const fresh = servicesTable.get(svc.id);
         const langIcon = iconForStack(result.builder.replace(/ · buildkit$/, ''));
-        if (fresh && langIcon && (fresh.icon === 'git' || fresh.icon === 'folder')) setServiceStatus(svc.id, fresh.status, { icon: langIcon });
+        const icon = fresh && (langIcon && (fresh.icon === 'git' || fresh.icon === 'folder') ? langIcon : betterIcon(fresh, result.baseImage?.ref));
+        if (fresh && icon) setServiceStatus(svc.id, fresh.status, { icon });
       }
     } else {
       log(`▸ Reusing image ${dep.image}`);

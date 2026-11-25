@@ -5,6 +5,8 @@
 import { z } from 'zod';
 import { cannotSleep, wake } from './sleep.ts';
 import { removeUploads, uploadPath } from './uploads.ts';
+import { iconForImage, betterIcon } from './icons.ts';
+export { iconForImage, iconForStack } from './icons.ts';
 import { imageUpdateOf, checkService, checkTarget, isBuild, parseRepo, remoteDigestOf, sameRepo } from './imageupdates.ts';
 import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
 import type { Project, Service, Deployment, Source, SourceUpload, Replica } from './types.ts';
@@ -303,65 +305,11 @@ function inferName(input: CreateServiceInput): string {
   return 'service';
 }
 
-/** Icon key for a Docker image (matched against the brand logo set in the dashboard). */
-export function iconForImage(image: string): string | null {
-  const img = image.toLowerCase().split('@')[0];
-  const rules: [RegExp, string][] = [
-    [/postgres|postgis|timescale|pgvector|supabase\/postgres/, 'postgres'],
-    [/mariadb/, 'mariadb'],
-    [/mysql|percona/, 'mysql'],
-    [/mongo/, 'mongo'],
-    [/redis|valkey|keydb|dragonfly/, 'redis'],
-    [/minio/, 'bucket'],
-    [/n8n/, 'flow'],
-    [/uptime-kuma/, 'pulse'],
-    [/ollama/, 'spark'],
-    [/traefik/, 'wave'],
-    [/nginx/, 'nginx'],
-    [/caddy/, 'caddy'],
-    [/adminer/, 'table'],
-    [/grafana/, 'grafana'],
-    [/prometheus/, 'prometheus'],
-    [/rabbitmq/, 'rabbitmq'],
-    [/elasticsearch|opensearch/, 'elasticsearch'],
-    [/kafka|redpanda/, 'kafka'],
-    [/meilisearch/, 'meilisearch'],
-    [/clickhouse/, 'clickhouse'],
-    [/keycloak/, 'keycloak'],
-    [/gitea|forgejo/, 'gitea'],
-    [/gitlab/, 'gitlab'],
-    [/oven\/bun|(^|\/)bun(:|$)/, 'bun'],
-    [/deno/, 'deno'],
-    [/(^|\/)node(:|$)/, 'node'],
-    [/(^|\/)python(:|$)/, 'python'],
-    [/golang|(^|\/)go(:|$)/, 'go'],
-    [/(^|\/)rust(:|$)/, 'rust'],
-    [/(^|\/)ruby(:|$)/, 'ruby'],
-    [/(^|\/)php(:|$)/, 'php'],
-    [/(^|\/)alpine(:|$)/, 'alpine'],
-    [/(^|\/)ubuntu(:|$)/, 'ubuntu'],
-    [/(^|\/)debian(:|$)/, 'debian'],
-  ];
-  for (const [re, key] of rules) if (re.test(img)) return key;
-  return null;
-}
-
-/** Icon key for a zero-config build ("node (pnpm, next.js)", "python", …). */
-export function iconForStack(stack: string | null | undefined): string | null {
-  const s = (stack ?? '').toLowerCase();
-  if (s.includes('next.js')) return 'next';
-  if (s.startsWith('node')) return 'node';
-  if (s.startsWith('static site')) return 'vite';
-  if (s.startsWith('static')) return 'static';
-  for (const k of ['python', 'go', 'rust', 'deno', 'php', 'ruby']) if (s.startsWith(k)) return k;
-  return null;
-}
-
-/** Boot: give services created before the logo set existed a recognisable icon. */
+/** Boot: give services Servify named generically (no logo yet, a scheduled job, a build from a known base) a recognisable icon. */
 export function upgradeIcons() {
   for (const svc of servicesTable.all()) {
-    if (svc.icon !== 'box') continue;
-    const next = svc.source.type === 'image' ? iconForImage(svc.source.image) : null;
+    const base = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.baseImage?.ref : null;
+    const next = betterIcon(svc, base);
     if (next) {
       svc.icon = next;
       servicesTable.put(svc);
@@ -772,6 +720,11 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
       if (err) throw new HttpError(400, `invalid schedule: ${err}`);
     }
     set('schedule', sched, 'schedule');
+  }
+  if (patch.icon === undefined && (changes.includes('schedule') || changes.includes('source'))) {
+    const base = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.baseImage?.ref : null;
+    const icon = betterIcon(svc, base);
+    if (icon) set('icon', icon);
   }
   const moved = patch.x !== undefined || patch.y !== undefined;
   if (patch.x !== undefined) svc.x = Math.round(patch.x);

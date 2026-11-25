@@ -10,6 +10,7 @@ import { parse } from 'yaml';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, resolve, relative } from 'node:path';
 import { templates } from './templates.ts';
+import { iconForImage } from './icons.ts';
 import type { Protocol, Service, Source } from './types.ts';
 import { HttpError, slugify } from './util.ts';
 
@@ -373,7 +374,7 @@ export function planCompose(input: { yaml: string; env?: string; basePath?: stri
     const dependsOn = Array.isArray(svc.depends_on) ? svc.depends_on.map(String) : Object.keys(svc.depends_on ?? {});
     const secretKeys = Object.keys(env).filter((k) => /SECRET|PASSWORD|TOKEN|KEY|PASS$/i.test(k));
 
-    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? null, protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: (p.proto === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp', ...(p.hostIp ? { hostIp: p.hostIp } : {}) })), replicas, env, secretKeys, volumes, cmd, entrypoint, buildArgs: source.type === 'image' ? null : buildArgs, buildTarget: source.type === 'image' ? null : buildTarget, healthPath, resources, dependsOn, x: 0, y: 0 });
+    out.push({ name, slug, aliases, source, templateId: tpl?.id ?? null, icon: tpl?.icon ?? (source.type === 'image' ? iconForImage(source.image) : null), protocol, port, publishedPort, published: udp.map((p) => ({ container: p.container, host: p.published!, protocol: (p.proto === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp', ...(p.hostIp ? { hostIp: p.hostIp } : {}) })), replicas, env, secretKeys, volumes, cmd, entrypoint, buildArgs: source.type === 'image' ? null : buildArgs, buildTarget: source.type === 'image' ? null : buildTarget, healthPath, resources, dependsOn, x: 0, y: 0 });
   }
   if (!out.length) throw new HttpError(400, 'no importable services in this compose file');
 

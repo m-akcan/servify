@@ -170,7 +170,7 @@ function MiniCanvas({ services }: { services: { id: string; status: any }[] }) {
 type ComposePlan = {
   name: string;
   warnings: string[];
-  services: { slug: string; name: string; aliases: string[]; source: { type: string; image?: string; path?: string; repo?: string }; templateId: string | null; protocol: string; port: number | null; replicas: number; volumes: { name: string }[] }[];
+  services: { slug: string; name: string; aliases: string[]; icon?: string | null; source: { type: string; image?: string; path?: string; repo?: string }; templateId: string | null; protocol: string; port: number | null; replicas: number; volumes: { name: string }[] }[];
 };
 
 const COMPOSE_SAMPLE = `services:
@@ -190,6 +190,7 @@ volumes:
   pgdata: {}`;
 
 function iconForPlan(s: ComposePlan['services'][number]): string {
+  if (s.icon) return s.icon; // the server's pick (template or image logo)
   if (s.templateId) return ({ postgres: 'postgres', redis: 'redis', mysql: 'mysql', mongo: 'mongo', minio: 'bucket', nginx: 'nginx', n8n: 'flow', adminer: 'table', whoami: 'wave', 'uptime-kuma': 'pulse', ollama: 'spark' } as Record<string, string>)[s.templateId] ?? 'box';
   if (s.source.type === 'local') return 'folder';
   if (s.source.type === 'git') return 'git';

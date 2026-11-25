@@ -132,6 +132,9 @@ export function hasBrand(icon: string) {
 /** Fallback monogram tiles for services without a known logo. */
 const GLYPHS: Record<string, { mono: string; hue: string }> = {
   postgres: { mono: 'Pg', hue: '#7aa7ff' },
+  // Lettermarks for apps without a logo in simple-icons
+  minecraft: { mono: 'Mc', hue: '#62b47a' },
+  nocodb: { mono: 'Nc', hue: '#8f7bff' },
   redis: { mono: 'Rd', hue: '#ff7a6b' },
   mysql: { mono: 'My', hue: '#5ec8e8' },
   mongo: { mono: 'Mg', hue: '#6ad48f' },
@@ -164,6 +167,13 @@ export function ServiceGlyph({ icon, name, size = 34 }: { icon: string; name: st
     return (
       <div className="glyph" style={{ ...style, ['--hue' as any]: g.hue }}>
         {g.mono}
+      </div>
+    );
+  }
+  if (icon === 'cron') {
+    return (
+      <div className="glyph" title="Scheduled job" style={{ ...style, ['--hue' as any]: '#f2b84b' }}>
+        <Icon name="clock" size={Math.round(size * 0.5)} />
       </div>
     );
   }

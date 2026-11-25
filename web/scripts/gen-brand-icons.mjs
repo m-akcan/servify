@@ -17,6 +17,23 @@ const MAP = {
   static: 'siHtml5', meilisearch: 'siMeilisearch', clickhouse: 'siClickhouse', keycloak: 'siKeycloak',
   gitlab: 'siGitlab', gitea: 'siGitea', discord: 'siDiscord', telegram: 'siTelegram', cloudflare: 'siCloudflare',
   letsencrypt: 'siLetsencrypt', supabase: 'siSupabase', alpine: 'siAlpinelinux', ubuntu: 'siUbuntu', debian: 'siDebian',
+  // Self-hosted apps
+  nextcloud: 'siNextcloud', teamspeak: 'siTeamspeak', vaultwarden: 'siVaultwarden', bitwarden: 'siBitwarden',
+  jellyfin: 'siJellyfin', plex: 'siPlex', emby: 'siEmby', immich: 'siImmich', homeassistant: 'siHomeassistant', nodered: 'siNodered',
+  mosquitto: 'siEclipsemosquitto', zigbee2mqtt: 'siZigbee2mqtt', frigate: 'siFrigate', portainer: 'siPortainer', npm: 'siNginxproxymanager',
+  pihole: 'siPihole', adguard: 'siAdguard', wireguard: 'siWireguard', tailscale: 'siTailscale', syncthing: 'siSyncthing',
+  paperless: 'siPaperlessngx', wordpress: 'siWordpress', ghost: 'siGhost', mattermost: 'siMattermost', rocketchat: 'siRocketdotchat',
+  matrix: 'siMatrix', mastodon: 'siMastodon', onlyoffice: 'siOnlyoffice', collabora: 'siCollaboraonline', bookstack: 'siBookstack',
+  outline: 'siOutline', hedgedoc: 'siHedgedoc', excalidraw: 'siExcalidraw', searxng: 'siSearxng', freshrss: 'siFreshrss',
+  audiobookshelf: 'siAudiobookshelf', calibre: 'siCalibreweb', sonarr: 'siSonarr', radarr: 'siRadarr', qbittorrent: 'siQbittorrent',
+  transmission: 'siTransmission', mealie: 'siMealie', grocy: 'siGrocy', actualbudget: 'siActualbudget', firefly: 'siFireflyiii',
+  umami: 'siUmami', plausible: 'siPlausibleanalytics', matomo: 'siMatomo', metabase: 'siMetabase', directus: 'siDirectus',
+  strapi: 'siStrapi', pocketbase: 'siPocketbase', appwrite: 'siAppwrite', authentik: 'siAuthentik', authelia: 'siAuthelia',
+  sentry: 'siSentry', netdata: 'siNetdata', ntfy: 'siNtfy', jenkins: 'siJenkins', drone: 'siDrone', codeserver: 'siCoder',
+  phpmyadmin: 'siPhpmyadmin', influxdb: 'siInfluxdb', vault: 'siVault',
+  // Data stores, infrastructure, runtimes
+  neo4j: 'siNeo4j', cassandra: 'siApachecassandra', qdrant: 'siQdrant', kibana: 'siKibana', haproxy: 'siHaproxy',
+  apache: 'siApache', tomcat: 'siApachetomcat', curl: 'siCurl', java: 'siOpenjdk', dotnet: 'siDotnet', elixir: 'siElixir',
 };
 
 const lum = (hex) => {
