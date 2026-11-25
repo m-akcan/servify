@@ -3,12 +3,13 @@ import { uploadPath } from './uploads.ts';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import type { DockerClient } from './docker.ts';
-import { dockerFor, nodeOf } from './nodes.ts';
+import { dockerFor, nodeOf, LOCAL } from './nodes.ts';
 import { config } from './config.ts';
 import { detect, DEFAULT_IGNORE } from './detect.ts';
 import type { Deployment, Project, Service } from './types.ts';
 import { INSTANCE_ID } from './engine.ts';
-import { baseImageOf, fromDigestsInLog } from './baseimage.ts';
+import { baseImageOf, fromDigestsInLog, type BaseImage } from './baseimage.ts';
+import { pull, pullProblem } from './deployer.ts';
 import { parseRepo, sameRepo } from './imageupdates.ts';
 import { normalizeImageRef } from './docker.ts';
 
@@ -144,8 +145,7 @@ async function apiBuild(d: DockerClient, ctx: string, dockerfile: string, tag: s
  * resolved (`FROM ref@sha256:…`) — that is what the build really used, even after `--pull`, which leaves the local
  * tag alone. The classic builder logs none; it builds from the local tag, so that tag's registry digest is it.
  */
-async function recordBaseImage(d: DockerClient, dockerfile: string, opts: BuildOpts, log: Log): Promise<BuildResult['baseImage']> {
-  const base = baseImageOf(dockerfile, opts.args, opts.target);
+async function recordBaseImage(d: DockerClient, base: BaseImage | null, opts: BuildOpts, log: Log): Promise<BuildResult['baseImage']> {
   const r = base && parseRepo(base.ref);
   if (!base || !r) return null;
   const same = (ref: string) => {
@@ -233,12 +233,19 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     const opts: BuildOpts = { args: buildArgsFor(svc), target: svc.buildTarget ?? null, pull: dep.trigger === 'update', fromLines: [] };
     if (Object.keys(opts.args).length) log(`▸ Build arguments: ${Object.keys(opts.args).join(', ')}`);
     if (opts.target) log(`▸ Build target: ${opts.target}`);
-    if (opts.pull) log('▸ Pulling the base image again (update)');
+    // Generated Dockerfiles pick their own base, which the user can't change: only their own Dockerfiles are checked.
+    const base = builder === 'dockerfile' ? baseImageOf(readFileSync(dockerfile, 'utf8'), opts.args, opts.target) : null;
+    if (opts.pull && base && parseRepo(base.ref)) {
+      // Into the server's image store, not just BuildKit's cache: later plain builds use the local copy of the base,
+      // and must not fall back to the old one. A failed pull fails the update, as for image services.
+      log(`▸ Pulling ${base.ref} (update)`);
+      const raw = await pull(d, base.ref, log, nodeOf(svc) === LOCAL);
+      if (raw) throw new Error(`pull failed: ${pullProblem(raw, base.ref)}`);
+    } else if (opts.pull) log('▸ Pulling the base images again (update)');
     const usedCli = await cliBuild(d, ctx, dockerfile, tag, labels, log, opts);
     if (!usedCli) await apiBuild(d, ctx, dockerfile, tag, labels, log, opts);
     log(`✓ Built in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    // Generated Dockerfiles pick their own base, which the user can't change: only their own Dockerfiles are checked.
-    const baseImage = builder === 'dockerfile' ? await recordBaseImage(d, readFileSync(dockerfile, 'utf8'), opts, log) : null;
+    const baseImage = await recordBaseImage(d, base, opts, log);
     return { image: tag, commitSha, commitMessage, builder: usedCli ? `${builder} · buildkit` : builder, baseImage };
   } finally {
     if (cleanup) rmSync(workDir, { recursive: true, force: true });

@@ -71,7 +71,7 @@ function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promis
  * Pull through the Engine API — on this machine with the registry login of the user Servify runs as — then, if that
  * fails, through the docker CLI. Null on success, else the reason. Logins never go to remote servers.
  */
-async function pull(d: DockerClient, ref: string, log: (l: string) => void, local: boolean): Promise<string | null> {
+export async function pull(d: DockerClient, ref: string, log: (l: string) => void, local: boolean): Promise<string | null> {
   try {
     const host = parseRepo(ref)?.registry;
     const auth = local && host ? await engineAuthHeader(host).catch(() => null) : null;

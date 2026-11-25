@@ -463,6 +463,8 @@ async function main() {
     await moveTag('acc/base', '1.0', 'moved');
     pushTo('busybox:1.36-musl', builderRepo, '1.1');
     await moveTag('acc/builder', '1.0', 'moved');
+    await api('PATCH', `/services/${app.id}`, { imageAutoUpdate: true }); // left over from an image service: must not apply
+    const updateDeps = async (id) => (await api('GET', `/services/${id}/deployments`)).filter((d) => d.trigger === 'update').length;
     st = await api('POST', `/services/${app.id}/image-check`);
     check('a rebuilt base image under the same tag is found', st?.base === true && st.status === 'changed', JSON.stringify(st));
     check('newer base tags are found (same major and next major)', st?.newerTag === '1.1' && st?.newerMajor === '2.0', JSON.stringify(st));
@@ -475,6 +477,8 @@ async function main() {
     const ms = await api('POST', `/services/${multi.id}/image-check`);
     check('multi-stage: a newer builder image is no base update', ms?.status === 'current' && !ms.newerTag && !ms.newerMajor && notesFor(multi.id).length === 0, JSON.stringify(ms));
     check('a plain build keeps using the copy on the server', await isAlpine(app.id));
+    check('builds never update by themselves', (await updateDeps(app.id)) === 0);
+    await api('PATCH', `/services/${app.id}`, { imageAutoUpdate: false });
     // Update: pull the base and rebuild.
     const before2 = (await api('GET', `/services/${app.id}`)).activeDeploymentId;
     await api('POST', `/services/${app.id}/update-image`, {});
@@ -488,6 +492,14 @@ async function main() {
       return x?.status === 'current' ? x : null;
     }, 30_000, 'recheck after the rebuild');
     check('after the rebuild the base is up to date again', st?.status === 'current' && st.newerTag === '1.1', JSON.stringify(st));
+    // The pulled base replaced the server's copy: an ordinary deploy afterwards builds on it too.
+    await sleep(1500); // the recheck after the update may still be notifying the newer tags
+    const notesBefore = notesFor(app.id).length;
+    const plain = await api('POST', `/services/${app.id}/deploy`);
+    await waitFor(async () => ['active', 'failed'].includes((await api('GET', `/deployments/${plain.id}`)).status), 240_000, 'plain rebuild');
+    st = await api('POST', `/services/${app.id}/image-check`);
+    await sleep(1000);
+    check('a plain deploy after the update keeps the new base', (await api('GET', `/deployments/${plain.id}`)).status === 'active' && !(await isAlpine(app.id)) && st?.status === 'current' && notesFor(app.id).length === notesBefore, JSON.stringify(st));
     // A newer tag: sets the build argument and rebuilds.
     await api('POST', `/services/${app.id}/update-image`, { tag: '1.1' });
     check('switching to a newer base tag sets the build argument and rebuilds', !!(await waitFor(async () => {
