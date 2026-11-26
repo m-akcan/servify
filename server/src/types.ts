@@ -366,6 +366,7 @@ export interface ApiToken {
   name: string;
   prefix: string;
   scope: 'read' | 'write';
+  kind?: 'agent' | 'device';
   createdAt: number;
   lastUsedAt: number | null;
 }

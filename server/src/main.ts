@@ -92,8 +92,8 @@ async function main() {
 
   app.all('/mcp', async (c) => {
     if (!hostAllowed(c.req.header('host'))) return c.json({ error: 'host not allowed' }, 403);
-    if (!originOk(c.req.header('origin'), c.req.header('host'), c.req.method)) return c.json({ error: 'origin not allowed' }, 403);
     const auth = c.req.header('authorization');
+    if (!originOk(c.req.header('origin'), c.req.header('host'), c.req.method, auth)) return c.json({ error: 'origin not allowed' }, 403);
     const p = principalFor({ bearer: auth?.startsWith('Bearer ') ? auth.slice(7).trim() : undefined, cookie: getCookie(c, SESSION_COOKIE) });
     if (!p) {
       return c.json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized: create an API token in Servify → Agents and send it as a Bearer token' }, id: null }, 401);

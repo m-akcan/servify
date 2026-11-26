@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Servify mark: four squares, fading from the top left. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp" android:height="96dp"
+    android:viewportWidth="32" android:viewportHeight="32">
+    <path android:fillColor="#D4F25A" android:pathData="M9,7 h4 a2,2 0 0 1 2,2 v4 a2,2 0 0 1 -2,2 h-4 a2,2 0 0 1 -2,-2 v-4 a2,2 0 0 1 2,-2z" />
+    <path android:fillColor="#D4F25A" android:fillAlpha="0.55" android:pathData="M19,7 h4 a2,2 0 0 1 2,2 v4 a2,2 0 0 1 -2,2 h-4 a2,2 0 0 1 -2,-2 v-4 a2,2 0 0 1 2,-2z" />
+    <path android:fillColor="#D4F25A" android:fillAlpha="0.55" android:pathData="M9,17 h4 a2,2 0 0 1 2,2 v4 a2,2 0 0 1 -2,2 h-4 a2,2 0 0 1 -2,-2 v-4 a2,2 0 0 1 2,-2z" />
+    <path android:fillColor="#D4F25A" android:fillAlpha="0.25" android:pathData="M19,17 h4 a2,2 0 0 1 2,2 v4 a2,2 0 0 1 -2,2 h-4 a2,2 0 0 1 -2,-2 v-4 a2,2 0 0 1 2,-2z" />
+</vector>

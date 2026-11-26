@@ -1129,6 +1129,53 @@ function Webhooks({ settings, reload }: { settings: Settings; reload: () => void
 
 // ───────────────────────────── security ─────────────────────────────
 
+type Device = { id: string; name: string; prefix: string; createdAt: number; lastUsedAt: number | null; current?: boolean };
+
+/** Phones signed in with the Servify app. Each holds its own token; signing one out ends it at once. */
+function Devices() {
+  const [devices, setDevices] = useState<Device[] | null>(null);
+  const load = () => api.get<Device[]>('/devices').then(setDevices).catch(() => setDevices([]));
+  useEffect(() => {
+    void load();
+  }, []);
+  const signOut = async (d: Device) => {
+    if (!(await confirmDialog({ title: `Sign out ${d.name}?`, body: 'The app on that phone stops working until you sign in on it again.', confirm: 'Sign out', danger: true }))) return;
+    try {
+      await api.del(`/devices/${d.id}`);
+      toast({ title: `Signed out ${d.name}` });
+      void load();
+    } catch (e) {
+      toastError(e);
+    }
+  };
+  return (
+    <Card title="Signed-in devices" icon={<Icon name="phone" size={17} />} desc="Phones signed in with the Servify app. They act as you, so sign out any you no longer use.">
+      {devices === null ? null : devices.length === 0 ? (
+        <div className="faint" style={{ fontSize: 13 }}>No phones yet. In the app, enter this Servify's address and your password.</div>
+      ) : (
+        <div className="token-list">
+          {devices.map((d) => (
+            <div className="token-row" key={d.id}>
+              <div className="token-icon">
+                <Icon name="phone" size={15} />
+              </div>
+              <div className="grow">
+                <b>{d.name}</b>
+                <div className="faint mono" style={{ fontSize: 11, marginTop: 2 }}>
+                  signed in {timeAgo(d.createdAt)}  ·  {d.lastUsedAt ? `used ${timeAgo(d.lastUsedAt)}` : 'never used'}
+                </div>
+              </div>
+              <Button size="sm" variant="ghost" onClick={() => void signOut(d)}>
+                Sign out
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function Security() {
   const system = useStore((s) => s.system) as any;
   const mk = system?.masterKey as { source: 'env' | 'file' | 'created'; path: string | null } | undefined;
@@ -1146,6 +1193,7 @@ function Security() {
           </div>
         </div>
       </Card>
+      <Devices />
       <Card title="Access" icon={<Icon name="shield" size={17} />} desc="Who can reach this Servify.">
         <ul className="plain-list">
           <li>The dashboard and API listen on <span className="mono">{system?.api.host}</span> — {system?.api.host === '127.0.0.1' ? 'only this machine' : 'reachable from your network'}.</li>

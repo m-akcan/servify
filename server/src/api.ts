@@ -3,6 +3,7 @@ import { receiveUpload } from './uploads.ts';
 import * as dbb from './dbbrowser.ts';
 import { overview } from './overview.ts';
 import { streamSSE } from 'hono/streaming';
+import { cors } from 'hono/cors';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { ZodError } from 'zod';
 import * as ops from './ops.ts';
@@ -18,6 +19,8 @@ import {
   createToken,
   hostAllowed,
   originOk,
+  throttleLogin,
+  APP_ORIGINS,
   type Principal,
 } from './auth.ts';
 import { tokensTable, deployments as deploymentsTable } from './db.ts';
@@ -85,10 +88,26 @@ api.onError((err, c) => {
   return c.json({ error: (err as Error).message || 'internal error' }, 500);
 });
 
+// The mobile app calls the API from its WebView (http://localhost). It authenticates with a Bearer
+// token, never cookies, so CORS is allowed for its origins only and without credentials. This runs
+// first so the app can read error responses (like "host not allowed") and preflights skip auth.
+api.use(
+  '*',
+  cors({
+    origin: (origin) => (APP_ORIGINS.has(origin) ? origin : null),
+    allowMethods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
+    allowHeaders: ['Authorization', 'Content-Type'],
+    maxAge: 600,
+  }),
+);
+
 // Host / origin validation for everything under /api.
 api.use('*', async (c, next) => {
   if (!hostAllowed(c.req.header('host'))) return c.json({ error: 'host not allowed' }, 403);
-  if (!originOk(c.req.header('origin'), c.req.header('host'), c.req.method)) return c.json({ error: 'origin not allowed' }, 403);
+  const origin = c.req.header('origin');
+  // Signing in from the app carries a password, not a cookie, so there is nothing to forge.
+  const appSignIn = c.req.path === '/api/auth/device' && c.req.method === 'POST' && !!origin && APP_ORIGINS.has(origin);
+  if (!appSignIn && !originOk(origin, c.req.header('host'), c.req.method, c.req.header('authorization'))) return c.json({ error: 'origin not allowed' }, 403);
   await next();
 });
 
@@ -96,7 +115,7 @@ api.use('*', async (c, next) => {
 
 api.get('/auth/status', (c) => {
   const p = principalFor({ cookie: getCookie(c, SESSION_COOKIE), bearer: bearer(c) });
-  return c.json({ setUp: isSetUp(), authenticated: !!p, authMode: config.authMode, version: config.version });
+  return c.json({ app: 'servify', setUp: isSetUp(), authenticated: !!p, authMode: config.authMode, version: config.version });
 });
 
 api.post('/auth/setup', async (c) => {
@@ -108,17 +127,25 @@ api.post('/auth/setup', async (c) => {
   return c.json({ ok: true });
 });
 
-const loginAttempts: number[] = [];
 api.post('/auth/login', async (c) => {
-  const nowTs = Date.now();
-  while (loginAttempts.length && nowTs - loginAttempts[0] > 60_000) loginAttempts.shift();
-  if (loginAttempts.length > 10) throw new HttpError(429, 'too many attempts, wait a minute');
-  loginAttempts.push(nowTs);
+  throttleLogin();
   const { password } = await jsonBody<{ password: string }>(c);
   if (!checkPassword(password ?? '')) throw new HttpError(401, 'wrong password');
   const s = createSession();
   setCookie(c, SESSION_COOKIE, s.id, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: s.maxAge });
   return c.json({ ok: true });
+});
+
+/** Sign in from the mobile app: the owner password buys a device token (shown once, revocable in Settings → Security). */
+api.post('/auth/device', async (c) => {
+  if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none); the app needs an owner password');
+  if (!isSetUp()) throw new HttpError(409, 'this Servify has no owner password yet: open the dashboard once to set it');
+  throttleLogin();
+  const { password, name } = await jsonBody<{ password: string; name?: string }>(c);
+  if (!checkPassword(password ?? '')) throw new HttpError(401, 'wrong password');
+  const { token, record } = createToken(name || 'Phone', 'write', 'device');
+  recordActivity({ type: 'user', name: 'you' }, 'device.signin', `Signed in on ${record.name}`);
+  return c.json({ token, device: record }, 201);
 });
 
 api.post('/auth/logout', (c) => {
@@ -140,6 +167,16 @@ api.use('*', async (c, next) => {
   if (p.scope === 'read' && c.req.method !== 'GET') return c.json({ error: 'this token is read-only' }, 403);
   c.set('principal', p);
   await next();
+});
+
+/** The app signs itself out: its own device token stops working. */
+api.delete('/auth/device', (c) => {
+  const { tokenId } = c.get('principal');
+  const rec = tokenId ? tokensTable.list().find((t) => t.id === tokenId) : null;
+  if (!rec || rec.kind !== 'device') throw new HttpError(400, 'not signed in with a device token');
+  tokensTable.delete(rec.id);
+  recordActivity({ type: 'user', name: 'you' }, 'device.signout', `Signed out on ${rec.name}`);
+  return c.json({ ok: true });
 });
 
 const actor = (c: Context<Env>) => c.get('principal').actor;
@@ -676,7 +713,21 @@ api.post('/settings/webhooks/rotate', (c) => {
 
 api.get('/tokens', (c) => {
   if (c.get('principal').actor.type !== 'user') throw new HttpError(403, 'only the owner can manage tokens');
-  return c.json(tokensTable.list());
+  return c.json(tokensTable.list().filter((t) => t.kind !== 'device'));
+});
+/** Phones signed in with the mobile app. */
+api.get('/devices', (c) => {
+  if (c.get('principal').actor.type !== 'user') throw new HttpError(403, 'only the owner can manage devices');
+  const current = c.get('principal').tokenId;
+  return c.json(tokensTable.list().filter((t) => t.kind === 'device').map((t) => ({ ...t, current: t.id === current })));
+});
+api.delete('/devices/:id', (c) => {
+  if (c.get('principal').actor.type !== 'user') throw new HttpError(403, 'only the owner can manage devices');
+  const rec = tokensTable.list().find((t) => t.id === c.req.param('id') && t.kind === 'device');
+  if (!rec) throw new HttpError(404, 'no such device');
+  tokensTable.delete(rec.id);
+  recordActivity(actor(c), 'device.signout', `Signed out ${rec.name}`);
+  return c.json({ ok: true });
 });
 api.post('/tokens', async (c) => {
   if (c.get('principal').actor.type !== 'user') throw new HttpError(403, 'only the owner can manage tokens');

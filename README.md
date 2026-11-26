@@ -245,6 +245,12 @@ The agent (`server/bin/agent.mjs`, no dependencies) connects **out** to this Ser
 
 The agent endpoint listens on `0.0.0.0:7701` only once you add a server (`SERVIFY_AGENT_HOST`, `SERVIFY_AGENT_PORT`). The join command uses your first LAN address; set `SERVIFY_AGENT_PUBLIC_HOST` if servers reach this machine under another name (a VPN or public address). Treat an agent token like a password: whoever holds it can pose as that server.
 
+## Android app
+
+The Servify app for Android (in [`mobile/`](mobile/README.md)) signs in like a password manager's self-hosted mode: enter your Servify's address, then the owner password. The phone gets its own token, listed under **Settings → Security → Signed-in devices**, where you can sign it out. The app shows your projects and services live, with metrics, deployments and logs, and can restart, redeploy, stop, start and run scheduled jobs.
+
+Reach Servify from your phone through your home network or a VPN (Tailscale, WireGuard); there's no need to put the dashboard on the internet. Plain `http://` is only accepted for local and VPN addresses. Servify always answers on bare IP addresses; add any hostname you use (for example a Tailscale MagicDNS name) to `SERVIFY_ALLOWED_HOSTS`.
+
 ## Start at login
 
 **Settings → General → Start Servify at login.** Servify then starts in the background when you log in (a launchd agent on macOS, a systemd user service on Linux) and restarts if it crashes. Turning it on while Servify is running takes effect at your next login; turning it off never stops the running Servify. Logs go to `~/.servify/logs/servify.log`. The same from a terminal:
@@ -296,7 +302,7 @@ The **production ▾** menu next to the project name creates environments: a ful
 | `SERVIFY_MASTER_KEY` | | Encryption key for stored secrets (any string). Default: a generated `master.key` in the data dir |
 | `SERVIFY_BASE_DOMAIN` | `localhost` | Generated URLs: `<service>.<project>.<base>` |
 | `SERVIFY_TCP_PORT_START` | `15400` | First port for auto-assigned TCP proxies |
-| `SERVIFY_ALLOWED_HOSTS` | | Extra hostnames allowed to reach the dashboard |
+| `SERVIFY_ALLOWED_HOSTS` | | Extra hostnames allowed to reach the dashboard (bare IP addresses always work) |
 | `SERVIFY_AGENT_HOST` / `SERVIFY_AGENT_PORT` | `0.0.0.0` / `7701` | Where servers' agents connect (TLS). Only started once a server is added |
 | `SERVIFY_AGENT_PUBLIC_HOST` | first LAN IPv4 | Address shown in the join command |
 | `SERVIFY_TRUSTED_PROXIES` | | Proxies in front of Servify (IPs / IPv4 CIDRs) whose `X-Forwarded-Proto` and `X-Forwarded-For` (visitor key of the access log) are believed |
@@ -348,6 +354,7 @@ The acceptance script deploys, load-balances, scales, redeploys under load (asse
 
 - Servify controls your Docker daemon, which is root-equivalent. Keep it bound to localhost unless you know what you're doing.
 - The dashboard uses an scrypt-hashed owner password and an HttpOnly, SameSite=Strict session cookie. Writes must come from Servify's own origin (hosted apps live on `*.localhost` too, so this matters). Host headers are checked to block DNS rebinding.
+- The Android app signs in with the owner password and gets a device token that acts as the owner; it is revocable under Settings → Security, shares the login rate limit, and sits in the Android Keystore on the phone. The API answers CORS only for the app's own WebView origins, never with credentials, and a request that carries a Bearer token skips the Origin check (no site can attach someone else's token).
 - API tokens are stored as SHA-256 hashes and can be read-only. Secrets are masked for read-only tokens; instance settings can only be changed by the owner (not by agent tokens).
 - Service variables, git tokens, resolved environments, notification credentials, storage keys, ACME account keys and certificate keys are encrypted at rest (AES-256-GCM). Back up `master.key` (or use `SERVIFY_MASTER_KEY`): without it the secrets are gone, and Servify refuses to start with the wrong key rather than overwrite them. Not encrypted: what Docker itself stores (a running container's environment), build logs, cron job output and runtime logs — keep secrets out of your log output.
 - Git webhooks are verified with HMAC-SHA256 (GitHub, Gitea) or the secret token (GitLab) in constant time; payloads are capped at 2 MB.

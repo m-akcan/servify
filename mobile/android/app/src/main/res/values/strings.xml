@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Servify</string>
+    <string name="title_activity_main">Servify</string>
+    <string name="package_name">cloud.servify.app</string>
+    <string name="custom_url_scheme">cloud.servify.app</string>
+</resources>

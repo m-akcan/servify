@@ -123,6 +123,8 @@ export type TokenRecord = {
   name: string;
   prefix: string;
   scope: 'read' | 'write';
+  /** 'device': a phone signed in with the owner password (acts as the owner). Missing on older tokens = 'agent'. */
+  kind?: 'agent' | 'device';
   createdAt: number;
   lastUsedAt: number | null;
 };
