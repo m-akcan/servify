@@ -5,12 +5,19 @@ import { openVolumeDialog } from './volumes.tsx';
 import { navigate, projectPath } from './router.ts';
 import { store } from './store.ts';
 
-export async function deploy(s: ServiceView, opts: { useCachedImage?: boolean } = {}) {
+export async function deploy(s: ServiceView, opts: { useCachedImage?: boolean; skipSafetyBackup?: boolean } = {}) {
   try {
-    await api.post<Deployment>(`/services/${s.id}/deploy`, opts.useCachedImage ? { useCachedImage: true } : undefined);
+    const body = { ...(opts.useCachedImage ? { useCachedImage: true } : {}), ...(opts.skipSafetyBackup ? { skipSafetyBackup: true } : {}) };
+    await api.post<Deployment>(`/services/${s.id}/deploy`, Object.keys(body).length ? body : undefined);
     toast({
       title: `Deploying ${s.name}`,
-      body: opts.useCachedImage ? 'With the image already on the server, without pulling' : s.pendingChanges.length ? `Applying ${s.pendingChanges.join(', ')}` : undefined,
+      body: opts.skipSafetyBackup
+        ? 'Without a safety backup, as asked'
+        : opts.useCachedImage
+          ? 'With the image already on the server, without pulling'
+          : s.pendingChanges.length
+            ? `Applying ${s.pendingChanges.join(', ')}`
+            : undefined,
       tone: 'build',
     });
   } catch (e) {
@@ -76,6 +83,28 @@ export async function remove(s: ServiceView) {
     toast({ title: `${s.name} deleted`, tone: 'idle' });
   } catch (e) {
     toastError(e);
+  }
+}
+
+/**
+ * A deploy refused for want of a safety backup, done again without one — after the user confirms. Rollbacks and
+ * restarts roll back to the refused deployment's image; updates pull again.
+ */
+export async function deployWithoutSafetyBackup(s: ServiceView, d: Deployment) {
+  const ok = await confirmDialog({
+    title: `Deploy ${s.name} without a safety backup?`,
+    body: `The new version starts on ${s.name}’s current data and may change it in place. If it goes wrong there is no backup from just before to go back to — only older ones, if any.`,
+    confirm: 'Deploy without a backup',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    if (d.trigger === 'rollback' || d.trigger === 'restart') await api.post(`/services/${s.id}/rollback`, { deploymentId: d.id, skipSafetyBackup: true });
+    else if (d.trigger === 'update') await api.post(`/services/${s.id}/update-image`, { skipSafetyBackup: true });
+    else await api.post(`/services/${s.id}/deploy`, { skipSafetyBackup: true });
+    toast({ title: `Deploying ${s.name}`, body: 'Without a safety backup, as asked', tone: 'build' });
+  } catch (e) {
+    toastError(e, 'Deploy failed to start');
   }
 }
 

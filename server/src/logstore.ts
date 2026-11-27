@@ -11,6 +11,7 @@ import { demuxLines } from './docker.ts';
 import { dockerForContainer, isOnline } from './nodes.ts';
 import { allRuntime } from './engine.ts';
 import { bus } from './events.ts';
+import { persistPaused, noteSkipped } from './diskguard.ts';
 import type { Replica } from './types.ts';
 
 export type LogLine = { ts: number; replica: number; deploymentId: string; stream: 'stdout' | 'stderr'; text: string };
@@ -29,9 +30,35 @@ let dropped = 0;
 
 const insert = db.prepare('INSERT INTO logs (service_id, deployment_id, cid, replica, ts, stream, text) VALUES (?, ?, ?, ?, ?, ?, ?)');
 
+/**
+ * While the data disk is in low-disk protection, lines are not stored: the newest of each service stay here instead,
+ * so the dashboard (backlog and history) still shows them, and they are written once there is room again.
+ */
+const MEM_TAIL = Number(process.env.SERVIFY_LOG_MEMORY_LINES ?? 2000);
+const memTail = new Map<string, Pending[]>();
+
+function keepInMemory(batch: Pending[]) {
+  for (const l of batch) {
+    let t = memTail.get(l.serviceId);
+    if (!t) memTail.set(l.serviceId, (t = []));
+    t.push(l);
+    if (t.length > MEM_TAIL * 1.25) t.splice(0, t.length - MEM_TAIL);
+  }
+  noteSkipped('logLines', batch.length);
+}
+
 export function flushLogs() {
-  if (!queue.length) return;
-  const batch = queue;
+  if (persistPaused()) {
+    if (queue.length) keepInMemory(queue.splice(0, queue.length));
+    return;
+  }
+  let batch = queue;
+  if (memTail.size) {
+    // Back above the line: the lines kept in memory meanwhile go in first (the newest of each service).
+    batch = [...[...memTail.values()].flatMap((t) => t.slice(-MEM_TAIL)), ...queue];
+    memTail.clear();
+  }
+  if (!batch.length) return;
   queue = [];
   db.exec('BEGIN');
   try {
@@ -51,6 +78,18 @@ function parseTs(line: string): { ts: number; text: string } {
   const t = Date.parse(line.slice(0, sp));
   if (sp > 0 && Number.isFinite(t)) return { ts: t, text: line.slice(sp + 1) };
   return { ts: Date.now(), text: line };
+}
+
+/** A line from Servify itself in a service's logs (e.g. "restarted replica #0"), next to the container output. */
+export function appendServiceLog(serviceId: string, deploymentId: string, replica: number, text: string) {
+  // Its own cid: lastTs(cid) decides where a container's stream resumes, so a line under the real cid could hide output.
+  const line: Pending = { ts: Date.now(), replica, deploymentId, stream: 'stderr', text: `[servify] ${text}`.slice(0, MAX_LINE), serviceId, cid: 'servify' };
+  if (queue.length >= MAX_QUEUE) {
+    queue.shift();
+    dropped++;
+  }
+  queue.push(line);
+  feed.emit(serviceId, line);
 }
 
 // ───────────────────────────── collector ─────────────────────────────
@@ -102,13 +141,19 @@ function sync() {
   }
 }
 
-function retention() {
+/** Lines past the retention (age, and count per service) are deleted: returns how many. */
+export function pruneLogs(): number {
   flushLogs();
-  db.prepare('DELETE FROM logs WHERE ts < ?').run(Date.now() - RETENTION_DAYS * 86400_000);
+  let n = Number(db.prepare('DELETE FROM logs WHERE ts < ?').run(Date.now() - RETENTION_DAYS * 86400_000).changes);
   const svcs = db.prepare('SELECT service_id, COUNT(*) AS n FROM logs GROUP BY service_id HAVING n > ?').all(MAX_LINES) as { service_id: string }[];
   for (const s of svcs) {
-    db.prepare('DELETE FROM logs WHERE service_id = ? AND id < (SELECT id FROM logs WHERE service_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)').run(s.service_id, s.service_id, MAX_LINES);
+    n += Number(db.prepare('DELETE FROM logs WHERE service_id = ? AND id < (SELECT id FROM logs WHERE service_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)').run(s.service_id, s.service_id, MAX_LINES).changes);
   }
+  return n;
+}
+
+function retention() {
+  pruneLogs();
   if (dropped) {
     console.warn(`[logs] dropped ${dropped} lines under load`);
     dropped = 0;
@@ -123,6 +168,7 @@ export function startLogCollector() {
   bus.subscribe((ev) => {
     if (ev.type === 'replicas') sync();
     if (ev.type === 'service.deleted') {
+      memTail.delete(ev.serviceId);
       flushLogs();
       db.prepare('DELETE FROM logs WHERE service_id = ?').run(ev.serviceId);
     }
@@ -163,7 +209,15 @@ export function queryLogs(
   const rows = db
     .prepare(`SELECT ts, replica, deployment_id AS deploymentId, stream, text FROM logs WHERE ${where.join(' AND ')} ORDER BY ts DESC, id DESC LIMIT ?`)
     .all(...params, tail) as LogLine[];
-  return rows.reverse();
+  rows.reverse();
+  const mem = memTail.get(serviceId);
+  if (!mem?.length) return rows;
+  // Lines kept in memory during low-disk protection (not in the database yet), filtered the same way.
+  const needle = opts.search?.toLowerCase();
+  const extra = mem
+    .filter((l) => (!opts.since || l.ts >= opts.since) && (!opts.until || l.ts <= opts.until) && (!opts.deploymentId || l.deploymentId === opts.deploymentId) && (!opts.stream || l.stream === opts.stream) && (!needle || l.text.toLowerCase().includes(needle)))
+    .map((l) => ({ ts: l.ts, replica: l.replica, deploymentId: l.deploymentId, stream: l.stream, text: l.text }));
+  return [...rows, ...extra].sort((a, b) => a.ts - b.ts).slice(-tail);
 }
 
 export function subscribeLogs(serviceId: string, fn: (l: LogLine) => void): () => void {

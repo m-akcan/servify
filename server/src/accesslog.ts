@@ -19,6 +19,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { db, services as servicesTable } from './db.ts';
 import { bus } from './events.ts';
+import { persistPaused, noteSkipped } from './diskguard.ts';
 import { HttpError } from './util.ts';
 
 const RETENTION_DAYS = Number(process.env.SERVIFY_ACCESS_LOG_RETENTION_DAYS ?? process.env.SERVIFY_LOG_RETENTION_DAYS ?? 7);
@@ -148,6 +149,11 @@ export function flushAccessLog() {
   if (!queue.length) return;
   const batch = queue;
   queue = [];
+  if (persistPaused()) {
+    // Low-disk protection: requests are still counted in the live metrics, but not stored row by row.
+    noteSkipped('accessRows', batch.length);
+    return;
+  }
   db.exec('BEGIN');
   try {
     for (const r of batch) insert.run(r.serviceId, r.ts, r.host, r.method, r.path, r.status, r.bytes, r.ms, r.referrer, r.refHost, r.userAgent, r.visitor, r.bot, r.replica);
@@ -161,13 +167,19 @@ export function flushAccessLog() {
   }
 }
 
-function retention() {
+/** Rows past the retention (age, and count per service) are deleted: returns how many. */
+export function pruneAccessLog(): number {
   flushAccessLog();
-  db.prepare('DELETE FROM access_log WHERE ts < ?').run(Date.now() - RETENTION_DAYS * 86400_000);
+  let n = Number(db.prepare('DELETE FROM access_log WHERE ts < ?').run(Date.now() - RETENTION_DAYS * 86400_000).changes);
   const big = db.prepare('SELECT service_id, COUNT(*) AS n FROM access_log GROUP BY service_id HAVING n > ?').all(MAX_ROWS) as { service_id: string }[];
   for (const s of big) {
-    db.prepare('DELETE FROM access_log WHERE service_id = ? AND id < (SELECT id FROM access_log WHERE service_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)').run(s.service_id, s.service_id, MAX_ROWS);
+    n += Number(db.prepare('DELETE FROM access_log WHERE service_id = ? AND id < (SELECT id FROM access_log WHERE service_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)').run(s.service_id, s.service_id, MAX_ROWS).changes);
   }
+  return n;
+}
+
+function retention() {
+  pruneAccessLog();
   if (dropped) {
     console.warn(`[access-log] dropped ${dropped} records under load`);
     dropped = 0;
@@ -398,15 +410,32 @@ export type RecentAccess = Pick<AccessEntry, 'id' | 'ts' | 'host' | 'method' | '
  * the caller already has (the response's `last`), so polling only returns what's new. Leaves out the visitor key,
  * full referrer and user agent: the board shows where requests go, not who sent them.
  */
-export function recentAccess(after?: number, limit = 50): { entries: RecentAccess[]; last: number } {
+/** `only`: just these services (a project-limited token's); null or missing = all. */
+export function recentAccess(after?: number, limit = 50, only?: Set<string> | null): { entries: RecentAccess[]; last: number } {
   flushAccessLog();
   const n = Math.max(1, Math.min(Number.isFinite(limit) ? Math.floor(limit) : 50, 200));
+  if (only) {
+    const ids = [...only];
+    if (!ids.length) return { entries: [], last: after !== undefined && Number.isFinite(after) ? after : 0 };
+    const inList = `service_id IN (${ids.map(() => '?').join(', ')})`;
+    const since = after !== undefined && Number.isFinite(after) ? after : 0;
+    const rows = db.prepare(`SELECT id, service_id, ts, host, method, path, status, ms, bot, ref_host, ua FROM access_log WHERE id > ? AND ${inList} ORDER BY id DESC LIMIT ?`).all(since, ...ids, n) as any[];
+    // The cursor moves over these services' rows only (the instance-wide count is not theirs to see).
+    const top = (db.prepare(`SELECT MAX(id) AS id FROM access_log WHERE ${inList}`).get(...ids) as { id: number | null }).id ?? 0;
+    return { entries: rows.map(recentEntry), last: Math.max(since, top) };
+  }
   const rows = (
     after !== undefined && Number.isFinite(after)
       ? db.prepare('SELECT id, service_id, ts, host, method, path, status, ms, bot, ref_host, ua FROM access_log WHERE id > ? ORDER BY id DESC LIMIT ?').all(after, n)
       : db.prepare('SELECT id, service_id, ts, host, method, path, status, ms, bot, ref_host, ua FROM access_log ORDER BY id DESC LIMIT ?').all(n)
   ) as any[];
-  const entries = rows.map((r) => ({
+  const entries = rows.map(recentEntry);
+  const top = (db.prepare('SELECT MAX(id) AS id FROM access_log').get() as { id: number | null }).id ?? 0;
+  return { entries, last: Math.max(after ?? 0, top) };
+}
+
+function recentEntry(r: any): RecentAccess {
+  return {
     id: r.id,
     serviceId: r.service_id,
     ts: r.ts,
@@ -418,9 +447,7 @@ export function recentAccess(after?: number, limit = 50): { entries: RecentAcces
     bot: !!r.bot,
     botName: r.bot ? botName(r.ua) : null,
     refHost: r.ref_host && r.ref_host !== r.host ? r.ref_host : '',
-  }));
-  const top = (db.prepare('SELECT MAX(id) AS id FROM access_log').get() as { id: number | null }).id ?? 0;
-  return { entries, last: Math.max(after ?? 0, top) };
+  };
 }
 
 export type AccessTotals = { requests: number; errors: number; bots: number; visitors: number };

@@ -22,18 +22,22 @@ import { referencedServices, publicUrl, resolveEnv, hostUrl } from './vars.ts';
 import { certsTable } from './db.ts';
 import { isLocalHost } from './certs.ts';
 import { getSettings, destinationById } from './settings.ts';
-import { backupMethod, backupService, listBackups, isRestoring } from './backups.ts';
+import { backupMethod, backupService, listBackups, isRestoring, ensureSafetyBackup, safetyPolicy, publicBackup } from './backups.ts';
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
 import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume, borrowersOf } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { clusterStatus } from './pgcluster.ts';
+import { autoRestartInfo } from './autorestart.ts';
 import { isExternal, isRoute, parseExternalUrl, parseRedirect, externalTarget } from './external.ts';
-import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
+import { allocateTcpPort, tcpPortInUse, portFree, internalHeaders } from './proxy.ts';
+import { mergeAccess, publicAccess, accessWarnings, setBasicAuthPassword, deleteBasicAuth, copyBasicAuth, exportAccess, importAccess } from './access.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
 import { config } from './config.ts';
+import { assertDisk } from './diskguard.ts';
 import { validateCron, nextRun, validTimeZone } from './cron.ts';
 import { runJob, listRuns, isJobRunning, killJobs } from './cronjobs.ts';
+import { scheduleInfo } from './schedstate.ts';
 
 const PROJECT_COLORS = ['#d4f25a', '#7ce0c3', '#f2a65a', '#9fb4ff', '#f27a9b', '#c9a7ff', '#5ad1f2'];
 
@@ -50,6 +54,9 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.tcpAddress = s.publicTcpPort ? `${config.proxyHost === '0.0.0.0' ? 'localhost' : config.proxyHost}:${s.publicTcpPort}` : null;
   out.pendingChanges = pendingChanges(s);
   out.accessLog = s.accessLog !== false;
+  // Access rules without the password hash (kept apart from the record anyway), and what may defeat them.
+  out.access = publicAccess(s);
+  out.accessWarnings = accessWarnings(s);
   const iu = imageUpdateOf(s.id);
   // Stale once the image (or, for a build, the base image of the running build) changes.
   const target = iu || isBuild(s) ? checkTarget(s) : null;
@@ -70,7 +77,19 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.deployedSchedule = live;
   out.nextRunAt = live && !s.stopped ? nextRun(live, new Date(), s.scheduleTz)?.getTime() ?? null : null;
   out.jobRunning = isJobRunning(s.id);
+  // Scheduled jobs and backups: catch-up of missed starts, and a failure streak ("failing since") if there is one.
+  if (live || s.schedule) {
+    const info = scheduleInfo('job', s.id);
+    out.cron = { catchUp: s.scheduleCatchUp === true, catchUpExplicit: s.scheduleCatchUp != null, ...info };
+  }
+  if (s.backup?.enabled) {
+    const b = scheduleInfo('backup', s.id);
+    const t = scheduleInfo('test', s.id);
+    out.backupHealth = { catchUp: s.backup.catchUp !== false, failing: b.failing, pendingCatchUp: b.pendingCatchUp, testFailing: s.backup.testSchedule ? t.failing : null };
+  }
   out.backupMethod = backupMethod(s);
+  // What protects a new image on this service's data, and its volumes when they are deleted (setting or default).
+  out.safetyPolicy = { deploy: safetyPolicy(s, 'deploy'), delete: safetyPolicy(s, 'delete') };
   out.clusterStatus = clusterStatus(s);
   const node = nodeOf(s);
   out.server = { id: node, name: node === LOCAL ? 'This machine' : nodeName(node), online: isOnline(node) };
@@ -78,6 +97,7 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   out.crossServerRefs = referencedServicesOn(s);
   out.external = externalTarget(s);
   out.restoring = isRestoring(s.id);
+  out.autoRestart = autoRestartInfo(s);
   return out as Service & { url: string | null; tcpAddress: string | null; pendingChanges: string[] };
 }
 
@@ -238,7 +258,9 @@ export async function deleteProject(actor: Actor, projectId: string) {
   const p = getProjectOrThrow(projectId);
   // A base project takes its environments (and previews) with it.
   if (!p.parentId) for (const env of projectsTable.all().filter((x) => x.parentId === p.id)) await deleteProject(actor, env.id);
-  for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true, deleteVolumes: true }); // a project goes with its data
+  // A project goes with its data. Deleting a whole project is unchanged by safety backups (it is the cleanup path of
+  // every script); deleting a service's volumes or a volume on its own is where they apply.
+  for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true, deleteVolumes: true, skipSafetyBackup: true });
   await deleteProjectVolumes(p.id);
   projectsTable.delete(p.id);
   bus.publish({ type: 'project.deleted', projectId: p.id });
@@ -511,6 +533,8 @@ export const updateServiceInput = z.object({
       intervalSec: z.number().min(1).max(300).optional(),
       timeoutSec: z.number().min(1).max(60).optional(),
       graceSec: z.number().min(5).max(1800).optional(),
+      autoRestart: z.boolean().nullable().optional().describe('Restart a replica that keeps failing its health check while it runs (hung). On by default; null = back to the default'),
+      restartAfterSec: z.number().int().min(10).max(86400).nullable().optional().describe('How long a running replica must keep failing its health check before it is restarted (default 120); null = the default'),
     })
     .optional(),
   autoscale: z
@@ -548,6 +572,28 @@ export const updateServiceInput = z.object({
   buildTarget: z.string().max(64).nullable().optional().describe('Multi-stage build target'),
   sleepAfterMinutes: z.number().int().min(1).max(1440).nullable().optional().describe('HTTP services: stop after this many idle minutes; the next request starts it again (takes a few seconds)'),
   accessLog: z.boolean().optional().describe('HTTP services: record the router access log (requests, referrers, user agents; no IPs). On by default; takes effect immediately'),
+  access: z
+    .object({
+      allow: z.array(z.string()).max(500).nullable().optional().describe('Only these IPs/CIDRs (IPv4 or IPv6) may connect; "private" = private networks only (RFC 1918, loopback, ULA, link-local, 100.64.0.0/10 for Tailscale). Empty/null = anyone'),
+      deny: z.array(z.string()).max(500).nullable().optional().describe('These IPs/CIDRs are refused (403), checked before allow'),
+      basicAuth: z
+        .object({
+          username: z.string().min(1).max(100),
+          password: z.string().max(200).nullable().optional().describe('At least 8 characters; stored hashed. Leave out (or send the mask) to keep the current one'),
+          exemptPaths: z.array(z.string()).max(50).nullable().optional().describe('Path prefixes that skip basic auth, e.g. /api/public'),
+        })
+        .nullable()
+        .optional()
+        .describe('HTTP basic auth (401 without the right user name and password); null = off'),
+      rateLimit: z
+        .object({ requests: z.number().int().min(1).max(1_000_000), perSeconds: z.number().int().min(1).max(86_400) })
+        .nullable()
+        .optional()
+        .describe('Requests per client address per window (429 with Retry-After beyond it); null = off'),
+    })
+    .nullable()
+    .optional()
+    .describe('Router access control. Fields left out stay as they are; null clears them all. IP lists also apply to TCP routes; basic auth and rate limits only to HTTP. Takes effect immediately'),
   imageAutoUpdate: z.boolean().optional().describe('Image services: redeploy automatically when a new image is published under the same tag (not for databases or clusters)'),
   watchPaths: z.array(z.string().min(1).max(200)).max(50).nullable().optional().describe('Git: deploy only when a push changes files matching these globs (e.g. apps/web/**, !**/*.md)'),
   preDeployCommand: z.string().max(2000).nullable().optional().describe('Runs once per new deploy (e.g. migrations) in a one-off container from the new image; a failure stops the deploy'),
@@ -560,10 +606,20 @@ export const updateServiceInput = z.object({
       schedule: z.string().optional().describe('Cron expression, e.g. "0 3 * * *" for 03:00 daily'),
       retention: z.number().int().min(1).max(365).optional().describe('How many backups to keep'),
       destinationId: z.string().optional().describe('"local" or a destination id from settings'),
+      testSchedule: z.string().nullable().optional().describe('Cron expression for test restores of the newest backup (restored into a scratch volume / throwaway database), e.g. "0 5 * * 0" weekly; null = none'),
+      catchUp: z.boolean().nullable().optional().describe('Run a scheduled backup (and test restore) missed while Servify was down once, late, within the catch-up window (half the interval, at most 24 h). null = the default: on'),
     })
     .nullable()
     .optional()
     .describe('Scheduled backups of the service data (databases are dumped, other volumes archived)'),
+  safetyBackup: z
+    .object({
+      mode: z.enum(['off', 'auto', 'require']).optional().describe('off: never; auto: reuse a recent backup, else take one; require: reuse a recent backup, else refuse'),
+      maxAgeHours: z.number().int().min(0).max(24 * 30).optional().describe('How old a successful backup may be and still count (0 = always take a fresh one)'),
+    })
+    .nullable()
+    .optional()
+    .describe('Safety backups before a new image starts on the data (deploys, rollbacks, auto-updates) and before its volumes are deleted. null = the default: on (24 h) when scheduled backups are on'),
   external: z.string().optional().describe('New address of an external route (owner only)'),
   udp: z.boolean().optional().describe('External TCP routes: also forward UDP on the proxy port'),
   redirect: z.string().optional().describe('Redirects: new target URL'),
@@ -579,6 +635,11 @@ export const updateServiceInput = z.object({
     .describe('Database cluster settings: failoverAfterSec (0 = manual only), synchronous replication. Use switchover to change the primary.'),
   schedule: z.string().nullable().optional().describe('Cron expression (e.g. "*/15 * * * *", "@daily"). Turns the service into a scheduled job; null to clear.'),
   scheduleTz: z.string().max(64).nullable().optional().describe('Time zone the schedule is read in, e.g. "Europe/Berlin" or "UTC". null or empty = the server\'s local time.'),
+  scheduleCatchUp: z
+    .boolean()
+    .nullable()
+    .optional()
+    .describe('Scheduled jobs: run once, late, for a start missed while Servify was down or the job\'s server offline — only within the catch-up window (half the interval, at most 24 h). null = the default: off (a job may not be safe to run late)'),
   x: z.number().optional(),
   y: z.number().optional(),
 });
@@ -676,7 +737,12 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     set('replicas', patch.replicas, 'replicas');
   }
   if (patch.strategy !== undefined) set('strategy', patch.strategy, 'load balancing');
-  if (patch.healthcheck) set('healthcheck', { ...svc.healthcheck, ...patch.healthcheck, path: patch.healthcheck.path === undefined ? svc.healthcheck.path : patch.healthcheck.path || null }, 'health check');
+  if (patch.healthcheck) {
+    const hc: any = { ...svc.healthcheck, ...patch.healthcheck, path: patch.healthcheck.path === undefined ? svc.healthcheck.path : patch.healthcheck.path || null };
+    // null = back to the instance default (stored as absent).
+    for (const k of ['autoRestart', 'restartAfterSec']) if (hc[k] === null) delete hc[k];
+    set('healthcheck', hc, 'health check');
+  }
   if (patch.autoscale) {
     const a = { ...svc.autoscale, ...patch.autoscale };
     if (a.max < a.min) a.max = a.min;
@@ -687,7 +753,9 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.publicHttp !== undefined) set('publicHttp', patch.publicHttp, 'public networking');
   if (patch.domains !== undefined) {
     const clean = [...new Set(patch.domains.map((d) => d.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')).filter(Boolean))];
+    const dashboardDomain = getSettings().dashboardDomain;
     for (const d of clean) {
+      if (dashboardDomain && d === dashboardDomain) throw new HttpError(409, `${d} is the dashboard's domain (Settings → HTTPS)`);
       const clash = servicesTable.all().find((s) => s.id !== svc.id && s.domains.includes(d));
       if (clash) throw new HttpError(409, `domain ${d} is already used by ${clash.name}`);
     }
@@ -718,6 +786,12 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   }
   if (patch.imageAutoUpdate !== undefined) set('imageAutoUpdate', patch.imageAutoUpdate, 'image auto-update');
   if (patch.accessLog !== undefined) set('accessLog', patch.accessLog, 'access log');
+  let accessPassword: string | null = null;
+  if (patch.access !== undefined) {
+    const merged = mergeAccess(svc, patch.access as any);
+    accessPassword = merged.password;
+    set('access', merged.access ?? undefined, 'access control');
+  }
   if (patch.watchPaths !== undefined) set('watchPaths', patch.watchPaths?.map((p) => p.trim()).filter(Boolean).length ? patch.watchPaths.map((p) => p.trim()).filter(Boolean) : null, 'watch paths');
   if (patch.preDeployCommand !== undefined) set('preDeployCommand', patch.preDeployCommand?.trim() || null, 'pre-deploy command');
   if (patch.resources) set('resources', { ...svc.resources, ...patch.resources } as Service['resources'], 'resources');
@@ -727,10 +801,24 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (patch.backup === null) set('backup', null, 'backups');
     else {
       const b = { enabled: false, schedule: '0 3 * * *', retention: 7, destinationId: 'local', ...(svc.backup ?? {}), ...patch.backup };
+      if (b.catchUp == null) delete b.catchUp; // the default (on)
       const err = validateCron(b.schedule);
       if (err) throw new HttpError(400, `invalid backup schedule: ${err}`);
+      if (b.testSchedule) {
+        const terr = validateCron(b.testSchedule);
+        if (terr) throw new HttpError(400, `invalid test restore schedule: ${terr}`);
+      }
       if (!destinationById(b.destinationId)) throw new HttpError(400, `unknown backup destination: ${b.destinationId}`);
       set('backup', b, 'backups');
+    }
+  }
+  if (patch.safetyBackup !== undefined) {
+    if (patch.safetyBackup === null) set('safetyBackup', null, 'safety backups');
+    else {
+      const cur = safetyPolicy(svc, 'deploy');
+      const b = { mode: patch.safetyBackup.mode ?? cur.mode, maxAgeHours: patch.safetyBackup.maxAgeHours ?? cur.maxAgeHours };
+      if (b.mode === 'require' && b.maxAgeHours < 1) throw new HttpError(400, 'requiring a recent backup needs a maximum age of at least 1 hour');
+      set('safetyBackup', b, 'safety backups');
     }
   }
   if (patch.cluster !== undefined) {
@@ -755,6 +843,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (tz && !validTimeZone(tz)) throw new HttpError(400, `unknown time zone: ${tz} (use a name like Europe/Berlin or UTC)`);
     set('scheduleTz', tz, 'schedule time zone');
   }
+  if (patch.scheduleCatchUp !== undefined) set('scheduleCatchUp', patch.scheduleCatchUp ?? null, 'catch-up of missed runs');
   if (patch.icon === undefined && (changes.includes('schedule') || changes.includes('source'))) {
     const base = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.baseImage?.ref : null;
     const icon = betterIcon(svc, base);
@@ -772,6 +861,9 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   for (const k of new Set([...Object.keys(cur), ...Object.keys(svc)]) as Set<keyof Service>) if (!touched.has(k)) (svc as any)[k] = (cur as any)[k];
   if (touched.has('cluster') && svc.cluster && cur.cluster) svc.cluster = { ...svc.cluster, primary: cur.cluster.primary }; // settings change; the primary is the cluster's to decide
   svc.updatedAt = Date.now();
+  // The password is hashed into its own sealed record; the service only keeps the user name and when it was set.
+  if (accessPassword) setBasicAuthPassword(svc.id, accessPassword);
+  else if (touched.has('access') && !svc.access?.basicAuth) deleteBasicAuth(svc.id);
   servicesTable.put(svc);
   if (changes.includes('volumes')) syncServiceVolumes(svc);
   bus.publish({ type: 'service.updated', service: svc });
@@ -935,33 +1027,56 @@ export async function scaleService(actor: Actor, serviceId: string, replicas: nu
  * Deploy the service's current settings. A registry image is pulled when it isn't on the server yet or is `:latest`,
  * and a failed pull fails the deployment. `useCachedImage` deploys the copy already on the server instead (registry down).
  */
-export function deployService(actor: Actor, serviceId: string, trigger: 'manual' | 'agent' | 'git' | 'config' = actor.type === 'agent' ? 'agent' : 'manual', opts: { useCachedImage?: boolean } = {}) {
+/**
+ * For the explicit deploy requests (REST, MCP): a build needs room on the data disk and the Docker disk, so it is
+ * refused at once (507) while either is protected. Every other path (imports, hooks, previews…) finds out in the
+ * deploy itself, which fails with the same message; image pulls are always decided there (the image may be present).
+ */
+export function assertCanBuild(serviceId: string) {
+  const svc = getServiceOrThrow(serviceId);
+  if (svc.source.type !== 'image' && svc.source.type !== 'external' && svc.source.type !== 'redirect' && !svc.cluster) assertDisk('build', svc.nodeId);
+}
+
+export function deployService(
+  actor: Actor,
+  serviceId: string,
+  trigger: 'manual' | 'agent' | 'git' | 'config' = actor.type === 'agent' ? 'agent' : 'manual',
+  opts: { useCachedImage?: boolean; skipSafetyBackup?: boolean } = {},
+) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'deploy');
   if (svc.stopped) {
     svc.stopped = false;
     servicesTable.put(svc);
   }
-  return serializeDeployment(queueDeployment(svc, trigger, actor, opts.useCachedImage && svc.source.type === 'image' ? { useCachedImage: true } : {}));
+  return serializeDeployment(queueDeployment(svc, trigger, actor, { ...(opts.useCachedImage && svc.source.type === 'image' ? { useCachedImage: true } : {}), skipSafetyBackup: opts.skipSafetyBackup }));
+}
+
+/** The safety backup before switching versions (purpose "switch"): a refusal stops the switch before anything changed. */
+async function backUpBeforeSwitch(actor: Actor, svc: Service, what: string, skip?: boolean): Promise<string | null> {
+  if (skip) {
+    recordActivity(actor, 'backup.skipped', `${what} without a safety backup (skipped by ${actor.name})`, svc.projectId, svc.id);
+    return null;
+  }
+  // The deploy that follows relies on this backup instead of looking (or, set to "always fresh", backing up) again.
+  return (await ensureSafetyBackup(svc, { purpose: 'switch', actor, what: what.replace(/^./, (c) => c.toLowerCase()) })).backup?.id ?? null;
 }
 
 /**
  * Update an image service: pull its image again (a new image under the same tag) or switch to another tag first,
  * then deploy. It always pulls, even an image that only exists on this server, and a failed pull fails the deployment.
  */
-export async function updateServiceImage(actor: Actor, serviceId: string, tag?: string | null) {
+export async function updateServiceImage(actor: Actor, serviceId: string, tag?: string | null, opts: { skipSafetyBackup?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'update');
-  if (isBuild(svc)) return updateBuildBase(actor, svc, tag ?? null);
+  if (isBuild(svc)) return updateBuildBase(actor, svc, tag ?? null, opts);
   if (svc.source.type !== 'image') throw new HttpError(400, `${svc.name} doesn't run a registry image`);
+  let safetyBackupId: string | null = null;
   if (tag) {
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag)) throw new HttpError(400, 'not a valid tag');
     // A newer version may upgrade the data in place, after which the old image may not start on it: back up first.
-    if (backupMethod(svc)) {
-      const b = await backupService(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
-      if (b.status !== 'succeeded') throw new HttpError(409, `the safety backup ${b.status}${b.error ? ` (${b.error})` : ''} — ${svc.name} was not switched`);
-    }
     const [image] = splitImageRef(normalizeImageRef(svc.source.image));
+    safetyBackupId = await backUpBeforeSwitch(actor, svc, `Switching ${svc.name} to ${image}:${tag}`, opts.skipSafetyBackup);
     await updateService(actor, svc.id, { image: `${image}:${tag}` }, { quiet: true });
     recordActivity(actor, 'service.updated', `Updating ${svc.name} to ${image}:${tag}`, svc.projectId, svc.id);
   } else recordActivity(actor, 'service.updated', `Updating ${svc.name}: pulling ${svc.source.image} again`, svc.projectId, svc.id);
@@ -970,7 +1085,7 @@ export async function updateServiceImage(actor: Actor, serviceId: string, tag?: 
     fresh.stopped = false;
     servicesTable.put(fresh);
   }
-  return serializeDeployment(queueDeployment(fresh, 'update', actor));
+  return serializeDeployment(queueDeployment(fresh, 'update', actor, { skipSafetyBackup: opts.skipSafetyBackup, safetyBackupId }));
 }
 
 /**
@@ -978,20 +1093,18 @@ export async function updateServiceImage(actor: Actor, serviceId: string, tag?: 
  * build argument its tag comes from (`FROM nextcloud:${NEXTCLOUD_TAG}`) to a newer tag. A tag written into the
  * Dockerfile itself is the user's to change there.
  */
-async function updateBuildBase(actor: Actor, svc: Service, tag: string | null) {
+async function updateBuildBase(actor: Actor, svc: Service, tag: string | null, opts: { skipSafetyBackup?: boolean } = {}) {
   const b = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.baseImage : null;
   if (!b) throw new HttpError(409, `${svc.name}'s running build has no recorded base image — deploy it once`);
+  let safetyBackupId: string | null = null;
   if (tag) {
     if (!/^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag)) throw new HttpError(400, 'not a valid tag');
     if (!b.tagArg) throw new HttpError(409, `the base image tag is written in the Dockerfile (FROM ${b.ref}) — change it there and deploy`);
     const current = svc.buildArgs?.[b.tagArg];
     if (current?.includes('${')) throw new HttpError(409, `the build argument ${b.tagArg} comes from a variable (${current}) — change that instead`);
-    if (backupMethod(svc)) {
-      const bk = await backupService(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
-      if (bk.status !== 'succeeded') throw new HttpError(409, `the safety backup ${bk.status}${bk.error ? ` (${bk.error})` : ''} — ${svc.name} was not switched`);
-    }
-    await updateService(actor, svc.id, { buildArgs: { ...(svc.buildArgs ?? {}), [b.tagArg]: tag } }, { quiet: true });
     const [image] = splitImageRef(b.ref);
+    safetyBackupId = await backUpBeforeSwitch(actor, svc, `Rebuilding ${svc.name} on ${image}:${tag}`, opts.skipSafetyBackup);
+    await updateService(actor, svc.id, { buildArgs: { ...(svc.buildArgs ?? {}), [b.tagArg]: tag } }, { quiet: true });
     recordActivity(actor, 'service.updated', `Rebuilding ${svc.name} on ${image}:${tag} (build argument ${b.tagArg})`, svc.projectId, svc.id);
   } else recordActivity(actor, 'service.updated', `Rebuilding ${svc.name} on a freshly pulled ${b.ref}`, svc.projectId, svc.id);
   const fresh = getServiceOrThrow(svc.id);
@@ -999,7 +1112,7 @@ async function updateBuildBase(actor: Actor, svc: Service, tag: string | null) {
     fresh.stopped = false;
     servicesTable.put(fresh);
   }
-  return serializeDeployment(queueDeployment(fresh, 'update', actor));
+  return serializeDeployment(queueDeployment(fresh, 'update', actor, { skipSafetyBackup: opts.skipSafetyBackup, safetyBackupId }));
 }
 
 /**
@@ -1154,21 +1267,23 @@ export function moveServiceToProject(actor: Actor, serviceId: string, targetRef:
   return serializeService(moved);
 }
 
-export function restartService(actor: Actor, serviceId: string) {
+/** Restarts bring back the running image (no safety backup needed) — unless it has to be built again. */
+export function restartService(actor: Actor, serviceId: string, opts: { skipSafetyBackup?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'restart');
   const active = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
-  if (!active?.image) return deployService(actor, serviceId);
-  return serializeDeployment(queueDeployment(svc, 'restart', actor, { image: active.image, port: active.port, fromDeployment: active }));
+  if (!active?.image) return deployService(actor, serviceId, undefined, opts);
+  return serializeDeployment(queueDeployment(svc, 'restart', actor, { image: active.image, port: active.port, fromDeployment: active, skipSafetyBackup: opts.skipSafetyBackup }));
 }
 
-export function rollbackService(actor: Actor, serviceId: string, deploymentId: string) {
+/** An older image on today's data is a new image too: it gets the same safety backup as a deploy. */
+export function rollbackService(actor: Actor, serviceId: string, deploymentId: string, opts: { skipSafetyBackup?: boolean } = {}) {
   notExternal(getServiceOrThrow(serviceId), 'roll back');
   const svc = getServiceOrThrow(serviceId);
   const target = deploymentsTable.get(deploymentId);
   assert(target && target.serviceId === svc.id, 404, 'deployment not found for this service');
   assert(target.image, 400, 'that deployment has no image to roll back to');
-  return serializeDeployment(queueDeployment(svc, 'rollback', actor, { image: target.image, port: target.port, fromDeployment: target }));
+  return serializeDeployment(queueDeployment(svc, 'rollback', actor, { image: target.image, port: target.port, fromDeployment: target, skipSafetyBackup: opts.skipSafetyBackup }));
 }
 
 export function cancelDeployment(actor: Actor, deploymentId: string) {
@@ -1227,11 +1342,28 @@ export function startService(actor: Actor, serviceId: string) {
   return { service: serializeService(svc), deployment: null };
 }
 
-/** Deletes the service. Its volumes stay as detached volumes (data intact) unless `deleteVolumes` is set. */
-export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; deleteVolumes?: boolean } = {}) {
+/**
+ * Deletes the service. Its volumes stay as detached volumes (data intact) unless `deleteVolumes` is set — then a recent
+ * backup of their data must exist, or is taken first (refused, with nothing deleted, when it can't be); `skipSafetyBackup`
+ * goes ahead without one. It never implies `deleteVolumes`.
+ */
+export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; deleteVolumes?: boolean; skipSafetyBackup?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   assert(isOnline(nodeOf(svc)), 409, `${svc.name} runs on ${nodeName(nodeOf(svc))}, which is offline — bring it back online before deleting`);
+  // Only volumes that really go: adopted ones and ones others still read are kept as detached volumes anyway.
+  const doomed = opts.deleteVolumes
+    ? svc.volumes.some((m) => {
+        if (m.hostPath || m.borrowed) return false;
+        const rec = m.volumeId ? volumesTable.get(m.volumeId) : null;
+        return !rec || (!rec.adopted && !borrowersOf(rec).length);
+      })
+    : false;
+  if (doomed) {
+    if (opts.skipSafetyBackup) recordActivity(actor, 'backup.skipped', `Deleting ${svc.name} and its volumes without a safety backup (skipped by ${actor.name})`, svc.projectId, svc.id);
+    else await ensureSafetyBackup(svc, { purpose: 'delete', actor, what: `deleting ${svc.name} and its volumes` });
+  }
   servicesTable.delete(svc.id);
+  deleteBasicAuth(svc.id);
   removeUploads(svc.id);
   bus.publish({ type: 'service.deleted', serviceId: svc.id, projectId: svc.projectId });
   if (!opts.quiet) recordActivity(actor, 'service.deleted', `Deleted ${svc.name}`, svc.projectId, null);
@@ -1305,14 +1437,32 @@ export function followServiceLogs(serviceId: string, onLine: (l: LogLine) => voi
   return subscribeLogs(serviceId, onLine);
 }
 
-export async function execInService(actor: Actor, serviceId: string, command: string, replica?: number) {
+/** A command for exec: a string runs through `/bin/sh -c`; an array is the argv itself (no shell, no word splitting). */
+export function execArgv(command: unknown): string[] {
+  if (typeof command === 'string') {
+    assert(command.trim(), 400, 'command is required');
+    return ['/bin/sh', '-c', command];
+  }
+  assert(Array.isArray(command) && command.length > 0 && command.length <= 1000, 400, 'command must be a string or a non-empty array of strings');
+  assert(command.every((a) => typeof a === 'string'), 400, 'command must be a string or a non-empty array of strings');
+  assert(command[0].length > 0, 400, 'the first element of command (the program) must not be empty');
+  assert(command.reduce((n, a) => n + a.length, 0) <= 128 * 1024, 400, 'command is too long');
+  return command as string[];
+}
+
+/** An argv as a shell would read it back (for the activity log). */
+const shellQuote = (argv: string[]) => argv.map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`)).join(' ');
+
+export async function execInService(actor: Actor, serviceId: string, command: string | string[], replica?: number) {
   const svc = getServiceOrThrow(serviceId);
+  const argv = execArgv(command);
   const reps = replicasOf(svc.id).filter((r) => r.dockerState === 'running' && r.deploymentId === svc.activeDeploymentId);
   const target = replica !== undefined ? reps.find((r) => r.index === replica) : reps[0];
   assert(target, 400, `${svc.name} has no running replica${replica !== undefined ? ` #${replica}` : ''}`);
-  recordActivity(actor, 'service.exec', `Ran \`${command.slice(0, 80)}\` in ${svc.name}#${target.index}`, svc.projectId, svc.id);
+  const shown = typeof command === 'string' ? command : shellQuote(argv);
+  recordActivity(actor, 'service.exec', `Ran \`${shown.slice(0, 80)}\` in ${svc.name}#${target.index}`, svc.projectId, svc.id);
   // Long enough for migrations and one-off scripts; the deadline only stops a command that never exits.
-  return dockerForContainer(target.containerId).exec(target.containerId, ['/bin/sh', '-c', command], 10 * 60_000);
+  return dockerForContainer(target.containerId).exec(target.containerId, argv, 10 * 60_000);
 }
 
 export function serviceMetrics(serviceId: string, seconds = 300) {
@@ -1334,9 +1484,15 @@ export function deploymentLogs(deploymentId: string) {
   });
 }
 
-export function listActivity(opts: { projectId?: string; limit?: number } = {}) {
+/** projectIds: only entries of these projects (a project-limited token's reach); null or missing = everything. */
+export function listActivity(opts: { projectId?: string; limit?: number; projectIds?: Set<string> | null } = {}) {
   const limit = Math.min(opts.limit ?? 100, 500);
   if (opts.projectId) return activityTable.all('WHERE project_id = ? ORDER BY created_at DESC LIMIT ?', opts.projectId, limit);
+  if (opts.projectIds) {
+    const ids = [...opts.projectIds];
+    if (!ids.length) return [];
+    return activityTable.all(`WHERE project_id IN (${ids.map(() => '?').join(', ')}) ORDER BY created_at DESC LIMIT ?`, ...ids, limit);
+  }
   return activityTable.all('ORDER BY created_at DESC LIMIT ?', limit);
 }
 
@@ -1415,7 +1571,7 @@ export function loadTest(actor: Actor, serviceId: string, rps: number, seconds: 
     carry += perTick;
     while (carry >= 1) {
       carry -= 1;
-      const req = httpMod.get({ host: '127.0.0.1', port: config.proxyPort, path: '/', headers: { host, 'user-agent': 'servify-loadtest' }, agent }, (res) => res.resume());
+      const req = httpMod.get({ host: '127.0.0.1', port: config.proxyPort, path: '/', headers: { host, 'user-agent': 'servify-loadtest', ...internalHeaders() }, agent }, (res) => res.resume());
       req.on('error', () => {});
       req.setTimeout(5000, () => req.destroy());
     }
@@ -1455,12 +1611,19 @@ export async function duplicateService(actor: Actor, serviceId: string) {
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
   const r = await createService(actor, src.projectId, input, { trustedPath: true }); // the same folder as the original
   if (s.type === 'upload' && s.uploadId) copyUpload(src.id, r.service.id, s);
-  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, scheduleTz: src.scheduleTz ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, accessLog: src.accessLog !== false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, scheduleTz: src.scheduleTz ?? null, scheduleCatchUp: src.scheduleCatchUp ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, accessLog: src.accessLog !== false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
     svc.icon = src.icon;
     servicesTable.put(svc);
+  }
+  // A copy of a protected service is protected the same way (same password).
+  if (src.access && svc.protocol === src.protocol) {
+    svc.access = structuredClone(src.access);
+    if (src.access.basicAuth) copyBasicAuth(src.id, svc.id);
+    servicesTable.put(svc);
+    bus.publish({ type: 'service.updated', service: svc });
   }
   const deployment = deployService(actor, svc.id);
   return { service: serializeService(servicesTable.get(svc.id)!), deployment };
@@ -1477,7 +1640,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'accessLog', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'scheduleTz', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'accessLog', 'access', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'scheduleTz', 'scheduleCatchUp', 'backup', 'safetyBackup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1493,6 +1656,9 @@ export function exportProject(projectId: string, opts: { secrets?: boolean } = {
       out.volumes = (out.volumes ?? []).map(({ volumeId, ...v }: any) => v);
       // Which server it runs on (by name, so a spec stays readable); imports keep it when that server exists.
       if (s.nodeId) out.server = nodesTable.get(s.nodeId)?.name ?? s.nodeId;
+      // Access rules travel with the spec (environments and previews stay as private); the hash only with secrets.
+      out.access = exportAccess(s, !!opts.secrets);
+      if (!out.access) delete out.access;
       if (!opts.secrets) {
         for (const k of s.secretKeys) if (k in out.env && !/\$\{\{/.test(out.env[k])) out.env[k] = '';
         if (out.source?.type === 'git') delete out.source.token;
@@ -1500,6 +1666,14 @@ export function exportProject(projectId: string, opts: { secrets?: boolean } = {
       return out;
     }),
   };
+}
+
+/** A spec's safety backup setting, checked like a PATCH (anything else: the default). */
+function importedSafety(raw: unknown): Service['safetyBackup'] {
+  const v = updateServiceInput.shape.safetyBackup.safeParse(raw).data;
+  if (!v?.mode) return null;
+  const maxAgeHours = v.maxAgeHours ?? 24;
+  return { mode: v.mode, maxAgeHours: v.mode === 'require' && maxAgeHours < 1 ? 24 : maxAgeHours };
 }
 
 export async function importProject(actor: Actor, spec: ProjectSpec, opts: { deploy?: boolean; name?: string; trustedPaths?: boolean } = {}) {
@@ -1559,7 +1733,9 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),
       schedule: raw.schedule ?? null,
       scheduleTz: raw.scheduleTz && validTimeZone(raw.scheduleTz) ? raw.scheduleTz : null,
+      scheduleCatchUp: typeof raw.scheduleCatchUp === 'boolean' ? raw.scheduleCatchUp : null,
       backup: raw.backup ?? null,
+      safetyBackup: importedSafety(raw.safetyBackup),
       aliases: (raw.aliases ?? []).filter((a) => /^[a-z0-9]([a-z0-9_.-]*[a-z0-9])?$/.test(a)),
       cmd: raw.cmd ?? null,
       entrypoint: raw.entrypoint ?? null,
@@ -1568,6 +1744,8 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       cluster: raw.cluster ? { ...raw.cluster, primary: 0 } : svc.cluster ?? null,
     } satisfies Partial<Service>);
     if (svc.protocol === 'tcp' && !svc.publicTcpPort) svc.publicTcpPort = await allocateTcpPort();
+    const access = importAccess(svc, (raw as any).access);
+    if (access) svc.access = access;
     // Keep the template's fresh volume where the spec mounts the same path; drop the ones it doesn't use.
     const prevMounts = servicesTable.get(svc.id)!.volumes;
     svc.volumes = svc.volumes.map((v) => {
@@ -1592,7 +1770,12 @@ export async function backupNow(actor: Actor, serviceId: string, destinationId?:
 }
 
 export function serviceBackups(serviceId: string, limit = 50) {
-  return listBackups(getServiceOrThrow(serviceId).id, limit);
+  // Backups outlive what they were of: a deleted service's, or a deleted volume's safety backup (listed by its id).
+  if (!servicesTable.get(serviceId)) {
+    const kept = listBackups(serviceId, limit);
+    if (kept.length) return kept.map(publicBackup);
+  }
+  return listBackups(getServiceOrThrow(serviceId).id, limit).map(publicBackup);
 }
 
 export function planComposeImport(input: { yaml: string; env?: string; basePath?: string; name?: string }) {

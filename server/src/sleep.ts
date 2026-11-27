@@ -18,6 +18,11 @@ const WAKE_TIMEOUT = 90_000;
 const lastHit = new Map<string, number>();
 const startedAt = Date.now();
 const waking = new Map<string, Promise<boolean>>();
+const wokeAt = new Map<string, number>();
+
+/** Being woken up right now, or when it last was (null = not since Servify started). */
+export const isWaking = (serviceId: string) => waking.has(serviceId);
+export const lastWokenAt = (serviceId: string) => wokeAt.get(serviceId) ?? null;
 
 /** The router saw a request for this service. */
 export function touch(serviceId: string) {
@@ -65,6 +70,7 @@ export function wake(serviceId: string, why = 'a request'): Promise<boolean> {
       bus.publish({ type: 'service.updated', service: svc });
       recordActivity(SYSTEM, 'service.waking', `${svc.name} woke up for ${why}`, svc.projectId, svc.id);
       lastHit.set(serviceId, Date.now());
+      wokeAt.set(serviceId, Date.now());
       for (const r of replicasOf(serviceId).filter((x) => x.deploymentId === svc.activeDeploymentId)) {
         await dockerForContainer(r.containerId).startContainer(r.containerId).catch(() => {});
       }

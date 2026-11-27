@@ -4,7 +4,7 @@ import { useStore, deploymentsFor } from '../lib/store.ts';
 import { Badge, Button, Tooltip, toastError, Empty } from '../components/ui.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { deployTone, timeAgo, duration, isBusy } from '../lib/format.ts';
-import { rollback, deploy } from '../lib/actions.ts';
+import { rollback, deploy, deployWithoutSafetyBackup } from '../lib/actions.ts';
 import { sse, api } from '../lib/api.ts';
 import { LogView, type ViewLine } from '../components/LogView.tsx';
 import { useAutoHeight } from '../motion/hooks.ts';
@@ -55,7 +55,9 @@ function diffConfigs(prev: Deployment | undefined, d: Deployment): string[] {
 function FailureHint({ d, s }: { d: Deployment; s: ServiceView }) {
   const e = d.error ?? '';
   let text: string | null = null;
-  if (/health check timed out/.test(e) && s.protocol !== 'none')
+  if (d.safetyRefused)
+    text = `${s.name} keeps data, and a new image may change it in place — so Servify wants a recent backup first, and could neither find one nor take one. Nothing changed. Back it up in the Backups tab and deploy again, change the safety backup setting in Settings, or deploy without a safety backup if you accept the risk.`;
+  else if (/health check timed out/.test(e) && s.protocol !== 'none')
     text = `Replicas never accepted connections on port ${d.port ?? '?'}. If your app listens elsewhere, set the container port in Settings → Networking (Servify injects PORT=${d.port ?? '…'}), or switch to Worker if it serves no traffic.`;
   else if (/exited during startup/.test(e)) text = 'The process exited right after starting. Check the output below — a missing variable or a wrong start command are the usual causes.';
   else if (/^pull failed: (unauthorized|not found or private)/.test(e)) {
@@ -67,6 +69,7 @@ function FailureHint({ d, s }: { d: Deployment; s: ServiceView }) {
   else if (/^pull failed|pull access denied|manifest unknown|not found: manifest|error from registry|denied/i.test(e)) text = `The image could not be pulled, so ${s.activeDeploymentId ? 'nothing changed and the running version stays' : 'nothing was started'}. Check the name and tag; for private registries run docker login on the server (Servify pulls with your CLI credentials).`;
   else if (/git clone failed/.test(e)) text = 'The repository could not be cloned. Check the URL and branch; private repositories need an access token in Settings → Source.';
   else if (/could not detect how to build/.test(e)) text = 'No Dockerfile and no recognised project files. Add a Dockerfile, or point Root directory at the app folder.';
+
   if (!text) return null;
   return (
     <div className="failure-hint">
@@ -179,6 +182,13 @@ function DeploymentRow({ d, s, expanded, onToggle, prev }: { d: Deployment; s: S
             <Tooltip label="Deploy the copy of the image already on the server, without pulling (it may be older than the registry's)">
               <Button size="sm" variant="ghost" icon="history" onClick={() => void deploy(s, { useCachedImage: true })}>
                 Deploy cached image
+              </Button>
+            </Tooltip>
+          )}
+          {d.status === 'failed' && d.safetyRefused && (
+            <Tooltip label="Start the new version on the current data without a safety backup">
+              <Button size="sm" variant="ghost" icon="alert" onClick={() => void deployWithoutSafetyBackup(s, d)}>
+                Deploy without backup
               </Button>
             </Tooltip>
           )}

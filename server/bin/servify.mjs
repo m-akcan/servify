@@ -3,15 +3,33 @@
  * servify CLI
  *   servify start              start the platform (dashboard, router, engine)
  *   servify mcp                MCP stdio bridge → a running Servify (SERVIFY_URL, SERVIFY_TOKEN)
- *   servify token <name> [--read]   create an API token directly in the local database
+ *   servify token <name> [--scope read|deploy|write] [--project <id or slug>]…   create an API token directly in the
+ *                              local database (default: write, all projects; --read = --scope read; --project repeats
+ *                              or takes a comma list, and limits the token to those projects and their environments)
  *   servify service install | uninstall | status | print   run in the background, start at login/boot
  *   servify agent --join <url> --token <t> --fingerprint <fp>   let a Servify run services on this machine
  *   servify cert import <host> <fullchain.pem> <privkey.pem>   take over an existing certificate
  *   servify selftest           load the server without starting it (the updater runs this on a new release)
  *
- * From your own machine, against a Servify here or on a server (see src/cli.ts):
- *   servify login [url] · link [project] [service] · up [--service name] · deploy · logs [-f] [--build]
- *   servify run <command…> · exec <command…> · status · open
+ * From your own machine, against a Servify here or on a server (SERVIFY_URL + SERVIFY_TOKEN, or `servify login`):
+ *   servify login [url] [--token t] · logout      save (or forget) the URL and an API token
+ *   servify link [project] [service] · unlink    remember which project/service this folder deploys to
+ *   servify up [--service name] [--replace]      upload this folder, build and deploy it, follow the build
+ *   servify deploy [--tag t] [--skip-safety-backup]   redeploy the service (--tag: switch an image service's tag)
+ *   servify restart [--skip-safety-backup]       restart it with the image it runs
+ *   servify rollback [deployment] [--skip-safety-backup]   back to the previous live image (or that deployment)
+ *   servify deployments [--limit n]              recent deployments (ids for rollback)
+ *   servify logs [-f] [--build] [--tail n]       runtime logs, or the latest build log
+ *   servify variables [list] [--reveal] · get NAME · set NAME=value… [--from-file .env] · unset NAME…
+ *                              the service's variables (--shared: the project's; --deploy: redeploy now; alias: vars)
+ *   servify backup [create] [--destination d] [--no-wait] · backup list · backup test <id> · backup download <id> [-o f]
+ *   servify restore <backup id> [--yes]          replace the service's data with a backup, follow it
+ *   servify run [--] <command…>                  a local command with the service's variables
+ *   servify exec [--] <command…>                 a command inside the running service (its exit code is passed on)
+ *   servify status · open                        the project's services · open the service's URL
+ * Commands that act on a project or service take --project/-p and --service/-s (or SERVIFY_PROJECT / SERVIFY_SERVICE,
+ * names or ids); otherwise the folder's link decides.
+ * `servify help <command>` (or `servify <command> --help`) shows the details.
  */
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -25,9 +43,9 @@ if (major < 22 || (major === 22 && minor < 18)) {
   process.exit(1);
 }
 
-const CLIENT = ['login', 'logout', 'link', 'unlink', 'up', 'deploy', 'logs', 'run', 'exec', 'status', 'open'];
+const CLIENT = ['login', 'logout', 'link', 'unlink', 'up', 'deploy', 'restart', 'rollback', 'deployments', 'logs', 'variables', 'vars', 'backup', 'restore', 'run', 'exec', 'status', 'open'];
 
-if (CLIENT.includes(cmd)) {
+if (CLIENT.includes(cmd) || (cmd === 'help' && CLIENT.includes(rest[0]))) {
   const { main } = await import(pathToFileURL(join(here, '../src/cli.ts')).href);
   await main(cmd, rest);
 } else if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
@@ -70,10 +88,49 @@ if (CLIENT.includes(cmd)) {
   await http.start();
   await stdio.start();
 } else if (cmd === 'token') {
-  const name = rest.find((a) => !a.startsWith('--')) ?? 'agent';
-  const { createToken } = await import(pathToFileURL(join(here, '../src/auth.ts')).href);
-  const { token, record } = createToken(name, rest.includes('--read') ? 'read' : 'write');
-  console.log(`Created ${record.scope} token "${record.name}":\n\n  ${token}\n\nIt won't be shown again.`);
+  let name = null;
+  let scope = null;
+  const projects = [];
+  const usage = 'usage: servify token <name> [--scope read|deploy|write] [--project <id or slug>]…';
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    const value = (flag) => {
+      if (a.startsWith(`${flag}=`)) return a.slice(flag.length + 1);
+      const v = rest[++i];
+      if (v === undefined || v.startsWith('--')) {
+        console.error(`${flag} needs a value — ${usage}`);
+        process.exit(1);
+      }
+      return v;
+    };
+    if (a === '--read') scope = scope && scope !== 'read' ? 'conflict' : 'read';
+    else if (a === '--scope' || a.startsWith('--scope=')) {
+      const v = value('--scope');
+      scope = scope && scope !== v ? 'conflict' : v;
+    } else if (a === '--project' || a.startsWith('--project=')) projects.push(...value('--project').split(',').map((x) => x.trim()).filter(Boolean));
+    else if (a.startsWith('-')) {
+      console.error(`unknown option ${a} — ${usage}`);
+      process.exit(1);
+    } else if (name === null) name = a;
+    else {
+      console.error(`one name only — ${usage}`);
+      process.exit(1);
+    }
+  }
+  if (scope === 'conflict' || (scope && !['read', 'deploy', 'write'].includes(scope))) {
+    console.error(`--scope must be one of read, deploy, write — ${usage}`);
+    process.exit(1);
+  }
+  const { createToken, normalizeTokenProjects } = await import(pathToFileURL(join(here, '../src/auth.ts')).href);
+  try {
+    const ids = projects.length ? normalizeTokenProjects(projects) : null;
+    const { token, record } = createToken(name ?? 'agent', scope ?? 'write', 'agent', ids);
+    const where = ids ? ` for ${ids.length} project${ids.length === 1 ? '' : 's'} (${projects.join(', ')}) and their environments` : '';
+    console.log(`Created ${record.scope} token "${record.name}"${where}:\n\n  ${token}\n\nIt won't be shown again.`);
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
 } else if (cmd === 'cert' && rest[0] === 'import') {
   const [, host, chainFile, keyFile] = rest;
   if (!host || !chainFile || !keyFile) {

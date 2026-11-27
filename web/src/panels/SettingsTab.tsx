@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { ServiceView, Protocol, PublicServer } from '../lib/types.ts';
+import type { ServiceView, Protocol, PublicServer, SafetyPolicy } from '../lib/types.ts';
 import { api } from '../lib/api.ts';
 import { Button, Segmented, Switch, Field, Stepper, toastError, toast, Tooltip, CopyButton, confirmDialog } from '../components/ui.tsx';
 import { navigate } from '../lib/router.ts';
@@ -137,6 +137,20 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
         <Field label="Time zone" hint={s.scheduleTz ? `The schedule is read in ${s.scheduleTz} time. Takes effect right away.` : 'Empty = the server’s local time. A name like Europe/Berlin or UTC.'}>
           <CommitInput mono value={s.scheduleTz ?? ''} placeholder="server time" onCommit={(v) => void patch(id(s), { scheduleTz: v.trim() || null })} />
         </Field>
+      )}
+      {s.schedule && (
+        <div className="setting-row">
+          <div className="grow">
+            <div className="title">Catch up missed runs</div>
+            <div className="desc">
+              {s.scheduleCatchUp
+                ? 'A run missed while Servify was down (or this job’s server offline) runs once, late — if that is within half the time to the next run (at most 24 h). Several missed runs still run only once.'
+                : 'Off: a run missed while Servify was down is skipped (and shown as skipped). Turn on for jobs that are safe to run late.'}
+              {s.scheduleCatchUp == null && ' (Default.)'}
+            </div>
+          </div>
+          <Switch checked={!!s.scheduleCatchUp} onChange={(v) => void patch(id(s), { scheduleCatchUp: v })} label="Catch up missed runs" />
+        </div>
       )}
     </>
   );
@@ -331,6 +345,88 @@ function ServiceVolumes({ service: s }: { service: ServiceView }) {
         <span className="faint" style={{ fontSize: 12 }}>
           A new empty one, or a detached volume from this project.
         </span>
+      </div>
+    </>
+  );
+}
+
+const AGES: [number, string][] = [
+  [1, '1 hour'],
+  [6, '6 hours'],
+  [12, '12 hours'],
+  [24, '24 hours'],
+  [48, '2 days'],
+  [168, '7 days'],
+];
+const MODE_TEXT: Record<SafetyPolicy['mode'], string> = {
+  off: 'No safety backups',
+  auto: 'Reuse a recent backup, else take one',
+  require: 'Reuse a recent backup, else refuse',
+};
+function policyText(p: SafetyPolicy) {
+  if (p.mode === 'off') return 'no backup check';
+  const age = p.maxAgeHours === 0 ? 'always a fresh backup' : `a backup up to ${AGES.find(([h]) => h === p.maxAgeHours)?.[1] ?? `${p.maxAgeHours} hours`} old`;
+  return p.mode === 'auto' ? (p.maxAgeHours === 0 ? 'always a fresh backup' : `${age}, else a new one`) : `${age}, else refused`;
+}
+
+/**
+ * Safety backups: before a new image starts on the data and before volumes are deleted, a recent backup must exist —
+ * reused, or taken first. Next to the backup settings it depends on (destination, schedule: Backups tab).
+ */
+function SafetyBackups({ service: s }: { service: ServiceView }) {
+  const own = s.safetyBackup ?? null;
+  const p = s.safetyPolicy;
+  const dest = s.backup?.destinationId ?? 'local';
+  const mode = own?.mode ?? 'default';
+  const age = own?.maxAgeHours ?? p?.deploy.maxAgeHours ?? 24;
+  const effective = own?.mode ?? p?.deploy.mode ?? 'off';
+  const setMode = (m: string) => {
+    if (m === 'default') return void patch(s.id, { safetyBackup: null });
+    const maxAgeHours = m === 'require' && age < 1 ? 24 : age;
+    void patch(s.id, { safetyBackup: { mode: m, maxAgeHours } });
+  };
+  const ages = age === 0 || AGES.some(([h]) => h === age) ? AGES : [...AGES, [age, `${age} hours`] as [number, string]];
+  return (
+    <>
+      <div className="setting-row">
+        <div className="grow">
+          <div className="title">When there is no recent backup</div>
+          <div className="desc">
+            {mode === 'default'
+              ? `Default — ${p?.deploy.why ?? ''}${s.backup?.enabled ? '' : '. Turn on scheduled backups (Backups tab) or choose a mode here'}.`
+              : 'Set for this service.'}
+          </div>
+        </div>
+        <select className="select" style={{ width: 'auto' }} value={mode} onChange={(e) => setMode(e.target.value)} aria-label="Safety backup mode">
+          <option value="default">Default ({MODE_TEXT[s.backup?.enabled ? 'auto' : 'off'].toLowerCase()})</option>
+          <option value="auto">{MODE_TEXT.auto}</option>
+          <option value="require">{MODE_TEXT.require}</option>
+          <option value="off">{MODE_TEXT.off}</option>
+        </select>
+      </div>
+      <div className="setting-row">
+        <div className="grow">
+          <div className="title">A backup counts as recent for</div>
+          <div className="desc">The nightly scheduled backup usually covers a deploy. Only when there is none this recent is a new one taken — after checking it fits on the disk.</div>
+        </div>
+        <select
+          className="select"
+          style={{ width: 'auto' }}
+          value={String(age)}
+          disabled={effective === 'off'}
+          onChange={(e) => void patch(s.id, { safetyBackup: { mode: effective, maxAgeHours: Number(e.target.value) } })}
+          aria-label="Maximum age of a recent backup"
+        >
+          {ages.map(([h, label]) => (
+            <option key={h} value={h}>
+              {label}
+            </option>
+          ))}
+          {effective !== 'require' && <option value={0}>Always take a fresh one</option>}
+        </select>
+      </div>
+      <div className="faint" style={{ fontSize: 12, lineHeight: 1.5 }}>
+        New image{s.cluster || s.schedule ? ' (not for clusters and scheduled jobs)' : ''}: {p ? policyText(p.deploy) : '—'}. Deleting its volumes: {p ? policyText(p.delete) : '—'}. New backups go to {dest === 'local' ? 'this machine' : 'its backup destination'} (Backups tab). Automatic updates never take one themselves: without a recent backup they wait for the next one. A refused deploy changes nothing and can be repeated without a backup from its row in Deployments.
       </div>
     </>
   );
@@ -655,6 +751,180 @@ function DeployHook({ serviceId }: { serviceId: string }) {
   );
 }
 
+function minutes(sec: number) {
+  return sec % 60 === 0 && sec >= 120 ? `${sec / 60} min` : `${sec} s`;
+}
+
+/** Restart hung replicas: running, but failing the health check for a sustained time. */
+function AutoRestartRow({ s }: { s: ServiceView }) {
+  const a = s.autoRestart!;
+  if (a.unavailable) {
+    return (
+      <div className="faint" style={{ fontSize: 12, lineHeight: 1.5, marginTop: 10 }}>
+        Hung replicas aren’t restarted automatically: {a.unavailable}.
+      </div>
+    );
+  }
+  return (
+    <>
+      <div className="setting-row" style={{ marginTop: 10 }}>
+        <div className="grow">
+          <div className="title">Restart hung replicas</div>
+          <div className="desc">
+            {a.enabled
+              ? `A replica that keeps running but fails its health check for ${minutes(a.afterSec)} (after its startup grace) is restarted — at most ${a.maxRestarts} times in ${minutes(a.windowSec)}, with growing gaps. Then Servify stops and notifies you.`
+              : 'Off: a hung replica is only taken out of rotation.'}
+            {!a.explicit && ' (Default.)'}
+            {a.restarts > 0 && ` Restarted ${a.restarts}× recently${a.lastRestartAt ? `, last at ${new Date(a.lastRestartAt).toLocaleTimeString()}` : ''}.`}
+          </div>
+        </div>
+        {a.enabled && (
+          <div style={{ width: 96 }} title="Seconds of failed health checks before a restart">
+            <CommitInput mono value={String(a.afterSec)} onCommit={(v) => void patch(id(s), { healthcheck: { restartAfterSec: Math.max(10, Math.round(Number(v))) || null } })} />
+          </div>
+        )}
+        <Switch checked={a.enabled} onChange={(v) => void patch(id(s), { healthcheck: { autoRestart: v } })} />
+      </div>
+      {a.attention && (
+        <div className="callout">
+          <Icon name="alert" size={14} />
+          <span>{a.attention}</span>
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Router access control: who may connect (IP lists), basic auth and a rate limit. Applies immediately. */
+function AccessControl({ service: s }: { service: ServiceView }) {
+  const a = s.access ?? { allow: [], deny: [], basicAuth: null, rateLimit: null };
+  const http = s.protocol === 'http';
+  const privateOnly = a.allow.length === 1 && a.allow[0] === 'private';
+  const derived = !a.allow.length ? 'anyone' : privateOnly ? 'private' : 'list';
+  const [mode, setMode] = useState<'anyone' | 'private' | 'list'>(derived);
+  useEffect(() => setMode(derived), [derived]);
+  const [authOn, setAuthOn] = useState(!!a.basicAuth);
+  const [user, setUser] = useState(a.basicAuth?.username ?? '');
+  const [pw, setPw] = useState('');
+  useEffect(() => {
+    setAuthOn(!!a.basicAuth);
+    setUser(a.basicAuth?.username ?? '');
+    setPw('');
+  }, [a.basicAuth?.username, a.basicAuth?.setAt, !!a.basicAuth]);
+  const save = (access: Record<string, unknown>) => patch(s.id, { access });
+  const saveAuth = async () => {
+    if (await save({ basicAuth: { username: user.trim(), ...(pw ? { password: pw } : {}) } })) setPw('');
+  };
+  const rate = a.rateLimit;
+  return (
+    <>
+      {(s.accessWarnings ?? []).map((w) => (
+        <div key={w} className="callout callout-warn">
+          <Icon name="alert" size={15} />
+          <div className="grow">{w}</div>
+        </div>
+      ))}
+      <div className="setting-row">
+        <div className="grow">
+          <div className="title">Who can connect</div>
+          <div className="desc">
+            {mode === 'private'
+              ? 'Private networks only: your LAN (10/8, 172.16/12, 192.168/16), this machine, IPv6 ULA and link-local, and Tailscale (100.64/10). Everyone else gets a 403.'
+              : mode === 'list'
+                ? 'Only the addresses and networks below (IPv4 or IPv6, one per line). Everyone else gets a 403.'
+                : 'Anyone who can reach the router.'}
+            {!http && s.protocol === 'tcp' ? ' Checked when a connection opens on the TCP proxy port.' : ''}
+          </div>
+        </div>
+        <Segmented
+          size="sm"
+          value={mode}
+          onChange={(v) => {
+            setMode(v);
+            if (v === 'anyone') void save({ allow: [] });
+            if (v === 'private') void save({ allow: ['private'] });
+          }}
+          options={[
+            { value: 'anyone', label: 'Anyone' },
+            { value: 'private', label: 'Private networks' },
+            { value: 'list', label: 'Chosen' },
+          ]}
+        />
+      </div>
+      {mode === 'list' && <CommitLines value={privateOnly ? [] : a.allow} placeholder={'192.168.1.0/24\n2001:db8::/32\nprivate'} onCommit={(v) => void save({ allow: v })} />}
+      <Field label="Blocked addresses" hint="Refused first, whatever the list above says. One address or CIDR per line.">
+        <CommitLines value={a.deny} placeholder="203.0.113.0/24" onCommit={(v) => void save({ deny: v })} />
+      </Field>
+      {http && (
+        <>
+          <div className="setting-row">
+            <div className="grow">
+              <div className="title">Password protection</div>
+              <div className="desc">HTTP basic auth in front of the whole site. The password is stored hashed; repeated wrong guesses from one address are slowed down.</div>
+            </div>
+            <Switch
+              checked={authOn}
+              onChange={(v) => {
+                setAuthOn(v);
+                if (!v && a.basicAuth) void save({ basicAuth: null });
+              }}
+            />
+          </div>
+          {authOn && (
+            <div className="col" style={{ gap: 10 }}>
+              <div className="ns-grid">
+                <Field label="User name">
+                  <input className="input mono" value={user} autoComplete="off" onChange={(e) => setUser(e.target.value)} spellCheck={false} />
+                </Field>
+                <Field label={a.basicAuth ? 'New password' : 'Password'} hint={a.basicAuth ? 'Empty keeps the current one.' : 'At least 8 characters.'}>
+                  <input className="input mono" type="password" autoComplete="new-password" value={pw} placeholder={a.basicAuth ? '••••••••' : ''} onChange={(e) => setPw(e.target.value)} />
+                </Field>
+              </div>
+              <div className="row">
+                <div className="spacer" />
+                <Button size="sm" variant="primary" disabled={!user.trim() || (!a.basicAuth && pw.length < 8) || (!!a.basicAuth && !pw && user.trim() === a.basicAuth.username)} onClick={() => void saveAuth()}>
+                  {a.basicAuth ? 'Save' : 'Turn on'}
+                </Button>
+              </div>
+              {a.basicAuth && (
+                <Field label="Paths without a password" hint="Path prefixes that skip the password, e.g. /api/webhooks. IP lists and the rate limit still apply.">
+                  <CommitLines value={a.basicAuth.exemptPaths} placeholder="/api/public" onCommit={(v) => void save({ basicAuth: { username: a.basicAuth!.username, exemptPaths: v } })} />
+                </Field>
+              )}
+            </div>
+          )}
+          <div className="setting-row">
+            <div className="grow">
+              <div className="title">Rate limit</div>
+              <div className="desc">{rate ? `At most ${rate.requests} requests per ${rate.perSeconds} s from one address (bursts allowed, refilled evenly); beyond that a 429 with Retry-After.` : 'Limit how fast one address can send requests.'}</div>
+            </div>
+            {rate && (
+              <>
+                <div style={{ width: 84 }} title="Requests">
+                  <CommitInput mono value={String(rate.requests)} onCommit={(v) => void save({ rateLimit: { ...rate, requests: Math.max(1, Math.round(Number(v)) || 1) } })} />
+                </div>
+                <span className="faint" style={{ fontSize: 12 }}>
+                  per
+                </span>
+                <div style={{ width: 72 }} title="Seconds">
+                  <CommitInput mono value={String(rate.perSeconds)} onCommit={(v) => void save({ rateLimit: { ...rate, perSeconds: Math.max(1, Math.round(Number(v)) || 1) } })} />
+                </div>
+                <span className="faint" style={{ fontSize: 12 }}>
+                  s
+                </span>
+              </>
+            )}
+            <Switch checked={!!rate} onChange={(v) => void save({ rateLimit: v ? { requests: 120, perSeconds: 60 } : null })} />
+          </div>
+        </>
+      )}
+      <div className="faint" style={{ fontSize: 12 }}>
+        Visitors are told apart by address: behind another reverse proxy, list it in <span className="mono">SERVIFY_TRUSTED_PROXIES</span> so Servify reads the real address from X-Forwarded-For.
+      </div>
+    </>
+  );
+}
+
 export function SettingsTab({ service: s }: { service: ServiceView }) {
   const proxyPort = useStore((st) => st.current?.proxyPort ?? 8080);
   const project = useStore((st) => st.current?.project);
@@ -905,7 +1175,13 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
       </Section>
 
       {s.protocol !== 'none' && (
-        <Section title="Health checks" icon="pulse" desc="Replicas only receive traffic once healthy. Failing replicas are taken out of rotation.">
+        <Section title="Access control" icon="shield" desc="Who may reach this service through the router. Applies immediately, also to its domains over HTTPS and to WebSockets.">
+          <AccessControl service={s} />
+        </Section>
+      )}
+
+      {s.protocol !== 'none' && (
+        <Section title="Health checks" icon="pulse" desc="Replicas only receive traffic once healthy. Failing replicas are taken out of rotation, and restarted when they stay stuck.">
           <div className="ns-grid">
             <Field label="HTTP path" hint={s.protocol === 'http' ? 'Empty = TCP connect check' : 'TCP connect check'}>
               <CommitInput mono value={s.healthcheck.path ?? ''} placeholder="/healthz" disabled={s.protocol !== 'http'} onCommit={(v) => void patch(id, { healthcheck: { path: v || null } })} />
@@ -920,6 +1196,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
               <CommitInput mono value={String(s.healthcheck.graceSec)} onCommit={(v) => void patch(id, { healthcheck: { graceSec: Number(v) || 60 } })} />
             </Field>
           </div>
+          {s.autoRestart && <AutoRestartRow s={s} />}
         </Section>
       )}
 
@@ -999,6 +1276,12 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
       <Section title="Volumes" icon="database" desc="Persistent storage that survives deploys and can move between services. A service with a volume runs as one replica.">
         <ServiceVolumes service={s} />
       </Section>
+
+      {s.backupMethod && (
+        <Section title="Safety backups" icon="shield" desc="Before a new image starts on this service’s data — a deploy, rollback or automatic update that may migrate it — and before its volumes are deleted, Servify makes sure a recent backup exists.">
+          <SafetyBackups service={s} />
+        </Section>
+      )}
 
       <Section title="Published ports" icon="network" desc="Open container ports straight on the server — TCP or UDP — for game servers, voice chat and anything the router doesn’t handle. One replica; anyone who can reach the server can reach these.">
         <PublishedPorts service={s} />

@@ -3,6 +3,8 @@
  * send headers, and a token in the URL would end up in logs). Reconnects with backoff and treats a
  * stream that goes quiet for longer than the server's ping interval as dead.
  */
+import { appHeaders } from './appversion.ts';
+
 export type StreamHandlers = Record<string, (data: any) => void>;
 
 export function openStream(
@@ -36,7 +38,7 @@ export function openStream(
     const mine = ctrl;
     try {
       const res = await fetch(`${base}/api${path}`, {
-        headers: { authorization: `Bearer ${token}`, accept: 'text/event-stream' },
+        headers: { ...appHeaders(base), authorization: `Bearer ${token}`, accept: 'text/event-stream' },
         credentials: 'omit',
         cache: 'no-store',
         signal: mine.signal,

@@ -11,6 +11,7 @@ import * as x509 from '@peculiar/x509';
 import acme from 'acme-client';
 import tls from 'node:tls';
 import http from 'node:http';
+import { networkInterfaces } from 'node:os';
 import { webcrypto, X509Certificate, randomBytes, createPrivateKey, createPublicKey } from 'node:crypto';
 import { certsTable, kv, services as servicesTable, projects as projectsTable } from './db.ts';
 import { seal, open, sealJson, openJson } from './crypto.ts';
@@ -113,6 +114,9 @@ export function wantedHosts(): string[] {
     const p = projects.get(s.projectId);
     if (p && s.publicHttp && !isLocalHost(config.baseDomain)) hosts.add(`${s.slug}.${p.slug}.${config.baseDomain}`.toLowerCase());
   }
+  // The dashboard domain gets a public certificate like any routed domain (local names use the local CA).
+  const dd = getSettings().dashboardDomain;
+  if (dd && !isLocalHost(dd)) hosts.add(dd);
   return [...hosts].sort();
 }
 
@@ -340,7 +344,7 @@ export function sniCallback(servername: string, cb: (err: Error | null, ctx?: tl
 
 let routed: Set<string> | null = null;
 bus.subscribe((ev) => {
-  if (ev.type === 'service.updated' || ev.type === 'service.deleted' || ev.type === 'project.updated' || ev.type === 'project.deleted') routed = null;
+  if (ev.type === 'service.updated' || ev.type === 'service.deleted' || ev.type === 'project.updated' || ev.type === 'project.deleted' || ev.type === 'settings.updated') routed = null;
 });
 /** Every host name the router answers for (as in proxy.ts): generated names and custom domains of HTTP services. */
 function routedHosts(): Set<string> {
@@ -353,12 +357,41 @@ function routedHosts(): Set<string> {
     const p = projects.get(s.projectId);
     if (p && s.publicHttp) hosts.add(`${s.slug}.${p.slug}.${config.baseDomain}`.toLowerCase());
   }
+  const dd = getSettings().dashboardDomain;
+  if (dd) hosts.add(dd);
   return (routed = hosts);
+}
+
+/** A LAN or VPN address: RFC 1918, CGNAT (Tailscale), IPv6 ULA. Public addresses are never put in the certificate. */
+function privateAddress(ip: string): boolean {
+  if (/^10\./.test(ip) || /^192\.168\./.test(ip) || /^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
+  const cg = /^100\.(\d+)\./.exec(ip);
+  if (cg && +cg[1] >= 64 && +cg[1] <= 127) return true;
+  return /^f[cd][0-9a-f]{2}:/i.test(ip);
+}
+
+/**
+ * This machine's own LAN and VPN addresses, for the certificate served to clients that connect by IP. Anyone who
+ * connects by IP sees this list (internet scanners too, once the router is reachable from outside), so it holds only
+ * private addresses of real interfaces: no public addresses, no Docker or VM bridges.
+ */
+function ownAddresses(): x509.JsonGeneralName[] {
+  const out: x509.JsonGeneralName[] = [];
+  for (const [name, list] of Object.entries(networkInterfaces())) {
+    if (/^(docker|br-|veth|virbr|vmnet|vboxnet|cni|flannel|cali|podman|lxc|lxd)/.test(name)) continue;
+    for (const a of list ?? []) {
+      if (a.internal || !privateAddress(a.address)) continue;
+      out.push({ type: 'ip', value: a.address });
+    }
+  }
+  return out.slice(0, 20);
 }
 
 export async function defaultContextOptions(): Promise<{ key: string; cert: string }> {
   const ca = await localCa();
-  // A throwaway self-signed default for clients that send no SNI at all.
+  // The default for clients that send no SNI at all — which is what TLS clients do when they connect to an IP address.
+  // It names localhost and every address this machine had at startup, so https://<LAN IP>:<port> verifies against
+  // the local CA (the phone app pins it).
   const keys = await webcrypto.subtle.generateKey(ALG, true, ['sign', 'verify']);
   const caKey = await importPkcs8(ca.keyPem);
   const cert = await x509.X509CertificateGenerator.create({
@@ -370,7 +403,11 @@ export async function defaultContextOptions(): Promise<{ key: string; cert: stri
     publicKey: keys.publicKey as any,
     signingKey: caKey as any,
     signingAlgorithm: ALG,
-    extensions: [new x509.SubjectAlternativeNameExtension([{ type: 'dns', value: 'localhost' }, { type: 'ip', value: '127.0.0.1' }])],
+    extensions: [
+      new x509.SubjectAlternativeNameExtension([{ type: 'dns', value: 'localhost' }, { type: 'ip', value: '127.0.0.1' }, { type: 'ip', value: '::1' }, ...ownAddresses()]),
+      new x509.ExtendedKeyUsageExtension([x509.ExtendedKeyUsage.serverAuth]),
+      new x509.BasicConstraintsExtension(false),
+    ],
   });
   return { key: pem('PRIVATE KEY', await webcrypto.subtle.exportKey('pkcs8', keys.privateKey)), cert: cert.toString('pem').trim() + '\n' + ca.certPem.trim() + '\n' };
 }

@@ -2,11 +2,12 @@
  * Updating Servify itself from a release. Nothing is checked until someone asks: "Check for updates" asks the
  * release feed (GitHub releases of this repository by default), and an update is installed only on request.
  *
- * Installing: download the release package and check its checksum, unpack it next to the install folder, run the
- * new version's self-test, snapshot the database, then swap the folders (the old one stays as `<install>.prev`) and
- * exit so the service manager starts the new version. bin/update-guard.mjs watches the next starts: the new version
- * confirms itself once it serves the dashboard and reaches Docker, and after three failed starts the old folder and
- * the database snapshot are put back. Only for a supervised install (Start at login / the systemd or launchd service)
+ * Installing: download the release package and check it against the release's signed manifest (releasesig.ts: an
+ * Ed25519 signature by a key pinned in releasekey.ts — a release that isn't signed by one is refused, whoever
+ * published it), unpack it next to the install folder, run the new version's self-test, snapshot the database, then
+ * swap the folders (the old one stays as `<install>.prev`) and exit so the service manager starts the new version.
+ * bin/update-guard.mjs watches the next starts: the new version confirms itself once it serves the dashboard and
+ * reaches Docker, and after three failed starts the old folder and the database snapshot are put back. Only for a supervised install (Start at login / the systemd or launchd service)
  * — something has to start Servify again — and not inside a container, where you update the image instead.
  */
 import { createHash } from 'node:crypto';
@@ -24,6 +25,25 @@ import { notify } from './notify.ts';
 import { flushLogs } from './logstore.ts';
 import { flushAccessLog } from './accesslog.ts';
 import { restoresRunning } from './backups.ts';
+import { checkAsset, manifestName, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, packageName, signatureName, signingSelfTest, trustedKeys, verifyReleaseManifest, type ReleaseManifest } from './releasesig.ts';
+
+// The release check is part of `servify selftest` (which imports this file): the pinned keys must load and the
+// verifier must accept a good signature and refuse a bad one, or this version can't update itself safely.
+signingSelfTest();
+export { verifyReleaseManifest, checkAsset, trustedKeys } from './releasesig.ts';
+
+/**
+ * Escape hatch for people who build their own releases without signing them: SERVIFY_UPDATE_ALLOW_UNSIGNED=1 installs
+ * a release that has no manifest or signature (checked against its .sha256 only, as before 0.3.0). A release whose
+ * signature is present but wrong is still refused. Prefer signing your builds and setting SERVIFY_UPDATE_KEYS.
+ */
+const allowUnsigned = () => process.env.SERVIFY_UPDATE_ALLOW_UNSIGNED === '1';
+const warned = new Set<string>();
+function warnOnce(msg: string) {
+  if (warned.has(msg)) return;
+  warned.add(msg);
+  console.warn(`\n  ⚠ Updates: ${msg}\n`);
+}
 
 /** Run a command without blocking the router (it keeps serving every site meanwhile). */
 function runAsync(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -63,6 +83,16 @@ export const INSTALL_DIR = resolve(import.meta.dirname, '../..');
 const MARKER = join(config.dataDir, 'update.json');
 const FEED = process.env.SERVIFY_UPDATE_FEED ?? `https://api.github.com/repos/${process.env.SERVIFY_UPDATE_REPO ?? 'm-akcan/servify'}/releases/latest`;
 
+/**
+ * Where to ask for one release by tag (the phone app mirror wants the release of the running version, not the newest):
+ * the feed's `/releases/latest` with `/releases/tags/<tag>` instead. Null when the feed is some other URL — then the
+ * feed itself is asked, and used only if it is that release.
+ */
+export function releaseUrlForTag(tag: string): string | null {
+  return /\/releases\/latest\/?$/.test(FEED) ? FEED.replace(/\/latest\/?$/, `/tags/${encodeURIComponent(tag)}`) : null;
+}
+export const releaseFeed = () => FEED;
+
 export type UpdateMarker = {
   from: string;
   to: string;
@@ -78,7 +108,22 @@ export type UpdateMarker = {
   failedDir?: string;
 };
 
-export type Release = { version: string; tag: string; url: string; notes: string; publishedAt: string | null; asset: string; checksum: string };
+export type Release = {
+  version: string;
+  tag: string;
+  url: string;
+  notes: string;
+  publishedAt: string | null;
+  asset: string;
+  checksum: string | null;
+  manifest: string | null;
+  signature: string | null;
+  /** Signed by a trusted key (checked only for a release newer than this one). */
+  signed: boolean;
+  signedBy: string | null;
+  /** No signature, but SERVIFY_UPDATE_ALLOW_UNSIGNED=1 lets it install. */
+  unsigned: boolean;
+};
 
 function readMarker(): UpdateMarker | null {
   try {
@@ -116,32 +161,96 @@ export function cannotUpdate(): string | null {
   return null;
 }
 
-let lastCheck: { at: number; release: Release | null; error?: string } | null = null;
+let lastCheck: { at: number; release: Release | null; blocked?: string | null; error?: string } | null = null;
 
-async function fetchJson(url: string) {
+export async function fetchJson(url: string) {
   const res = await fetch(url, { headers: { accept: 'application/vnd.github+json', 'user-agent': `servify/${config.version}` }, signal: AbortSignal.timeout(20_000) });
   if (!res.ok) throw new Error(`${url} answered ${res.status}`);
   return res.json() as Promise<any>;
 }
 
-/** Ask the release feed for the newest release (on request only). */
-export async function checkForUpdate(): Promise<{ current: string; latest: Release | null; available: boolean; error?: string }> {
+/** Fetch a small file (manifest, signature) with a size limit. */
+export async function fetchSmall(url: string, max: number): Promise<Buffer> {
+  const res = await fetch(url, { headers: { 'user-agent': `servify/${config.version}` }, signal: AbortSignal.timeout(30_000) });
+  if (!res.ok || !res.body) throw new Error(`downloading ${url.split('/').pop()} failed (${res.status})`);
+  const chunks: Buffer[] = [];
+  let n = 0;
+  for await (const c of res.body as unknown as AsyncIterable<Uint8Array>) {
+    n += c.length;
+    if (n > max) throw new Error(`${url.split('/').pop()} is larger than ${max} bytes`);
+    chunks.push(Buffer.from(c));
+  }
+  return Buffer.concat(chunks);
+}
+
+type Found = { release: Release; newer: boolean; verified: { manifest: ReleaseManifest; keyId: string } | null; blocked: string | null };
+
+/**
+ * The newest release and, when it is newer than this version, whether it may be installed: its manifest must be
+ * signed by a trusted key and be for exactly this version and tag, and list the package. `blocked` says why not.
+ */
+async function findRelease(): Promise<Found> {
+  const r = await fetchJson(FEED);
+  const tag = String(r.tag_name ?? '');
+  const version = tag.replace(/^v/, '');
+  if (!/^\d+\.\d+\.\d+(-[\w.]+)?$/.test(version)) throw new Error(`the newest release has an unexpected tag (${tag || 'none'})`);
+  const assets: { name: string; browser_download_url: string }[] = Array.isArray(r.assets) ? r.assets : [];
+  const byName = (n: string) => assets.find((a) => a.name === n);
+  const asset = byName(packageName(version));
+  if (!asset) throw new Error(`release ${tag} has no servify package to install`);
+  const sum = byName(`${asset.name}.sha256`);
+  const man = byName(manifestName(version));
+  const sig = byName(signatureName(version));
+  const release: Release = {
+    version,
+    tag,
+    url: String(r.html_url ?? ''),
+    notes: String(r.body ?? '').slice(0, 4000),
+    publishedAt: r.published_at ?? null,
+    asset: asset.browser_download_url,
+    checksum: sum?.browser_download_url ?? null,
+    manifest: man?.browser_download_url ?? null,
+    signature: sig?.browser_download_url ?? null,
+    signed: false,
+    signedBy: null,
+    unsigned: false,
+  };
+  if (!newer(version, config.version)) return { release, newer: false, verified: null, blocked: null };
   try {
-    const r = await fetchJson(FEED);
-    const tag = String(r.tag_name ?? '');
-    const version = tag.replace(/^v/, '');
-    const assets: { name: string; browser_download_url: string }[] = r.assets ?? [];
-    const asset = assets.find((a) => a.name === `servify-${tag}.tar.gz` || a.name === `servify-v${version}.tar.gz`);
-    const sum = asset && assets.find((a) => a.name === `${asset.name}.sha256`);
-    if (!/^\d+\.\d+\.\d+(-[\w.]+)?$/.test(version)) throw new Error(`the newest release has an unexpected tag (${tag || 'none'})`);
-    const release: Release | null =
-      asset && sum ? { version, tag, url: String(r.html_url ?? ''), notes: String(r.body ?? '').slice(0, 4000), publishedAt: r.published_at ?? null, asset: asset.browser_download_url, checksum: sum.browser_download_url } : null;
-    if (!release) throw new Error(`release ${tag} has no servify package to install`);
-    lastCheck = { at: Date.now(), release };
-    return { current: config.version, latest: release, available: newer(version, config.version) };
+    if (!man || !sig) {
+      if (!allowUnsigned()) throw new Error(`release ${tag} is not signed — Servify only installs releases signed by a trusted release key`);
+      if (!sum) throw new Error(`release ${tag} is not signed and has no checksum`);
+      warnOnce(`release ${tag} is NOT signed; SERVIFY_UPDATE_ALLOW_UNSIGNED=1 lets it install anyway (checked against its .sha256 only)`);
+      release.unsigned = true;
+      return { release, newer: true, verified: null, blocked: null };
+    }
+    const { keys, fromEnv } = trustedKeys();
+    if (fromEnv) warnOnce('trusting the release keys in SERVIFY_UPDATE_KEYS instead of the built-in ones');
+    const [manifestBytes, sigBytes] = await Promise.all([fetchSmall(man.browser_download_url, MAX_MANIFEST_BYTES), fetchSmall(sig.browser_download_url, MAX_SIGNATURE_BYTES)]);
+    const verified = verifyReleaseManifest(manifestBytes, sigBytes, { version, tag, keys });
+    if (!Object.hasOwn(verified.manifest.assets, asset.name)) throw new Error(`release ${tag}: the signed manifest doesn’t list ${asset.name}`);
+    release.signed = true;
+    release.signedBy = verified.keyId;
+    return { release, newer: true, verified, blocked: null };
+  } catch (e) {
+    const blocked = (e as Error).message;
+    warnOnce(`not installing ${tag}: ${blocked}`);
+    return { release, newer: true, verified: null, blocked };
+  }
+}
+
+/**
+ * Ask the release feed for the newest release (on request only). `available` means newer and installable;
+ * `blocked` says why a newer release won't be installed (not signed, signature invalid …).
+ */
+export async function checkForUpdate(): Promise<{ current: string; latest: Release | null; available: boolean; newer: boolean; blocked: string | null; error?: string }> {
+  try {
+    const f = await findRelease();
+    lastCheck = { at: Date.now(), release: f.release, blocked: f.blocked };
+    return { current: config.version, latest: f.release, available: f.newer && !f.blocked, newer: f.newer, blocked: f.blocked };
   } catch (e) {
     lastCheck = { at: Date.now(), release: null, error: (e as Error).message };
-    return { current: config.version, latest: null, available: false, error: (e as Error).message };
+    return { current: config.version, latest: null, available: false, newer: false, blocked: null, error: (e as Error).message };
   }
 }
 
@@ -168,22 +277,56 @@ export async function installUpdate(actor: Actor, wanted?: string | null): Promi
   installing = true;
   const work = join(config.dataDir, 'updates');
   try {
-    const check = await checkForUpdate();
-    if (!check.latest) throw new HttpError(502, `couldn't get the newest release: ${check.error ?? 'unknown error'}`);
-    const rel = check.latest;
+    let found: Found;
+    try {
+      found = await findRelease();
+      lastCheck = { at: Date.now(), release: found.release, blocked: found.blocked };
+    } catch (e) {
+      throw new HttpError(502, `couldn't get the newest release: ${(e as Error).message}`);
+    }
+    const rel = found.release;
     if (wanted && wanted.replace(/^v/, '') !== rel.version) throw new HttpError(409, `the newest release is ${rel.version}, not ${wanted}`);
-    if (!newer(rel.version, config.version)) throw new HttpError(409, `${config.version} is already the newest release`);
+    if (!found.newer) throw new HttpError(409, `${config.version} is already the newest release`);
+    if (found.blocked) throw new HttpError(409, `${found.blocked} — nothing was changed`);
     rmSync(work, { recursive: true, force: true });
     mkdirSync(work, { recursive: true });
-    // 1. Download and check.
-    const pkg = join(work, `servify-v${rel.version}.tar.gz`);
+    // 1. Download and check against the signed manifest (or, for an allowed unsigned release, its .sha256),
+    // before anything is unpacked. The download stops as soon as it is larger than the manifest says.
+    const name = packageName(rel.version);
+    const pkg = join(work, name);
+    const limit = found.verified ? found.verified.manifest.assets[name].size : 4 * 1024 ** 3;
     const res = await fetch(rel.asset, { headers: { 'user-agent': `servify/${config.version}` }, signal: AbortSignal.timeout(10 * 60_000) });
     if (!res.ok || !res.body) throw new HttpError(502, `downloading ${rel.tag} failed (${res.status})`);
-    await pipeline(Readable.fromWeb(res.body as any), createWriteStream(pkg));
-    const sumRes = await fetch(rel.checksum, { headers: { 'user-agent': `servify/${config.version}` }, signal: AbortSignal.timeout(30_000) });
-    const want = (await sumRes.text()).trim().split(/\s+/)[0]?.toLowerCase();
-    const got = createHash('sha256').update(readFileSync(pkg)).digest('hex');
-    if (!want || want !== got) throw new HttpError(502, `the downloaded package doesn't match its checksum — nothing was changed`);
+    const hash = createHash('sha256');
+    let size = 0;
+    await pipeline(
+      Readable.fromWeb(res.body as any),
+      async function* (src: AsyncIterable<Buffer>) {
+        for await (const chunk of src) {
+          size += chunk.length;
+          if (size > limit) throw new HttpError(502, `the downloaded package is larger than the signed manifest says — nothing was changed`);
+          hash.update(chunk);
+          yield chunk;
+        }
+      },
+      createWriteStream(pkg),
+    );
+    const got = hash.digest('hex');
+    if (found.verified) {
+      try {
+        checkAsset(found.verified.manifest, name, { sha256: got, size });
+      } catch (e) {
+        rmSync(pkg, { force: true });
+        throw new HttpError(502, `${(e as Error).message} — nothing was changed`);
+      }
+    } else {
+      if (!rel.unsigned || !allowUnsigned() || !rel.checksum) throw new HttpError(409, `release ${rel.tag} is not signed — nothing was changed`);
+      const sumRes = await fetch(rel.checksum, { headers: { 'user-agent': `servify/${config.version}` }, signal: AbortSignal.timeout(30_000) });
+      const want = (await sumRes.text()).trim().split(/\s+/)[0]?.toLowerCase();
+      if (!want || want !== got) throw new HttpError(502, `the downloaded package doesn't match its checksum — nothing was changed`);
+      console.warn(`\n  ⚠ Updates: installing UNSIGNED release ${rel.tag} because SERVIFY_UPDATE_ALLOW_UNSIGNED=1\n`);
+      recordActivity(actor, 'servify.update', `Installing unsigned release ${rel.tag} (SERVIFY_UPDATE_ALLOW_UNSIGNED=1)`, null, null);
+    }
     // 2. Unpack next to the install and test the new version.
     const staging = `${INSTALL_DIR}.next`;
     removeSibling(staging);

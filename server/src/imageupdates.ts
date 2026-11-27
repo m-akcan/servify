@@ -18,6 +18,8 @@ import { normalizeImageRef, splitImageRef } from './docker.ts';
 import { bus, recordActivity, SYSTEM } from './events.ts';
 import { notify } from './notify.ts';
 import { queueDeployment } from './deployer.ts';
+import { diskBlock } from './diskguard.ts';
+import { safetyBlocker } from './backups.ts';
 import type { Service } from './types.ts';
 
 export type ImageUpdate = {
@@ -38,6 +40,8 @@ export type ImageUpdate = {
   /** What we last told people about / automatically deployed, so neither happens twice. */
   notifiedFor?: string;
   autoUpdatedTo?: string;
+  /** The image an automatic update was held back from for want of a recent backup (told once; tried again at each check). */
+  safetySkippedFor?: string;
 };
 
 const KEY = 'imageUpdates';
@@ -253,7 +257,7 @@ async function checkServices(list: Service[]): Promise<void> {
     }
     const { ref } = target;
     const prev = imageUpdateOf(svc.id);
-    const keep = prev?.ref === ref && !!prev.base === target.base ? { notifiedFor: prev.notifiedFor, autoUpdatedTo: prev.autoUpdatedTo } : {};
+    const keep = prev?.ref === ref && !!prev.base === target.base ? { notifiedFor: prev.notifiedFor, autoUpdatedTo: prev.autoUpdatedTo, safetySkippedFor: prev.safetySkippedFor } : {};
     const r = parseRepo(ref);
     const dep = deploymentsTable.get(svc.activeDeploymentId!);
     const save = (u: Omit<ImageUpdate, 'ref' | 'checkedAt'>) => {
@@ -307,8 +311,26 @@ async function act(svc: Service, u: ImageUpdate, database: string | null) {
   if (!fresh) return;
   const what = [u.status === 'changed' && `a new ${u.ref} image`, u.newerTag, u.newerMajor].filter(Boolean) as string[];
   // Never for builds (a service switched from an image to a build may still have imageAutoUpdate set).
-  const autoOk = fresh.source.type === 'image' && fresh.imageAutoUpdate && u.status === 'changed' && !database && !fresh.cluster && !fresh.stopped;
-  if (autoOk && u.autoUpdatedTo !== u.remoteDigest) {
+  // Low disk space on its server's Docker disk: no pull now; the update goes through at a check once there is room.
+  const autoOk = fresh.source.type === 'image' && fresh.imageAutoUpdate && u.status === 'changed' && !database && !fresh.cluster && !fresh.stopped && !diskBlock('pull', fresh.nodeId);
+  // A service with data needs a recent backup first. Unattended, Servify never takes one itself (it could run for hours,
+  // or not fit) and never goes ahead without: it holds the update back, says so once, and tries again at each check —
+  // after the next scheduled backup it goes through.
+  const blocked = autoOk && u.autoUpdatedTo !== u.remoteDigest ? safetyBlocker(fresh) : null;
+  if (blocked) {
+    if (u.safetySkippedFor !== u.remoteDigest) {
+      store(svc.id, { ...u, safetySkippedFor: u.remoteDigest });
+      recordActivity(SYSTEM, 'service.update_skipped', `Not updating ${fresh.name} automatically: ${blocked}`, fresh.projectId, fresh.id);
+      notify({
+        event: 'deploy.failed',
+        level: 'error',
+        title: `Auto-update of ${fresh.name} skipped`,
+        message: `A new ${u.ref} image was published, but ${blocked}. Automatic updates never take a safety backup themselves and never update without one: the running version stays, and the update is tried again at each check (it goes through once a recent backup exists, e.g. after the next scheduled backup). To update now, use Update in its Settings — that backs it up first.`,
+        serviceId: fresh.id,
+        projectId: fresh.projectId,
+      });
+    }
+  } else if (autoOk && u.autoUpdatedTo !== u.remoteDigest) {
     store(svc.id, { ...u, autoUpdatedTo: u.remoteDigest });
     recordActivity(SYSTEM, 'service.deployed', `Updating ${fresh.name}: a new ${u.ref} image was published`, fresh.projectId, fresh.id);
     queueDeployment(fresh, 'update', SYSTEM);

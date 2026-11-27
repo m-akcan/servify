@@ -69,6 +69,9 @@ export interface VolumeRecord {
   adopted?: boolean;
   /** Where it is (or was last) mounted. */
   mountPath: string;
+  /** The service it was last attached to, and when it was detached (its data hasn't changed since): safety backups. */
+  lastServiceId?: string | null;
+  detachedAt?: number | null;
   /** Canvas position while detached. */
   x: number;
   y: number;
@@ -94,6 +97,10 @@ export interface Healthcheck {
   timeoutSec: number;
   /** How long a fresh replica may take to become healthy during a deploy. */
   graceSec: number;
+  /** Restart a replica that keeps failing its health check while it runs (hung). Absent = the instance default (on). */
+  autoRestart?: boolean;
+  /** How long it must keep failing before it is restarted. Absent = the instance default (SERVIFY_RESTART_AFTER_SECONDS). */
+  restartAfterSec?: number;
 }
 
 export interface Autoscale {
@@ -103,6 +110,21 @@ export interface Autoscale {
   metric: 'cpu' | 'rps';
   /** CPU % per replica, or requests/second per replica. */
   target: number;
+}
+
+/**
+ * Who may reach a service through the router (see access.ts). Unset = anyone, as before. IP rules also apply to its TCP
+ * proxy port and UDP relay (at connect time); basic auth and rate limits only to HTTP.
+ */
+export interface AccessControl {
+  /** Only these addresses or CIDRs (IPv4/IPv6) may connect; `private` = RFC 1918, loopback, ULA, link-local, CGNAT. Empty = anyone. */
+  allow?: string[];
+  /** These addresses or CIDRs are refused (checked first). */
+  deny?: string[];
+  /** HTTP basic auth. The password is stored hashed (scrypt) apart from the service record; `setAt` changes with it. */
+  basicAuth?: { username: string; setAt: number; exemptPaths?: string[] } | null;
+  /** Requests per client address per window (token bucket: bursts up to `requests`, refilled evenly over `perSeconds`). */
+  rateLimit?: { requests: number; perSeconds: number } | null;
 }
 
 export interface Service {
@@ -119,6 +141,9 @@ export interface Service {
   schedule?: string | null;
   /** IANA time zone the schedule is read in (e.g. Europe/Berlin). Empty = the server's local time. */
   scheduleTz?: string | null;
+  /** Run once, late, for a start missed while Servify was down or the job's server offline (within the catch-up window).
+   * Unset = off: a job may not be safe to run late or twice (mails, billing…). */
+  scheduleCatchUp?: boolean | null;
   /** Port detected from the image on the last successful deploy (used when `port` is auto). */
   detectedPort?: number | null;
   replicas: number;
@@ -148,6 +173,8 @@ export interface Service {
   imageAutoUpdate?: boolean;
   /** Record the router's HTTP access log for this service (on unless set to false; no IPs, only a daily-salted visitor key). */
   accessLog?: boolean;
+  /** Router access control: IP allow/deny lists, basic auth, rate limit (unset = open to anyone). */
+  access?: AccessControl | null;
   /** Docker-style overrides (e.g. from Compose): replace only CMD / only ENTRYPOINT. Ignored when startCommand is set. */
   cmd?: string[] | null;
   entrypoint?: string[] | null;
@@ -156,6 +183,8 @@ export interface Service {
   autoDeploy: boolean;
   /** Scheduled backups of this service's data. */
   backup?: BackupConfig | null;
+  /** Safety backups before risky operations (a new image on a service with data, deleting its volumes). Unset = the default (see backups.ts safetyPolicy). */
+  safetyBackup?: SafetyBackupConfig | null;
   /** Extra hostnames on the project network (e.g. the original Docker Compose service name). */
   aliases?: string[];
   /** Replicated database cluster managed by Servify (primary + standbys, failover). */
@@ -230,6 +259,12 @@ export interface Deployment {
   useCachedImage?: boolean;
   /** Set when the pull failed: whether a copy of the image is on the server (so "deploy the cached image" can work). */
   cachedImageAvailable?: boolean;
+  /** Asked for (never honoured for unattended deploys): deploy a new image of a service with data without a safety backup. */
+  skipSafetyBackup?: boolean;
+  /** Set when the deploy was refused because no safety backup could be found or taken (the running version stayed). */
+  safetyRefused?: boolean;
+  /** The backup this deploy relied on (reused or taken just before). */
+  safetyBackupId?: string | null;
   /** Detected/used port for this image. */
   port: number | null;
   sourceLabel: string;
@@ -285,29 +320,87 @@ export interface BackupConfig {
   /** How many successful backups to keep per destination. */
   retention: number;
   destinationId: string;
+  /** Cron expression for test restores of the newest backup (e.g. weekly). Unset or null: none scheduled. */
+  testSchedule?: string | null;
+  /** Run a scheduled backup (and test restore) missed while Servify was down once, late, within the catch-up window. Unset = on. */
+  catchUp?: boolean | null;
+}
+
+/**
+ * Safety backups: before a new image starts on a service's data, or before its volumes are deleted, Servify makes sure
+ * a recent successful backup exists — and, in `auto`, takes one when there is none (refusing the operation if that fails).
+ */
+export interface SafetyBackupConfig {
+  /** off: never. auto: reuse a recent backup, else take one. require: reuse a recent backup, else refuse (never takes one). */
+  mode: 'off' | 'auto' | 'require';
+  /** How old a successful backup may be and still count as recent. 0 = always take a fresh one (auto only). */
+  maxAgeHours: number;
 }
 
 export type BackupMethod = 'pg_dumpall' | 'mysqldump' | 'mongodump' | 'volume';
 
 export interface BackupRecord {
   id: string;
+  /** The service backed up — or, for the safety backup of a detached volume before it is deleted, that volume's id. */
   serviceId: string;
   projectId: string;
   serviceName: string;
   status: 'running' | 'succeeded' | 'failed';
   method: BackupMethod;
-  trigger: 'schedule' | 'manual' | 'agent' | 'pre-restore';
+  trigger: 'schedule' | 'manual' | 'agent' | 'pre-restore' | 'safety';
+  /** Safety backups: what it was taken for ("deploying nextcloud:31", "deleting volume data"). */
+  purpose?: string;
+  /** The volumes (VolumeRecord ids; a set by its leader) whose data it holds. Missing on backups made before safety backups existed. */
+  volumeIds?: string[];
   actor: string;
   destinationId: string;
   destinationName: string;
-  /** Object key / file name at the destination. */
+  /** Object key / file name at the destination (while running: where it is being written, under a temporary name for folders). */
   key: string | null;
+  /** Bytes stored at the destination (the compressed archive or dump). */
   sizeBytes: number | null;
+  /** SHA-256 (hex) of the stored bytes, computed while they streamed to the destination; restores and test restores
+   * check it. Missing on backups made before checksums existed: those restore unverified. */
+  sha256?: string;
+  /** Database dumps: the image the data came from (test restores load the dump into a throwaway server of that image). */
+  image?: string;
+  /** S3: the multipart upload in progress, or one a failed backup left behind that could not be aborted yet. */
+  uploadId?: string | null;
+  /** A failed backup whose leftovers at the destination (a partial file, an unfinished upload) are still to be removed: retried in the background. */
+  cleanupPending?: boolean;
+  /** A scheduled backup run late, for a start missed while Servify was down (or the server offline). */
+  catchUp?: { dueAt: number; missed: number } | null;
+  /** The last test restore: the archive checked end to end and restored into a scratch volume or a throwaway database. */
+  test?: BackupTest | null;
   startedAt: number;
   finishedAt: number | null;
   error: string | null;
   restoredAt?: number | null;
+  /** The last restore from this backup: where it is (step), and how it ended. */
+  restore?: BackupRestore | null;
   createdAt: number;
+}
+
+export interface BackupRestore {
+  status: 'running' | 'succeeded' | 'failed';
+  /** What it is doing now (while running), e.g. "taking a safety backup of the current data". */
+  step: string;
+  startedAt: number;
+  finishedAt: number | null;
+  error: string | null;
+  actor: string;
+  /** The safety backup of the data as it was before (to go back to). */
+  safetyBackupId?: string | null;
+}
+
+export interface BackupTest {
+  /** checked: the archive is sound end to end, but there was no room to restore a scratch copy of it. */
+  status: 'running' | 'passed' | 'checked' | 'failed';
+  startedAt: number;
+  finishedAt: number | null;
+  /** What was checked and found ("checksum ok; 1,204 files, 3.1 GB unpacked; …"), or why it failed. */
+  message: string;
+  actor: string;
 }
 
 export interface CertRecord {
@@ -368,7 +461,9 @@ export interface ApiToken {
   id: string;
   name: string;
   prefix: string;
-  scope: 'read' | 'write';
+  scope: 'read' | 'deploy' | 'write';
+  /** Limited to these project ids (and their environments); missing = all projects. */
+  projects?: string[];
   kind?: 'agent' | 'device';
   createdAt: number;
   lastUsedAt: number | null;
@@ -417,13 +512,22 @@ export interface JobRun {
   id: string;
   serviceId: string;
   projectId: string;
-  status: 'running' | 'succeeded' | 'failed';
+  /** skipped: a scheduled start that didn't run (still running from before, server offline, missed while Servify was down…). */
+  status: 'running' | 'succeeded' | 'failed' | 'skipped';
   trigger: 'schedule' | 'manual' | 'agent';
   actor: string;
+  /** Skipped runs: when (the first of them, when several in a row were skipped for the same reason). */
   startedAt: number;
+  /** Skipped runs: the last of them. */
   finishedAt: number | null;
   exitCode: number | null;
   output: string;
+  /** Skipped runs: why. */
+  reason?: string;
+  /** Skipped runs: how many starts in a row this record stands for (same reason). */
+  skipCount?: number;
+  /** A run late, for a start missed while Servify was down or the server offline: when it was due, and how many were missed. */
+  catchUp?: { dueAt: number; missed: number } | null;
   createdAt: number;
 }
 
@@ -442,6 +546,7 @@ export type ServerEvent =
   | { type: 'backup.updated'; backup: BackupRecord }
   | { type: 'cert.updated'; cert: PublicCert }
   | { type: 'settings.updated' }
+  | { type: 'disk.updated'; disk: DiskState }
   | { type: 'volume.updated'; volume: VolumeRecord }
   | { type: 'volume.deleted'; volumeId: string; projectId: string }
   | { type: 'hello'; version: string };
@@ -498,6 +603,47 @@ export interface HostStats {
   at: number;
 }
 
+export type DiskLevel = 'ok' | 'warn' | 'protect';
+
+/** A disk Servify writes to, watched by the low-disk guard (diskguard.ts). */
+export interface DiskStatus {
+  /** 'data' (SERVIFY_DATA_DIR), 'docker' (this machine's Docker data root) or 'docker:<server id>'. */
+  id: string;
+  name: string;
+  /** null: this machine. */
+  nodeId: string | null;
+  path: string | null;
+  /** What lives on it: Servify's data, Docker's (both when they share a disk). */
+  roles: ('data' | 'docker')[];
+  totalBytes: number | null;
+  freeBytes: number | null;
+  /** Below this: warn. Below protectBytes: protect. Back to ok at clearBytes; protection is lifted above warnBytes. */
+  warnBytes: number | null;
+  protectBytes: number | null;
+  clearBytes: number | null;
+  level: DiskLevel;
+  /** When it entered its level. */
+  since: number;
+  measuredAt: number | null;
+  /** Why it has no reading (its level is then ok: nothing is refused on unknown numbers). */
+  error: string | null;
+}
+
+export interface DiskState {
+  /** The worst level of all disks. */
+  level: DiskLevel;
+  disks: DiskStatus[];
+  /** What Servify stopped storing, and what it refuses, right now. */
+  paused: string[];
+  refused: string[];
+  thresholds: { warnPct: number | null; warnGb: number | null; protectPct: number | null; protectGb: number | null; autoClean: boolean };
+  /** While in protect mode: what was not stored since it started. */
+  skipped: { logLines: number; metricRows: number; accessRows: number; since: number | null } | null;
+  /** The automatic clean-up when a disk last entered protect mode. */
+  lastCleanup: { at: number; steps: string[]; freedBytes: number } | null;
+  howToFree: string | null;
+}
+
 /** The projects page's overview: every server's usage and Servify's own. */
 export interface Overview {
   servers: (PublicServer & {
@@ -507,6 +653,8 @@ export interface Overview {
     os: string | null;
     dockerVersion: string | null;
   })[];
+  /** Low disk space protection. */
+  disk: DiskState;
   servify: {
     version: string;
     uptimeSec: number;

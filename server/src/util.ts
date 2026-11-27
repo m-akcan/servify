@@ -43,9 +43,12 @@ export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 export class HttpError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** A machine-readable reason clients can act on (e.g. 'safety_backup': retry with skipSafetyBackup). */
+  code?: string;
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    if (code) this.code = code;
   }
 }
 
@@ -65,6 +68,10 @@ export class KeyedLock {
       if (this.chains.get(key) === tail) this.chains.delete(key);
     });
     return next;
+  }
+  /** Something runs or waits under this key. */
+  held(key: string): boolean {
+    return this.chains.has(key);
   }
 }
 

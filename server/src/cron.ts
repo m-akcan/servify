@@ -124,7 +124,11 @@ export function cronMatches(c: Cron, d: Date, tz?: string | null): boolean {
  * Returns the wall time to remember when the job should start, else null.
  */
 export function cronDue(c: Cron, d: Date, tz?: string | null, lastFired?: string | null): string | null {
-  const now = wallTime(d, tz);
+  return dueAt(c, wallTime(d, tz), () => wallTime(new Date(d.getTime() - 60_000), tz), lastFired);
+}
+
+/** cronDue on wall times: `now`, and the minute before it (only asked for when needed: an Intl call). */
+function dueAt(c: Cron, now: Wall, before: () => Wall, lastFired?: string | null): string | null {
   const key = wallKey(now);
   // Only jobs set for certain hours are tied to the clock. "Every hour" or "every 15 minutes" simply keeps its
   // rhythm through a clock change (as cron does): it runs in the repeated hour too, and nothing needs catching up.
@@ -132,18 +136,95 @@ export function cronDue(c: Cron, d: Date, tz?: string | null, lastFired?: string
   if (matchesWall(c, now)) return fixedTime && key === lastFired ? null : key;
   if (!fixedTime) return null;
   // Did the wall clock jump forward since the minute before? Then look at the minutes that never happened.
-  const before = wallTime(new Date(d.getTime() - 60_000), tz);
-  const gap = wallMinutes(now) - wallMinutes(before) - 1;
+  const prev = before();
+  const gap = wallMinutes(now) - wallMinutes(prev) - 1;
   if (gap <= 0 || gap > 180) return null;
   for (let i = 1; i <= gap; i++) {
-    const t = new Date((wallMinutes(before) + i) * 60_000);
+    const t = new Date((wallMinutes(prev) + i) * 60_000);
     const skipped: Wall = { year: t.getUTCFullYear(), month: t.getUTCMonth() + 1, day: t.getUTCDate(), hour: t.getUTCHours(), minute: t.getUTCMinutes(), dow: t.getUTCDay() };
     if (matchesWall(c, skipped)) return key === lastFired ? null : key;
   }
   return null;
 }
 
-const nextCache = new Map<string, number | null>();
+// ───────────────────────────── missed runs (catch-up) ─────────────────────────────
+
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+/** The start of the minute `ms` falls in. */
+export const minuteOf = (ms: number) => Math.floor(ms / MINUTE) * MINUTE;
+/** The default catch-up window is never longer than this (and the look back for missed runs never shorter). */
+export const MAX_CATCHUP_WINDOW_MS = 24 * HOUR;
+
+/**
+ * The starts a schedule had in the minutes after `afterMs` and before `beforeMs` (minute starts, neither included) —
+ * exactly as cronDue would have made them minute by minute, from `lastFired` on, so a repeated hour counts once and a
+ * skipped one once. Looks back at most `maxBackMs` from `beforeMs` (`truncated` says the gap was longer).
+ */
+export function missedRuns(c: Cron, afterMs: number, beforeMs: number, tz: string | null | undefined, lastFired: string | null | undefined, maxBackMs = MAX_CATCHUP_WINDOW_MS) {
+  const first = Math.max(minuteOf(afterMs) + MINUTE, minuteOf(beforeMs) - maxBackMs);
+  const slots: number[] = [];
+  let fired = lastFired ?? null;
+  let prev: Wall | null = null;
+  for (let t = first; t < minuteOf(beforeMs); t += MINUTE) {
+    const w = wallTime(new Date(t), tz);
+    const p = prev;
+    const due = dueAt(c, w, () => p ?? wallTime(new Date(t - MINUTE), tz), fired);
+    prev = w;
+    if (!due) continue;
+    fired = due;
+    slots.push(t);
+  }
+  return { slots, lastFired: fired, truncated: first > minuteOf(afterMs) + MINUTE };
+}
+
+/** The first start after `fromMs` (not included), ignoring clock changes; null if none within a year. */
+function nextMatch(c: Cron, fromMs: number, tz?: string | null): number | null {
+  const start = minuteOf(fromMs) + MINUTE;
+  // Walk by the minute, but skip whole days whose date can't match (a time zone costs an Intl call per step).
+  for (let t = start, i = 0; i < 366 * 24 * 60; ) {
+    const w = wallTime(new Date(t), tz);
+    if (matchesWall(c, w)) return t;
+    const dayOk = c.fields[3].has(w.month) && (c.domStar && c.dowStar ? true : c.domStar ? c.fields[4].has(w.dow) : c.dowStar ? c.fields[2].has(w.day) : c.fields[2].has(w.day) || c.fields[4].has(w.dow));
+    // Not today: jump to (just before) the next midnight on the wall, minus an hour of slack for clock changes.
+    const step = dayOk ? (c.fields[1].has(w.hour) ? 1 : 60 - w.minute) : Math.max(1, (23 - w.hour) * 60 + (60 - w.minute) - 60);
+    t += step * MINUTE;
+    i += step;
+  }
+  return null;
+}
+
+/**
+ * How long after a missed start it is still worth running it late: half the time to the start after it (past that,
+ * the next regular run is nearer than the missed one), at most 24 h. A daily job catches up for 12 h, an hourly one
+ * for 30 min, an every-minute one never (30 s: by then its next run is already due). `overrideMs` replaces the rule.
+ */
+export function catchUpWindowMs(c: Cron, slotMs: number, tz?: string | null, overrideMs?: number | null): number {
+  if (overrideMs != null && overrideMs >= 0) return overrideMs;
+  let next = nextMatch(c, slotMs, tz);
+  // The repeated hour when clocks go back is not a start of a job set for certain hours (cronDue): the one after it is.
+  const key = wallKey(wallTime(new Date(slotMs), tz));
+  if (next !== null && c.fields[1].size < 24 && wallKey(wallTime(new Date(next), tz)) === key) next = nextMatch(c, next, tz);
+  return next === null ? MAX_CATCHUP_WINDOW_MS : Math.min(MAX_CATCHUP_WINDOW_MS, (next - slotMs) / 2);
+}
+
+/**
+ * What the scheduler finds at `now` after not looking since `afterMs` (Servify was stopped, the machine slept): the
+ * starts it missed, and whether the newest of them gets its one catch-up run — only when it is inside its window and
+ * the schedule isn't due this very minute anyway (that regular run covers it; never two at once). `lastFired` and
+ * `afterMs` come from what last ran, so a start that did happen is never missed.
+ */
+export function catchUpPlan(c: Cron, tz: string | null | undefined, o: { afterMs: number; now: Date; lastFired?: string | null; windowMs?: number | null }) {
+  const m = missedRuns(c, o.afterMs, o.now.getTime(), tz, o.lastFired, Math.max(MAX_CATCHUP_WINDOW_MS, o.windowMs ?? 0));
+  const last = m.slots.length ? m.slots[m.slots.length - 1] : null;
+  const dueNow = cronDue(c, o.now, tz, m.lastFired) !== null;
+  const windowMs = last === null ? null : catchUpWindowMs(c, last, tz, o.windowMs);
+  const catchUp = last !== null && windowMs !== null && !dueNow && o.now.getTime() - last <= windowMs;
+  return { missed: m.slots.length, truncated: m.truncated, last, lastFired: m.lastFired, dueNow, windowMs, catchUp };
+}
+
+/** expr|tz → the next start, and the moment it was worked out from (good for any later moment before that start). */
+const nextCache = new Map<string, { from: number; at: number | null }>();
 
 export function nextRun(expr: string, from = new Date(), tz?: string | null): Date | null {
   let c: Cron;
@@ -152,28 +233,15 @@ export function nextRun(expr: string, from = new Date(), tz?: string | null): Da
   } catch {
     return null;
   }
-  // Asked for on every serialised service: remember the answer until that moment has passed.
+  // Asked for on every serialised service: remember the answer until that moment has passed. Only for moments at or
+  // after the one it was worked out from — an earlier `from` may have an earlier next start.
   const cacheKey = `${expr}|${tz ?? ''}`;
   const hit = nextCache.get(cacheKey);
-  if (typeof hit === 'number' && hit > from.getTime()) return new Date(hit);
-  const start = Math.floor(from.getTime() / 60_000) * 60_000 + 60_000;
-  let found: number | null = null;
-  // Walk by the minute, but skip whole days whose date can't match (a time zone costs an Intl call per step).
-  for (let t = start, i = 0; i < 366 * 24 * 60; ) {
-    const d = new Date(t);
-    const w = wallTime(d, tz);
-    if (matchesWall(c, w)) {
-      found = t;
-      break;
-    }
-    const dayOk = c.fields[3].has(w.month) && (c.domStar && c.dowStar ? true : c.domStar ? c.fields[4].has(w.dow) : c.dowStar ? c.fields[2].has(w.day) : c.fields[2].has(w.day) || c.fields[4].has(w.dow));
-    // Not today: jump to (just before) the next midnight on the wall, minus an hour of slack for clock changes.
-    const step = dayOk ? (c.fields[1].has(w.hour) ? 1 : 60 - w.minute) : Math.max(1, (23 - w.hour) * 60 + (60 - w.minute) - 60);
-    t += step * 60_000;
-    i += step;
-  }
+  const t = from.getTime();
+  if (hit && typeof hit.at === 'number' && hit.from <= t && hit.at > t) return new Date(hit.at);
+  const found = nextMatch(c, t, tz);
   if (nextCache.size > 500) nextCache.clear();
-  nextCache.set(cacheKey, found);
+  nextCache.set(cacheKey, { from: t, at: found });
   return found === null ? null : new Date(found);
 }
 

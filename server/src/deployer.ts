@@ -9,12 +9,13 @@ import { engineAuthHeader, savedLoginHosts } from './registryauth.ts';
 import { databaseOf, demuxLines, normalizeImageRef, type DockerClient } from './docker.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes, LOCAL } from './nodes.ts';
 import { spawn } from 'node:child_process';
-import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable } from './db.ts';
+import { deployments as deploymentsTable, services as servicesTable, projects as projectsTable, backupsTable } from './db.ts';
 import type { Deployment, DeployTrigger, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { config } from './config.ts';
 import { id, KeyedLock, sleep } from './util.ts';
-import { isRestoring } from './backups.ts';
+import { ensureSafetyBackup, isRestoring, keepsData, SafetyBackupError } from './backups.ts';
+import { diskBlock } from './diskguard.ts';
 import { resolveEnv } from './vars.ts';
 import {
   busy,
@@ -178,6 +179,13 @@ function sourceLabel(svc: Service): string {
   return (s as any).path;
 }
 
+/**
+ * How long a new image on a service with data may take to become healthy, when the service's own grace is shorter: its
+ * first start may migrate the data (Nextcloud, Gitea, databases' minor upgrades…), and being killed half-way is the worst
+ * outcome. Crashes still fail at once; only "not healthy yet" waits longer.
+ */
+export const UPGRADE_GRACE_SEC = Number(process.env.SERVIFY_UPGRADE_GRACE_SECONDS ?? 600);
+
 /** Queue a deployment for the service. Returns immediately; the pipeline runs in the background. */
 const PRE_DEPLOY_MAX_MS = Number(process.env.SERVIFY_PRE_DEPLOY_MAX_SECONDS ?? 900) * 1000;
 
@@ -226,7 +234,7 @@ export function queueDeployment(
   svc: Service,
   trigger: DeployTrigger,
   actor: Actor,
-  opts: { image?: string; port?: number | null; fromDeployment?: Deployment; useCachedImage?: boolean } = {},
+  opts: { image?: string; port?: number | null; fromDeployment?: Deployment; useCachedImage?: boolean; skipSafetyBackup?: boolean; safetyBackupId?: string | null } = {},
 ): Deployment {
   // A deploy (or restart, rollback…) wakes a sleeping service: its new replicas must run.
   if (svc.sleeping) {
@@ -279,6 +287,10 @@ export function queueDeployment(
           schedule: svc.schedule ?? null,
         } as any,
     ...(opts.useCachedImage ? { useCachedImage: true } : {}),
+    // Only someone can decide to go ahead without a backup: never a git push, a hook or an auto-update.
+    ...(opts.skipSafetyBackup && actor.type !== 'system' ? { skipSafetyBackup: true } : {}),
+    // A tag switch backed up just before queueing this deploy: that backup is the one it relies on.
+    ...(opts.safetyBackupId ? { safetyBackupId: opts.safetyBackupId } : {}),
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,
@@ -347,6 +359,8 @@ async function runDeployment(depId: string, actor: Actor) {
           }
         }
         if (!from) throw new Error(`image ${dep.image} is no longer on any server — deploy again to ${src.type === 'image' ? 'pull' : 'build'} it fresh`);
+        const full = diskBlock('pull', node);
+        if (full) throw new Error(full.replace('image pulls are refused', 'copying images onto it is refused'));
         log(`▸ Copying ${dep.image} from ${nodeName(from)} to ${nodeName(node)}`);
         await d.loadImage(await dockerFor(from).exportImage(dep.image));
       }
@@ -359,11 +373,13 @@ async function runDeployment(depId: string, actor: Actor) {
         if (local && !update && !pulledFromRegistry(local, ref)) {
           log(`▸ Using local image ${ref} (made on this server, not pulled from a registry)`);
         } else if (!local || ref.endsWith(':latest') || update) {
-          log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`);
-          const raw = await pull(d, ref, log, node === LOCAL);
+          // Low disk space on that server's Docker disk: no download. A restart, rollback or move — or "deploy the
+          // cached image" — goes on with the copy already there, as it would when the registry is down.
+          const full = diskBlock('pull', node);
+          const raw = full ? full : (log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`), await pull(d, ref, log, node === LOCAL));
           if (raw) {
-            const reason = pullProblem(raw, ref);
-            if (local && !update && notOnDockerHub(raw, ref)) {
+            const reason = full ? 'low disk space' : pullProblem(raw, ref);
+            if (local && !update && !full && notOnDockerHub(raw, ref)) {
               log(`▸ ${ref} is not on Docker Hub — using the local image (made on this server)`);
             } else if (local && !update && reusing) {
               // Restarts, rollbacks and moves bring back a version that ran before: a registry hiccup mustn't stop them.
@@ -378,6 +394,10 @@ async function runDeployment(depId: string, actor: Actor) {
                   ? `▸ ${stays} To deploy the copy already on this server anyway (it may be older), use "Deploy cached image" on this deployment (API: POST /api/services/:id/deploy {"useCachedImage": true}).`
                   : `▸ ${stays}`,
               );
+              if (full) {
+                log(`✗ ${full}`);
+                throw new Error(full);
+              }
               throw new Error(`pull failed: ${reason}`);
             }
           }
@@ -401,6 +421,12 @@ async function runDeployment(depId: string, actor: Actor) {
           log(`▸ Using ${ref} (${String(pinned.Id).replace(/^sha256:/, '').slice(0, 12)}) as ${tag}`);
         }
       } else {
+        const full = diskBlock('build', node);
+        if (full) {
+          log(`✗ ${full}`);
+          log(`▸ ${svc.activeDeploymentId ? 'Nothing changed: the running version stays.' : 'Nothing was started.'}`);
+          throw new Error(full);
+        }
         const project = projectsTable.get(svc.projectId)!;
         const result = await buildSource(svc, project, dep, log);
         dep.image = result.image;
@@ -438,6 +464,35 @@ async function runDeployment(depId: string, actor: Actor) {
     const { env, unresolved } = resolveEnv(svc, dep.config.env, project, siblings, dep.port);
     if (unresolved.length) log(`! unresolved variable references: ${unresolved.join(', ')}`);
     (dep as any).resolvedEnv = env;
+
+    // ─── a new image on a service's data: a safety backup first (before pre-deploy migrations too) ───
+    // Restarts, variable changes, volume and project moves bring back the same image: nothing to guard. Compared by
+    // image id, since every deployment gets its own tag. What runs is asked of the container itself: deployments from before images were pinned name a moving tag, which
+    // after this deploy's pull already points at the new image.
+    const prevDep = svc.activeDeploymentId && svc.activeDeploymentId !== dep.id ? deploymentsTable.get(svc.activeDeploymentId) : null;
+    const prevReplica = prevDep ? replicasOf(svc.id).find((r) => r.deploymentId === prevDep.id) : null;
+    let prevImageId: string | null = null;
+    if (prevReplica) prevImageId = (await d.inspectContainer(prevReplica.containerId).catch(() => null))?.Image ?? null;
+    if (!prevImageId && prevDep?.image) prevImageId = (await d.inspectImage(prevDep.image).catch(() => null))?.Id ?? null;
+    const upgrade = !!prevDep?.image && prevImageId !== img.Id && keepsData(svc);
+    const preTaken = dep.safetyBackupId ? backupsTable.get(dep.safetyBackupId) : null;
+    if (upgrade) {
+      if (preTaken?.status === 'succeeded') {
+        log(`▸ Safety backup: the one from just before the switch (${new Date(preTaken.startedAt).toLocaleString()}, on ${preTaken.destinationName})`);
+      } else if (dep.skipSafetyBackup) {
+        log(`! No safety backup: skipped as asked by ${actor.name}`);
+        recordActivity(actor, 'backup.skipped', `Deploying a new image of ${svc.name} without a safety backup (skipped by ${actor.name})`, svc.projectId, svc.id);
+      } else {
+        try {
+          const r = await ensureSafetyBackup(svc, { purpose: 'deploy', actor, what: `deploying ${dep.sourceLabel}`, log });
+          if (r.status === 'off') log(`! No safety backup: ${r.message} — turn them on in Settings → Safety backups`);
+          dep.safetyBackupId = r.backup?.id ?? null;
+        } catch (e) {
+          if (e instanceof SafetyBackupError) dep.safetyRefused = true;
+          throw e;
+        }
+      }
+    }
 
     // ─── pre-deploy: once per new version (not on restarts, rollbacks or variable-only changes) ───
     const preDeploy = dep.config.preDeployCommand;
@@ -492,7 +547,10 @@ async function runDeployment(depId: string, actor: Actor) {
       stoppedOld = true;
       await drainAndRemove(oldContainers, 3000);
     }
-    const grace = (svc.healthcheck.graceSec || 60) * 1000;
+    const ownGrace = svc.healthcheck.graceSec || 60;
+    const graceSec = upgrade ? Math.max(ownGrace, UPGRADE_GRACE_SEC) : ownGrace;
+    if (graceSec > ownGrace) log(`▸ New image on ${svc.name}'s data: allowing up to ${graceSec}s for the first start (data migrations) instead of ${ownGrace}s`);
+    const grace = graceSec * 1000;
     if (rolling) {
       log(`▸ Rolling ${want} replica${want > 1 ? 's' : ''} one at a time (each has its own volume)`);
       for (const i of rollingOrder(svc, want)) {
@@ -574,7 +632,11 @@ async function runDeployment(depId: string, actor: Actor) {
     }
     log('✓ Deploy complete');
   } catch (e) {
-    const msg = (e as Error).message || String(e);
+    let msg = (e as Error).message || String(e);
+    const unattended = actor.type === 'system';
+    if (dep.safetyRefused) {
+      msg = `${msg} — nothing changed, the running version stays.${unattended ? '' : ' Deploy again with "skip safety backup" (API: {"skipSafetyBackup": true}) to go ahead without one.'}`;
+    }
     log(`✗ ${msg}`);
     if (stoppedOld) log('! The previous version had been stopped for this deploy: Servify starts it again now (on data the new version may already have changed)');
     dep.status = 'failed';
@@ -591,7 +653,7 @@ async function runDeployment(depId: string, actor: Actor) {
     notify({
       event: 'deploy.failed',
       level: 'error',
-      title: `Deploy of ${svc?.name ?? 'a service'} failed`,
+      title: dep.safetyRefused && unattended && dep.trigger === 'update' ? `Auto-update of ${svc?.name ?? 'a service'} skipped` : `Deploy of ${svc?.name ?? 'a service'} ${dep.safetyRefused ? 'refused' : 'failed'}`,
       message: `${projectsTable.get(dep.projectId)?.name ?? ''}: ${msg.slice(0, 300)}${!s?.activeDeploymentId ? '' : stoppedOld ? '\nThe previous version had been stopped for this deploy and is being started again — check that it came back (the new version may already have changed its data).' : '\nThe previous version is still serving traffic.'}\n\n${tail}`.trim(),
       projectId: dep.projectId,
       serviceId: dep.serviceId,
@@ -608,6 +670,11 @@ async function runDeployment(depId: string, actor: Actor) {
 
 export function isDeploying(serviceId: string) {
   return busy.has(serviceId);
+}
+
+/** A deploy runs, or is queued behind another one (or a restore) under the service's deploy lock. */
+export function deployPending(serviceId: string) {
+  return busy.has(serviceId) || lock.held(serviceId);
 }
 
 export { LABEL };

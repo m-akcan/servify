@@ -25,6 +25,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - name: Release signing checks (throwaway key)
+        run: node --disable-warning=ExperimentalWarning scripts/test-release-signing.mjs
       - run: pnpm build
       - name: Package (as a release would)
         run: node scripts/release.mjs --out dist

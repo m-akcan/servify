@@ -1,8 +1,10 @@
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
-import { kv, sessionsTable, tokensTable, type TokenRecord } from './db.ts';
+import { kv, sessionsTable, tokensTable, projects as projectsTable, type TokenRecord } from './db.ts';
 import { id, sha256, HttpError } from './util.ts';
 import { config } from './config.ts';
+import { getSettings } from './settings.ts';
 import type { Actor } from './events.ts';
+import type { TokenScope } from './policy.ts';
 
 export const SESSION_COOKIE = 'servify_session';
 const SESSION_TTL = 1000 * 60 * 60 * 24 * 30;
@@ -11,7 +13,7 @@ export function isSetUp(): boolean {
   return config.authMode === 'none' || !!kv.get('password_hash');
 }
 
-function hashPassword(pw: string): string {
+export function hashPassword(pw: string): string {
   const salt = randomBytes(16);
   const hash = scryptSync(pw, salt, 32);
   return `${salt.toString('hex')}:${hash.toString('hex')}`;
@@ -47,14 +49,26 @@ export function destroySession(sid: string | undefined) {
   if (sid) sessionsTable.delete(sid);
 }
 
-export function createToken(name: string, scope: 'read' | 'write', kind: 'agent' | 'device' = 'agent'): { token: string; record: TokenRecord } {
-  const raw = `svf_${randomBytes(24).toString('base64url')}`;
+/**
+ * `projects`: ids of the (base) projects an agent token is limited to; left out, it reaches all of them. Validate
+ * them first (normalizeTokenProjects below). Device tokens act as the owner: always write, never limited.
+ */
+export function createToken(name: string, scope: TokenScope, kind: 'agent' | 'device' = 'agent', projects?: string[] | null): { token: string; record: TokenRecord } {
+  if (!['read', 'deploy', 'write'].includes(scope)) throw new HttpError(400, 'scope must be read, deploy or write');
+  if (kind === 'device' && (scope !== 'write' || projects)) throw new HttpError(400, 'device tokens act as the owner');
+  if (projects && !projects.length) throw new HttpError(400, 'pick at least one project, or leave the list out for all projects');
+  // Deploy and project-limited tokens get their own prefix: Servify 0.2.3 and older only accept `svf_`, so after a
+  // rollback to such a version these tokens stop working instead of acting as full write tokens.
+  const narrowed = scope === 'deploy' || !!projects;
+  const raw = `${narrowed ? 'svs_' : 'svf_'}${randomBytes(24).toString('base64url')}`;
   const record: TokenRecord = {
     id: id(kind === 'device' ? 'dev' : 'tok'),
     name: name.trim().slice(0, 60) || kind,
     prefix: raw.slice(0, 10),
     scope,
     kind,
+    // Only written when set: a token for all projects is stored exactly as before scoped tokens existed.
+    ...(projects ? { projects: [...projects] } : {}),
     createdAt: Date.now(),
     lastUsedAt: null,
   };
@@ -62,31 +76,80 @@ export function createToken(name: string, scope: 'read' | 'write', kind: 'agent'
   return { token: raw, record };
 }
 
+/**
+ * Validate a token's project list: ids or slugs of existing base projects → their ids. Environments are refused
+ * (pick the project: its environments and pull-request previews come with it, and they read its shared variables).
+ */
+export function normalizeTokenProjects(raw: unknown): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) throw new HttpError(400, 'projects must be a list of project ids or slugs');
+  if (!raw.length) throw new HttpError(400, 'pick at least one project, or leave the list out for all projects');
+  if (raw.length > 100) throw new HttpError(400, 'at most 100 projects');
+  const ids = new Set<string>();
+  for (const r of raw) {
+    if (typeof r !== 'string' || !r.trim()) throw new HttpError(400, 'projects must be a list of project ids or slugs');
+    const ref = r.trim();
+    const p = projectsTable.get(ref) ?? projectsTable.all(`WHERE json_extract(data, '$.slug') = ?`, ref)[0];
+    if (!p) throw new HttpError(404, `project not found: ${ref}`);
+    if (p.parentId) {
+      const base = projectsTable.get(p.parentId);
+      throw new HttpError(400, `${p.slug} is an environment of ${base?.name ?? 'another project'}: pick ${base?.slug ?? 'that project'} — its environments and previews come with it`);
+    }
+    ids.add(p.id);
+  }
+  return [...ids];
+}
+
 const touchThrottle = new Map<string, number>();
 
-export function resolveToken(raw: string | undefined): TokenRecord | null {
-  if (!raw || !raw.startsWith('svf_')) return null;
+/** `X-Servify-App: <versionName>/<versionCode>`, as the phone app sends it; anything else is ignored. */
+export function parseAppHeader(h: string | undefined): { name: string; code: number } | null {
+  const m = h ? /^(\d{1,4}\.\d{1,4}\.\d{1,4})\/(\d{1,9})$/.exec(h.trim()) : null;
+  return m ? { name: m[1], code: Number(m[2]) } : null;
+}
+
+/**
+ * The token's record, with its last use noted (at most every 30 s). `appHeader`: the phone app's X-Servify-App header;
+ * for device tokens its version is kept on the record (written only when it changes), so the dashboard can show which
+ * phones run an old app.
+ */
+export function resolveToken(raw: string | undefined, appHeader?: string): TokenRecord | null {
+  if (!raw || !(raw.startsWith('svf_') || raw.startsWith('svs_'))) return null;
   const rec = tokensTable.byHash(sha256(raw));
   if (!rec) return null;
+  let dirty = false;
+  const app = rec.kind === 'device' ? parseAppHeader(appHeader) : null;
+  if (app && (rec.lastAppVersion !== app.name || rec.lastAppVersionCode !== app.code)) {
+    rec.lastAppVersion = app.name;
+    rec.lastAppVersionCode = app.code;
+    dirty = true;
+  }
   const last = touchThrottle.get(rec.id) ?? 0;
   if (Date.now() - last > 30_000) {
     touchThrottle.set(rec.id, Date.now());
     rec.lastUsedAt = Date.now();
-    tokensTable.touch(rec);
+    dirty = true;
   }
+  if (dirty) tokensTable.touch(rec);
   return rec;
 }
 
-/** tokenId: the token the request came with (agents and signed-in devices). */
-export type Principal = { actor: Actor; scope: 'read' | 'write'; tokenId?: string };
+/**
+ * tokenId: the token the request came with (agents and signed-in devices). projects: the project ids an agent token
+ * is limited to (their environments come with them); missing = all projects. See scopes.ts.
+ */
+export type Principal = { actor: Actor; scope: TokenScope; tokenId?: string; projects?: string[] };
 
-export function principalFor(opts: { cookie?: string; bearer?: string }): Principal | null {
+export function principalFor(opts: { cookie?: string; bearer?: string; app?: string }): Principal | null {
   if (opts.bearer) {
-    const t = resolveToken(opts.bearer);
+    const t = resolveToken(opts.bearer, opts.app);
     if (!t) return null;
     // A signed-in phone is the owner, like a dashboard session.
     if (t.kind === 'device') return { actor: { type: 'user', name: 'you' }, scope: 'write', tokenId: t.id };
-    return { actor: { type: 'agent', name: t.name }, scope: t.scope, tokenId: t.id };
+    // A record from before scoped tokens (or one for all projects) has no projects: unlimited, as it always was. A
+    // scope this version doesn't know reads as read-only rather than more.
+    const scope: TokenScope = t.scope === 'write' || t.scope === 'deploy' ? t.scope : 'read';
+    return { actor: { type: 'agent', name: t.name }, scope, tokenId: t.id, ...(Array.isArray(t.projects) ? { projects: [...t.projects] } : {}) };
   }
   if (config.authMode === 'none') return { actor: { type: 'user', name: 'you' }, scope: 'write' };
   if (validSession(opts.cookie)) return { actor: { type: 'user', name: 'you' }, scope: 'write' };
@@ -118,6 +181,8 @@ export function hostAllowed(hostHeader: string | undefined): boolean {
   if (host === config.host) return true;
   if (config.allowedHosts.includes(host)) return true;
   if (host.endsWith('.localhost')) return true;
+  // The dashboard domain (Settings → HTTPS): the router serves the dashboard there.
+  if (config.authMode !== 'none' && host === getSettings().dashboardDomain) return true;
   return false;
 }
 

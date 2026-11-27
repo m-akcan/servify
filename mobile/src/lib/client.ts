@@ -1,4 +1,6 @@
 /** Talking to one Servify over its REST API with the device token. */
+import { appHeaders, noteFeatures } from './appversion.ts';
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -46,7 +48,7 @@ export async function call<T>(base: string, token: string | null, method: string
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let res: Response;
   try {
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { ...appHeaders(base) };
     if (token) headers.authorization = `Bearer ${token}`;
     if (body !== undefined) headers['content-type'] = 'application/json';
     res = await fetch(`${base}/api${path}`, {
@@ -69,6 +71,8 @@ export async function call<T>(base: string, token: string | null, method: string
   } catch {
     data = null;
   }
+  // What this server supports (for example the X-Servify-App header), learned from any /auth/status answer.
+  if (res.ok && path === '/auth/status' && data && typeof data === 'object') noteFeatures(base, data.features);
   if (!res.ok) {
     const msg = humanize(res.status, data?.error, new URL(base).host);
     if (res.status === 401 && token && !path.startsWith('/auth/device')) throw new SignedOutError(401, 'This phone was signed out of Servify. Sign in again.');

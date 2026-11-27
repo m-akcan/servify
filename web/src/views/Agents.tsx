@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api.ts';
-import { useStore, store } from '../lib/store.ts';
+import { useStore, store, loadProjects } from '../lib/store.ts';
 import type { ApiToken, ActivityEntry } from '../lib/types.ts';
 import { Button, Modal, Segmented, CopyButton, toastError, confirmDialog, toast, Empty } from '../components/ui.tsx';
 import { Icon } from '../components/Icon.tsx';
@@ -24,6 +24,14 @@ const TOOLS = [
   ['get_activity', 'Audit trail of who did what'],
 ];
 
+type Scope = 'read' | 'deploy' | 'write';
+const SCOPE_LABEL: Record<Scope, string> = { write: 'full access', deploy: 'deploy only', read: 'read only' };
+const SCOPE_HINT: Record<Scope, string> = {
+  write: 'Everything an agent can do (owner-only settings stay in the dashboard).',
+  deploy: 'Deploy, restart, roll back and update images; read status and logs. No settings, variables, volumes, domains or deletes; secrets stay masked. Made for CI.',
+  read: 'Look, never touch: status, logs, metrics. Secrets stay masked.',
+};
+
 function Snippet({ title, code }: { title: string; code: string }) {
   return (
     <div className="snippet">
@@ -40,7 +48,12 @@ export function AgentsView({ settings }: { settings?: boolean }) {
   const [tokens, setTokens] = useState<ApiToken[]>([]);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('claude');
-  const [scope, setScope] = useState<'write' | 'read'>('write');
+  const [scope, setScope] = useState<Scope>('write');
+  const [limit, setLimit] = useState<'all' | 'some'>('all');
+  const [picked, setPicked] = useState<string[]>([]);
+  const projects = useStore((s) => s.projects);
+  const baseProjects = projects.filter((p) => !p.parentId);
+  const projectName = (id: string) => projects.find((p) => p.id === id)?.name ?? 'deleted project';
   const [newToken, setNewToken] = useState<string | null>(null);
   const [client, setClient] = useState<'claude-code' | 'json' | 'stdio' | 'rest'>('claude-code');
   const [agentActivity, setAgentActivity] = useState<ActivityEntry[]>([]);
@@ -49,6 +62,7 @@ export function AgentsView({ settings }: { settings?: boolean }) {
   const load = () => api.get<ApiToken[]>('/tokens').then(setTokens).catch(() => {});
   useEffect(() => {
     void load();
+    void loadProjects().catch(() => {});
     api
       .get<ActivityEntry[]>('/activity?limit=200')
       .then((a) => setAgentActivity(a.filter((x) => x.actorType === 'agent').slice(0, 30)))
@@ -58,9 +72,11 @@ export function AgentsView({ settings }: { settings?: boolean }) {
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const r = await api.post<{ token: string }>('/tokens', { name, scope });
+      const r = await api.post<{ token: string }>('/tokens', { name, scope, ...(limit === 'some' ? { projects: picked } : {}) });
       setNewToken(r.token);
       setCreating(false);
+      setLimit('all');
+      setPicked([]);
       void load();
     } catch (err) {
       toastError(err);
@@ -119,10 +135,18 @@ export function AgentsView({ settings }: { settings?: boolean }) {
                     <div className="grow">
                       <div className="row" style={{ gap: 8 }}>
                         <b>{t.name}</b>
-                        <span className="badge" data-tone={t.scope === 'write' ? 'signal' : 'idle'}>
-                          {t.scope === 'write' ? 'full access' : 'read only'}
+                        <span className="badge" data-tone={t.scope === 'write' ? 'signal' : t.scope === 'deploy' ? 'build' : 'idle'}>
+                          {SCOPE_LABEL[t.scope] ?? t.scope}
+                        </span>
+                        <span className="badge" data-tone="idle" title={t.projects ? t.projects.map(projectName).join(', ') : 'Every project, including new ones'}>
+                          {t.projects ? `${t.projects.length} project${t.projects.length === 1 ? '' : 's'}` : 'all projects'}
                         </span>
                       </div>
+                      {t.projects && (
+                        <div className="faint token-row-projects" style={{ fontSize: 11, marginTop: 2 }}>
+                          {t.projects.map(projectName).join(' · ')} <span className="faint">(+ their environments)</span>
+                        </div>
+                      )}
                       <div className="faint mono" style={{ fontSize: 11, marginTop: 2 }}>
                         {t.prefix}…  ·  created {timeAgo(t.createdAt)}  ·  {t.lastUsedAt ? `used ${timeAgo(t.lastUsedAt)}` : 'never used'}
                       </div>
@@ -170,7 +194,7 @@ export function AgentsView({ settings }: { settings?: boolean }) {
                   <span className="faint">{d}</span>
                 </div>
               ))}
-              <div className="faint" style={{ fontSize: 12, marginTop: 6 }}>+ 17 more: export/import projects, cron runs, load tests, stop/start, deployments, logs…</div>
+              <div className="faint" style={{ fontSize: 12, marginTop: 6 }}>+ 37 more: export/import projects, image updates, cron runs, load tests, stop/start, deployments, logs…</div>
             </div>
           </section>
 
@@ -263,15 +287,45 @@ export function AgentsView({ settings }: { settings?: boolean }) {
               onChange={setScope}
               options={[
                 { value: 'write', label: 'Full access' },
+                { value: 'deploy', label: 'Deploy only' },
                 { value: 'read', label: 'Read only' },
               ]}
             />
+            <span className="field-hint">{SCOPE_HINT[scope]}</span>
           </label>
+          <div className="field">
+            <span className="label">Projects</span>
+            <Segmented
+              value={limit}
+              onChange={setLimit}
+              options={[
+                { value: 'all', label: 'All projects' },
+                { value: 'some', label: 'Only some' },
+              ]}
+            />
+            {limit === 'some' && (
+              <div className="token-projects">
+                {baseProjects.length === 0 && <span className="faint">No projects yet.</span>}
+                {baseProjects.map((p) => (
+                  <label key={p.id} className="token-project">
+                    <input type="checkbox" checked={picked.includes(p.id)} onChange={(e) => setPicked((cur) => (e.target.checked ? [...cur, p.id] : cur.filter((x) => x !== p.id)))} />
+                    <span className="grow truncate">{p.name}</span>
+                    {p.environments > 0 && <span className="faint">+{p.environments} env</span>}
+                  </label>
+                ))}
+              </div>
+            )}
+            <span className="field-hint">
+              {limit === 'all'
+                ? 'Every project, including ones created later.'
+                : 'Only these projects, their environments and pull-request previews. It can’t create projects or see anything instance-wide.'}
+            </span>
+          </div>
           <div className="row" style={{ justifyContent: 'flex-end' }}>
             <Button type="button" variant="ghost" onClick={() => setCreating(false)}>
               Cancel
             </Button>
-            <Button type="submit" variant="primary" disabled={!name.trim()}>
+            <Button type="submit" variant="primary" disabled={!name.trim() || (limit === 'some' && picked.length === 0)}>
               Create token
             </Button>
           </div>

@@ -3,6 +3,7 @@ import { drainTraffic } from './proxy.ts';
 import { allRuntime, setReplicaRps, setReplicaStats } from './engine.ts';
 import { bus } from './events.ts';
 import { services as servicesTable, db } from './db.ts';
+import { persistPaused, noteSkipped } from './diskguard.ts';
 import type { ServiceMetricsPoint } from './types.ts';
 
 const HISTORY = 900; // 15 minutes at 1s
@@ -53,6 +54,14 @@ function accumulate(serviceId: string, p: ServiceMetricsPoint) {
 
 function flushBucket(t: number) {
   if (!acc.size) return;
+  if (persistPaused()) {
+    // Low-disk protection: the last 15 minutes stay in memory (the charts), nothing goes to the database.
+    let n = 0;
+    for (const a of acc.values()) if (a.n && !(a.rps === 0 && a.replicas === 0 && a.cpu === 0)) n++;
+    noteSkipped('metricRows', n);
+    acc.clear();
+    return;
+  }
   db.exec('BEGIN');
   try {
     for (const [sid, a] of acc) {
@@ -112,6 +121,11 @@ async function pollStats() {
 
 let currentBucket = 0;
 
+/** Rows past the retention are deleted: returns how many. */
+export function pruneMetrics(): number {
+  return Number(db.prepare('DELETE FROM metrics WHERE t < ?').run(Date.now() - RETENTION_DAYS * 86400_000).changes);
+}
+
 export function startMetrics() {
   let last = Date.now();
   setInterval(() => {
@@ -155,7 +169,7 @@ export function startMetrics() {
       currentBucket = bucket;
     }
   }, 1000);
-  setInterval(() => db.prepare('DELETE FROM metrics WHERE t < ?').run(Date.now() - RETENTION_DAYS * 86400_000), 3600_000);
+  setInterval(pruneMetrics, 3600_000);
   bus.subscribe((ev) => {
     if (ev.type === 'service.deleted') {
       history.delete(ev.serviceId);

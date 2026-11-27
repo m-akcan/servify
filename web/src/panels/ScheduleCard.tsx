@@ -35,6 +35,8 @@ export function ScheduleCard({ service: s }: { service: ServiceView }) {
     };
   }, [s.id]);
   const runningNow = runs.some((r) => r.status === 'running');
+  const failing = s.cron?.failing;
+  const pending = s.cron?.pendingCatchUp;
 
   return (
     <section className="card scale-card">
@@ -70,30 +72,76 @@ export function ScheduleCard({ service: s }: { service: ServiceView }) {
           {runningNow ? 'Running' : 'Run now'}
         </Button>
       </div>
+      {(failing || pending) && (
+        <div className="sched-state">
+          {failing && (
+            <div className="callout callout-err" style={{ fontSize: 12 }}>
+              <Icon name="alert" size={13} />
+              <span>
+                Failing since {new Date(failing.since).toLocaleString()} — {failing.count} failed run{failing.count === 1 ? '' : 's'} in a row.{' '}
+                <span className="faint">{failing.notifiedAt ? `Notified ${timeAgo(failing.notifiedAt)}; next a reminder, or once when it works again.` : 'No notification went out.'}</span>
+              </span>
+            </div>
+          )}
+          {pending && (
+            <div className="callout" style={{ fontSize: 12 }}>
+              <Icon name="clock" size={13} />
+              <span>
+                Catching up: the run due {new Date(pending.dueAt).toLocaleString()} {pending.missed > 1 ? `(and ${pending.missed - 1} more missed) ` : ''}runs once, as soon as it can.
+              </span>
+            </div>
+          )}
+        </div>
+      )}
       <div className="replica-list">
         {runs.length === 0 && <div className="faint" style={{ fontSize: 12, padding: '10px 16px' }}>No runs yet.</div>}
-        {runs.map((r) => (
-          <div key={r.id} className="run-row-wrap">
-            <button className="run-row" onClick={() => setOpen(open === r.id ? null : r.id)}>
-              <Badge tone={r.status === 'succeeded' ? 'ok' : r.status === 'failed' ? 'err' : 'warn'} live={r.status === 'running'}>
-                {r.status}
-              </Badge>
-              <span className="mono faint" style={{ fontSize: 11 }}>
-                {r.exitCode != null ? `exit ${r.exitCode}` : ''}
-              </span>
-              <span className="grow" />
-              <span className="actor-pill">
-                <Icon name={r.trigger === 'schedule' ? 'clock' : r.trigger === 'agent' ? 'bot' : 'user'} size={10} />
-                {r.trigger === 'schedule' ? 'schedule' : r.actor}
-              </span>
-              <span className="faint" style={{ fontSize: 11, minWidth: 110, textAlign: 'right' }}>
-                {timeAgo(r.startedAt)} · {duration((r.finishedAt ?? Date.now()) - r.startedAt)}
-              </span>
-              <Icon name="chevronDown" size={13} className="deploy-chev" style={{ transform: open === r.id ? 'rotate(180deg)' : undefined }} />
-            </button>
-            {open === r.id && <pre className="run-output mono no-canvas-wheel">{r.output || (r.status === 'running' ? 'Running…' : '(no output)')}</pre>}
-          </div>
-        ))}
+        {runs.map((r) =>
+          r.status === 'skipped' ? (
+            <div key={r.id} className="run-row-wrap">
+              <div className="run-row run-skipped">
+                <Badge tone="idle">skipped{(r.skipCount ?? 1) > 1 ? ` ×${r.skipCount}` : ''}</Badge>
+                <span className="faint grow truncate" style={{ fontSize: 11 }} title={r.reason}>
+                  {r.reason}
+                </span>
+                <span className="faint" style={{ fontSize: 11, minWidth: 110, textAlign: 'right' }}>
+                  {(r.skipCount ?? 1) > 1 && r.finishedAt ? `${timeAgo(r.startedAt)} – ${timeAgo(r.finishedAt)}` : timeAgo(r.startedAt)}
+                </span>
+                <span style={{ width: 13 }} />
+              </div>
+            </div>
+          ) : (
+            <div key={r.id} className="run-row-wrap">
+              <button className="run-row" onClick={() => setOpen(open === r.id ? null : r.id)}>
+                <Badge tone={r.status === 'succeeded' ? 'ok' : r.status === 'failed' ? 'err' : 'warn'} live={r.status === 'running'}>
+                  {r.status}
+                </Badge>
+                <span className="mono faint" style={{ fontSize: 11 }}>
+                  {r.exitCode != null ? `exit ${r.exitCode}` : ''}
+                </span>
+                {r.catchUp && (
+                  <span className="badge" data-tone="signal" title={`Run late, once, for ${r.catchUp.missed === 1 ? 'the run' : `${r.catchUp.missed} runs`} missed while Servify wasn't running or the server was offline (due ${new Date(r.catchUp.dueAt).toLocaleString()})`}>
+                    catch-up
+                  </span>
+                )}
+                <span className="grow" />
+                <span className="actor-pill">
+                  <Icon name={r.trigger === 'schedule' ? 'clock' : r.trigger === 'agent' ? 'bot' : 'user'} size={10} />
+                  {r.trigger === 'schedule' ? 'schedule' : r.actor}
+                </span>
+                <span className="faint" style={{ fontSize: 11, minWidth: 110, textAlign: 'right' }}>
+                  {timeAgo(r.startedAt)} · {duration((r.finishedAt ?? Date.now()) - r.startedAt)}
+                </span>
+                <Icon name="chevronDown" size={13} className="deploy-chev" style={{ transform: open === r.id ? 'rotate(180deg)' : undefined }} />
+              </button>
+              {open === r.id && (
+                <pre className="run-output mono no-canvas-wheel">
+                  {r.catchUp ? `catch-up run for the start due ${new Date(r.catchUp.dueAt).toLocaleString()}${r.catchUp.missed > 1 ? ` (${r.catchUp.missed} starts missed)` : ''}\n\n` : ''}
+                  {r.output || (r.status === 'running' ? 'Running…' : '(no output)')}
+                </pre>
+              )}
+            </div>
+          ),
+        )}
       </div>
     </section>
   );

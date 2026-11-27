@@ -51,6 +51,10 @@ type Runtime = Replica & {
   fails: number;
   lastProbe: number;
   crashTimes: number[];
+  /** Start of the current run of failed probes while Docker says the container runs (null = passing, or not running). */
+  failingSince: number | null;
+  /** Passed a probe since its container last started. */
+  everHealthy: boolean;
 };
 
 const runtime = new Map<string, Runtime>(); // containerId → runtime
@@ -65,6 +69,8 @@ function dropRuntime(cid: string) {
 export const busy = new Map<string, Set<string>>(); // serviceId → deployment ids being rolled out
 /** Containers being drained before removal. */
 const draining = new Set<string>();
+/** Containers Servify is restarting on purpose (hung replicas): not a crash, and the reconciler leaves them alone meanwhile. */
+const restarting = new Set<string>();
 const lastPublished = new Map<string, string>();
 /** Short-lived memo of crash-looping services to back off re-creation. */
 const backoffUntil = new Map<string, number>();
@@ -93,7 +99,7 @@ export function replicasOf(serviceId: string): Replica[] {
   const out: Replica[] = [];
   for (const r of runtime.values()) {
     if (r.serviceId !== serviceId) continue;
-    const { network, probing, fails, lastProbe, crashTimes, ...pub } = r;
+    const { network, probing, fails, lastProbe, crashTimes, failingSince, everHealthy, ...pub } = r;
     out.push(pub);
   }
   return out.sort((a, b) => (a.deploymentId === b.deploymentId ? a.index - b.index : a.deploymentId < b.deploymentId ? -1 : 1));
@@ -413,7 +419,17 @@ export async function adopt(cid: string, nodeId = containerNodeOf(cid)): Promise
     fails: 0,
     lastProbe: 0,
     crashTimes: [],
+    failingSince: null,
+    everHealthy: false,
   };
+  const startedAt = info.State?.StartedAt ? Date.parse(info.State.StartedAt) : null;
+  if (prev && startedAt && prev.startedAt && startedAt !== prev.startedAt) {
+    // Started again (a restart, a wake-up, Docker's restart policy): health is judged afresh, with the startup grace.
+    r.fails = 0;
+    r.failingSince = null;
+    r.everHealthy = false;
+    if (dockerState === 'running' && r.state !== 'draining') r.state = 'starting';
+  }
   if (prev && restarts > prev.restarts) {
     r.crashTimes.push(Date.now());
     r.state = 'starting';
@@ -423,9 +439,10 @@ export async function adopt(cid: string, nodeId = containerNodeOf(cid)): Promise
   r.dockerState = dockerState;
   r.host = host;
   r.port = hostPort;
-  r.startedAt = info.State?.StartedAt ? Date.parse(info.State.StartedAt) : null;
+  r.startedAt = startedAt;
   if (dockerState !== 'running') {
-    if (r.state !== 'exited' && prev && dockerState === 'exited') r.crashTimes.push(Date.now());
+    r.failingSince = null;
+    if (r.state !== 'exited' && prev && dockerState === 'exited' && !restarting.has(cid)) r.crashTimes.push(Date.now());
     r.state = dockerState === 'restarting' ? 'starting' : 'exited';
   } else if (r.state === 'exited') {
     r.state = 'starting';
@@ -522,11 +539,15 @@ async function probe(r: Runtime, svc: Service) {
     if (draining.has(r.containerId)) r.state = 'draining';
     else if (ok) {
       r.fails = 0;
+      r.failingSince = null;
+      r.everHealthy = true;
       r.state = 'healthy';
     } else if (r.dockerState !== 'running') {
+      r.failingSince = null;
       r.state = 'exited';
     } else {
       r.fails++;
+      r.failingSince ??= r.lastProbe;
       if (r.state === 'healthy' && r.fails >= 3) r.state = 'unhealthy';
     }
     if (before !== r.state) publishReplicas(svc);
@@ -547,6 +568,67 @@ function startProber() {
       if (now - r.lastProbe >= interval) void probe(r, svc);
     }
   }, 350);
+}
+
+/** How a replica's health checks are going, for the hung-replica restarts (autorestart.ts). */
+export type ProbeHealth = Pick<Runtime, 'containerId' | 'nodeId' | 'serviceId' | 'deploymentId' | 'index' | 'state' | 'dockerState' | 'startedAt' | 'fails' | 'failingSince' | 'everHealthy'>;
+export function probeHealth(serviceId: string): ProbeHealth[] {
+  const out: ProbeHealth[] = [];
+  for (const r of runtime.values()) {
+    if (r.serviceId !== serviceId || draining.has(r.containerId)) continue;
+    const { containerId, nodeId, deploymentId, index, state, dockerState, startedAt, fails, failingSince, everHealthy } = r;
+    out.push({ containerId, nodeId, serviceId, deploymentId, index, state, dockerState, startedAt, fails, failingSince, everHealthy });
+  }
+  return out;
+}
+
+/** Probe a replica once more right now; true when it passed. */
+export async function probeNow(cid: string): Promise<boolean> {
+  const r = runtime.get(cid);
+  const svc = r ? servicesTable.get(r.serviceId) : null;
+  if (!r || !svc) return false;
+  for (let i = 0; r.probing && i < 200; i++) await sleep(100);
+  await probe(r, svc);
+  return r.failingSince === null && r.state === 'healthy';
+}
+
+/**
+ * Restart a running replica in place (a hung one): stop it (SIGTERM, then SIGKILL after 10 s) and start the same
+ * container again. Like the reconciler does for a crashed one: when it won't start, it is removed and recreated by the
+ * next pass. Throws when Docker could not be asked (the caller treats that as "unknown", not as a restart).
+ */
+export async function restartReplica(cid: string): Promise<void> {
+  const r = runtime.get(cid);
+  if (!r) throw new Error('replica is gone');
+  const node = r.nodeId;
+  const d = dockerFor(node);
+  restarting.add(cid);
+  try {
+    await d.stopContainer(cid, 10);
+    try {
+      await d.startContainer(cid);
+    } catch (e) {
+      if (!isOnline(node)) throw e;
+      await d.removeContainer(cid, true).catch(() => {});
+      dropRuntime(cid);
+      requestReconcile();
+      return;
+    }
+    await adopt(cid, node);
+  } finally {
+    restarting.delete(cid);
+    const svc = servicesTable.get(r.serviceId);
+    if (svc) publishReplicas(svc);
+  }
+}
+
+/** Show a replica that is past its grace and still failing as unhealthy (not "starting"), e.g. once restarts stopped. */
+export function markUnhealthy(cid: string) {
+  const r = runtime.get(cid);
+  if (!r || r.state === 'healthy' || r.state === 'unhealthy' || r.dockerState !== 'running' || draining.has(cid)) return;
+  r.state = 'unhealthy';
+  const svc = servicesTable.get(r.serviceId);
+  if (svc) publishReplicas(svc);
 }
 
 export async function waitHealthy(cids: string[], svc: Service, timeoutMs: number, onLine?: (l: string) => void): Promise<{ ok: boolean; reason?: string; cid?: string }> {
@@ -779,6 +861,7 @@ async function convergeService(svc: Service, list: ContainerSummary[]) {
     if (busy.has(svc.id)) return; // a deploy just started: it owns the containers now
     if (isHeld(svc.id, i)) continue; // fenced: never restart or recreate it until it's released
     const c = ofActive.get(i);
+    if (c && restarting.has(c.Id)) continue; // being restarted on purpose (a hung replica): it comes back by itself
     if (!c) {
       if (backingOff) continue;
       try {
@@ -842,6 +925,8 @@ export async function startEngine() {
   onNodeChange((node, online) => {
     // The dashboard shows each service's server state: re-send the services that live there.
     for (const svc of servicesTable.all()) if (nodeOf(svc) === node) bus.publish({ type: 'service.updated', service: svc });
+    // Probes through a dropped or new connection say nothing about the replicas: their failure clocks start over.
+    for (const r of runtime.values()) if (r.nodeId === node) r.failingSince = null;
     if (!online) return;
     // Back online: refresh what we knew (new forwarders), follow its events, and converge.
     void (async () => {

@@ -15,6 +15,33 @@ const PRESETS = [
   { label: 'Weekly', value: '0 3 * * 0' },
 ];
 
+/** Sundays 05:00: after a nightly 03:00 backup. */
+const TEST_WEEKLY = '0 5 * * 0';
+
+function TestBadge({ b }: { b: BackupRecord }) {
+  const t = b.test;
+  if (!t) return null;
+  if (t.status === 'running')
+    return (
+      <span className="badge live" data-tone="build">
+        <span className="dot" />
+        testing
+      </span>
+    );
+  const meta = {
+    passed: { tone: 'ok', short: 'test passed', long: 'Test restore passed' },
+    checked: { tone: 'warn', short: 'archive checked', long: 'Archive checked end to end, but not restored (no room for a scratch copy)' },
+    failed: { tone: 'err', short: 'test failed', long: 'Test restore failed' },
+  }[t.status];
+  return (
+    <Tooltip label={`${meta.long} ${timeAgo(t.finishedAt ?? t.startedAt)}: ${t.message}`}>
+      <span className="badge" data-tone={meta.tone} tabIndex={0}>
+        {meta.short} {timeAgo(t.finishedAt ?? t.startedAt)}
+      </span>
+    </Tooltip>
+  );
+}
+
 const METHOD: Record<string, { title: string; body: string }> = {
   pg_dumpall: { title: 'PostgreSQL dump', body: 'A consistent pg_dumpall of every database, taken while Postgres keeps serving.' },
   mysqldump: { title: 'MySQL dump', body: 'A single-transaction mysqldump of all databases, routines and triggers.' },
@@ -34,7 +61,7 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
   const [list, setList] = useState<BackupRecord[]>([]);
   const [dests, setDests] = useState<Destination[]>([]);
   const [busy, setBusy] = useState(false);
-  const cfg = s.backup ?? { enabled: false, schedule: '0 3 * * *', retention: 7, destinationId: 'local' };
+  const cfg = s.backup ?? { enabled: false, schedule: '0 3 * * *', retention: 7, destinationId: 'local', testSchedule: null };
   const [draft, setDraft] = useState(cfg);
   const [custom, setCustom] = useState(!PRESETS.some((p) => p.value === cfg.schedule));
   const dirty = JSON.stringify(draft) !== JSON.stringify(cfg);
@@ -45,7 +72,7 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
     api.get<{ backups: { destinations: Destination[] } }>('/settings').then((r) => setDests(r.backups.destinations)).catch(() => {});
   }, [s.id]);
   // Poll while something is in flight (backups run in the background).
-  const running = list.some((b) => b.status === 'running') || s.restoring;
+  const running = list.some((b) => b.status === 'running' || b.test?.status === 'running') || s.restoring;
   useEffect(() => {
     if (!running) return;
     const t = setInterval(load, 1500);
@@ -66,7 +93,7 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
 
   const save = async () => {
     try {
-      await api.patch(`/services/${s.id}`, { backup: draft });
+      await api.patch(`/services/${s.id}`, { backup: { ...draft, catchUp: draft.catchUp ?? null } }); // null: back to the default (on)
       toast({ title: draft.enabled ? 'Backup schedule saved' : 'Scheduled backups off', tone: 'ok' });
     } catch (e) {
       toastError(e, 'Could not save');
@@ -92,7 +119,8 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
       title: `Restore ${s.name}?`,
       body: (
         <>
-          The current data is replaced by the backup from <b>{new Date(b.createdAt).toLocaleString()}</b>. Servify takes a safety backup first, then restarts {s.name}; expect a short interruption.
+          The current data is replaced by the backup from <b>{new Date(b.createdAt).toLocaleString()}</b>. Servify reads the whole backup first and refuses a damaged one, then takes a safety backup and restarts {s.name}; expect a short interruption.
+          {!b.sha256 && <> This backup was made before checksums existed: it is checked as an archive only, not against a checksum.</>}
         </>
       ),
       confirm: 'Restore',
@@ -106,6 +134,20 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
     } catch (e) {
       toastError(e, 'Could not restore');
     }
+  };
+
+  const test = async (b: BackupRecord) => {
+    try {
+      await api.post(`/backups/${b.id}/test`);
+      toast({ title: 'Test restore started', body: `The backup is checked end to end and restored into ${b.method === 'volume' ? 'a scratch volume' : 'a throwaway database'}; ${s.name} is not touched.`, tone: 'build' });
+      void load();
+    } catch (e) {
+      toastError(e, 'Could not start the test restore');
+    }
+  };
+
+  const copyHash = (h: string) => {
+    void navigator.clipboard?.writeText(h).then(() => toast({ title: 'Checksum copied', body: `sha256 ${h}`, tone: 'ok' }), () => {});
   };
 
   const remove = async (b: BackupRecord) => {
@@ -127,7 +169,7 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
         <div className="grow">
           <div className="h3">{m.title}</div>
           <div className="faint" style={{ fontSize: 12, marginTop: 2 }}>
-            {m.body} Restores take a safety backup first.
+            {m.body} Restores take a safety backup first; so do new images and deleting volumes (Settings → Safety backups).
           </div>
         </div>
         <Button variant="primary" size="sm" icon="download" loading={busy} disabled={s.restoring || !s.activeDeploymentId} onClick={() => void now()}>
@@ -142,6 +184,28 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
         </div>
       )}
 
+      {s.backupHealth?.failing && (
+        <div className="callout callout-err">
+          <Icon name="alert" size={14} />
+          <span>
+            Scheduled backups failing since {new Date(s.backupHealth.failing.since).toLocaleString()} — {s.backupHealth.failing.count} in a row. Notified once{s.backupHealth.failing.reminders ? ` (+${s.backupHealth.failing.reminders} reminder${s.backupHealth.failing.reminders === 1 ? '' : 's'})` : ''}; you hear again when one works.
+          </span>
+        </div>
+      )}
+      {s.backupHealth?.testFailing && (
+        <div className="callout callout-err">
+          <Icon name="alert" size={14} />
+          <span>
+            Scheduled test restores failing since {new Date(s.backupHealth.testFailing.since).toLocaleString()} — {s.backupHealth.testFailing.count} in a row.
+          </span>
+        </div>
+      )}
+      {s.backupHealth?.pendingCatchUp && (
+        <div className="callout">
+          <Icon name="clock" size={14} />
+          <span>Catching up: the backup due {new Date(s.backupHealth.pendingCatchUp.dueAt).toLocaleString()} runs once, as soon as it can.</span>
+        </div>
+      )}
       <section className="card settings-card">
         <div className="setting-row">
           <div className="grow">
@@ -187,6 +251,28 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
                 <Stepper value={draft.retention} min={1} max={365} onChange={(v) => setDraft({ ...draft, retention: v })} />
               </div>
             </div>
+            <div className="setting-row">
+              <div className="grow">
+                <div className="section-title">Test restores</div>
+                <div className="section-desc">
+                  {draft.testSchedule
+                    ? `${describeCron(draft.testSchedule)}: the newest backup is restored into ${s.backupMethod === 'volume' ? 'a scratch volume' : 'a throwaway database'}, never ${s.name} itself. A failure is notified.`
+                    : 'Off — test a backup by hand with Test in the history'}
+                </div>
+              </div>
+              <Switch checked={!!draft.testSchedule} onChange={(v) => setDraft({ ...draft, testSchedule: v ? TEST_WEEKLY : null })} label="Weekly test restores" />
+            </div>
+            <div className="setting-row">
+              <div className="grow">
+                <div className="section-title">Catch up missed backups</div>
+                <div className="section-desc">
+                  {draft.catchUp !== false
+                    ? 'A scheduled backup (or test restore) missed while Servify was down runs once, late — if that is within half the time to the next one (at most 24 h).'
+                    : 'Off — a missed backup waits for the next scheduled one'}
+                </div>
+              </div>
+              <Switch checked={draft.catchUp !== false} onChange={(v) => setDraft({ ...draft, catchUp: v ? undefined : false })} label="Catch up missed backups" />
+            </div>
           </div>
         )}
         <div className="row" style={{ marginTop: 14, gap: 8 }}>
@@ -216,16 +302,47 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
             {list.map((b) => (
               <div className={`backup-row ${b.status}`} key={b.id}>
                 <Badge tone={b.status === 'succeeded' ? 'ok' : b.status === 'failed' ? 'err' : 'build'} live={b.status === 'running'}>
-                  {b.status === 'running' ? 'Running' : b.status === 'failed' ? 'Failed' : (b.trigger as string) === 'pre-restore' ? 'Safety' : b.trigger === 'schedule' ? 'Scheduled' : 'Manual'}
+                  {b.status === 'running' ? 'Running' : b.status === 'failed' ? 'Failed' : b.trigger === 'pre-restore' || b.trigger === 'safety' ? 'Safety' : b.trigger === 'schedule' ? 'Scheduled' : 'Manual'}
                 </Badge>
                 <div className="grow" style={{ minWidth: 0 }}>
-                  <div className="row" style={{ gap: 8 }}>
+                  <div className="row backup-row-head">
                     <span>{new Date(b.createdAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</span>
                     {b.restoredAt && <span className="badge" data-tone="signal">restored {timeAgo(b.restoredAt)}</span>}
+                    {b.catchUp && (
+                      <Tooltip label={`Run late, once, for the scheduled backup due ${new Date(b.catchUp.dueAt).toLocaleString()} — missed while Servify wasn't running`}>
+                        <span className="badge" data-tone="signal" tabIndex={0}>
+                          catch-up
+                        </span>
+                      </Tooltip>
+                    )}
+                    {b.status === 'succeeded' && !b.sha256 && (
+                      <Tooltip label="Made before checksums existed: restores check it as an archive only. A test restore still proves it works.">
+                        <span className="badge" data-tone="warn" tabIndex={0}>
+                          not verified
+                        </span>
+                      </Tooltip>
+                    )}
+                    <TestBadge b={b} />
                   </div>
                   <div className="faint mono truncate" style={{ fontSize: 11, marginTop: 2 }}>
-                    {b.status === 'failed' ? b.error : `${formatSize(b.sizeBytes)} · ${b.destinationName} · ${duration((b.finishedAt ?? Date.now()) - b.startedAt)} · by ${b.actor}`}
+                    {b.status === 'failed'
+                      ? b.error
+                      : `${formatSize(b.sizeBytes)} · ${b.destinationName} · ${duration((b.finishedAt ?? Date.now()) - b.startedAt)} · by ${b.actor}${b.purpose ? ` · before ${b.purpose}` : b.trigger === 'pre-restore' ? ' · before a restore' : ''}`}
                   </div>
+                  {b.status === 'succeeded' && b.sha256 && (
+                    <div className="faint mono" style={{ fontSize: 11, marginTop: 2 }}>
+                      <Tooltip label={`SHA-256 of the stored file: ${b.sha256} (click to copy)`}>
+                        <button className="link mono" style={{ fontSize: 11 }} onClick={() => copyHash(b.sha256!)}>
+                          sha256 {b.sha256.slice(0, 16)}…
+                        </button>
+                      </Tooltip>
+                    </div>
+                  )}
+                  {b.test?.status === 'failed' && (
+                    <div className="mono truncate" style={{ fontSize: 11, marginTop: 2, color: 'var(--err)' }}>
+                      Test restore failed: {b.test.message}
+                    </div>
+                  )}
                 </div>
                 {b.status === 'succeeded' && (
                   <div className="row" style={{ gap: 2 }}>
@@ -233,6 +350,11 @@ export function BackupsTab({ service: s }: { service: ServiceView }) {
                       <a className="btn btn-ghost btn-sm btn-icon" href={`/api/backups/${b.id}/download`} aria-label="Download">
                         <Icon name="download" size={14} />
                       </a>
+                    </Tooltip>
+                    <Tooltip label={`Check it end to end and restore it into ${b.method === 'volume' ? 'a scratch volume' : 'a throwaway database'} — ${s.name} is not touched`}>
+                      <Button size="sm" variant="ghost" icon="shield" disabled={b.test?.status === 'running'} onClick={() => void test(b)}>
+                        Test
+                      </Button>
                     </Tooltip>
                     <Button size="sm" variant="ghost" icon="history" disabled={s.restoring} onClick={() => void restore(b)}>
                       Restore

@@ -1,8 +1,8 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import { api } from './api.ts';
+import { api, ApiError } from './api.ts';
 import { store, useStore, createStore } from './store.ts';
 import type { ServiceView, VolumeRecord } from './types.ts';
-import { Button, Modal, Field, Switch, Segmented, toast, toastError, confirmDialog, type MenuItem } from '../components/ui.tsx';
+import { Button, Modal, Field, Switch, Segmented, toast, toastError, dismissToast, confirmDialog, type MenuItem } from '../components/ui.tsx';
 import { Icon, ServiceGlyph } from '../components/Icon.tsx';
 
 export function bytes(n: number | null | undefined) {
@@ -96,11 +96,37 @@ export async function deleteVolume(v: VolumeRecord) {
     typeToConfirm: v.name,
   });
   if (!ok) return;
+  const go = async (skip: boolean) => {
+    const r = await api.del<{ safetyBackup?: { status: string; destinationName: string; startedAt: number } | null }>(`/volumes/${v.id}${skip ? '?skipSafetyBackup=1' : ''}`);
+    const b = r?.safetyBackup;
+    toast({
+      title: `${v.name} deleted`,
+      body: b ? `${b.status === 'taken' ? 'A safety backup was taken first' : 'A recent backup holds its data'} (${new Date(b.startedAt).toLocaleString()}, on ${b.destinationName}).` : skip ? 'Without a safety backup, as asked.' : undefined,
+      tone: 'idle',
+    });
+  };
+  const pending = toast({ title: `Deleting ${v.name}…`, body: 'Making sure a recent backup of its data exists first.', tone: 'build', duration: 600_000 });
   try {
-    await api.del(`/volumes/${v.id}`);
-    toast({ title: `${v.name} deleted`, tone: 'idle' });
+    await go(false);
   } catch (e) {
-    toastError(e, 'Could not delete');
+    dismissToast(pending);
+    if (!(e instanceof ApiError && e.code === 'safety_backup')) return toastError(e, 'Could not delete');
+    // No recent backup, and none could be taken: nothing was deleted. Say why, and let the user decide.
+    const anyway = await confirmDialog({
+      title: `Delete ${v.name} without a backup?`,
+      body: `${e.message.replace(/^no safety backup: /, '').replace(/^./, (c) => c.toUpperCase())}. Nothing was deleted yet. Deleting it now loses the data for good.`,
+      confirm: 'Delete without a backup',
+      danger: true,
+      typeToConfirm: v.name,
+    });
+    if (!anyway) return;
+    try {
+      await go(true);
+    } catch (err) {
+      toastError(err, 'Could not delete');
+    }
+  } finally {
+    dismissToast(pending);
   }
 }
 

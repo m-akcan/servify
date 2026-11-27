@@ -1,11 +1,13 @@
 /**
  * Usage alerts: a minute-by-minute look at every server's disk, memory and CPU. Notifies once when a figure
  * stays over its threshold (disk at once, memory for 5 checks, CPU for 10) and once when it is back to normal,
- * with a margin so a value hovering at the line doesn't flap.
+ * with a margin so a value hovering at the line doesn't flap. While the low-disk guard (diskguard.ts) has a server's
+ * disk in warn or protect mode, it notifies for that disk and the disk rule here stays quiet.
  */
 import { listServers } from './nodes.ts';
 import { getSettings } from './settings.ts';
 import { notify } from './notify.ts';
+import { diskAlertSuppressed } from './diskguard.ts';
 import type { HostStats } from './types.ts';
 
 type Metric = 'disk' | 'memory' | 'cpu';
@@ -40,6 +42,8 @@ export function checkUsage() {
     if (srv.status !== 'online' || !srv.stats) continue;
     const name = srv.local ? (srv.info?.hostname || 'This machine') : srv.name;
     for (const [metric, f] of Object.entries(figures(srv.stats)) as [Metric, { pct: number; detail: string }][]) {
+      // The low-disk guard is already speaking for this server's disk (warn/protect, and their all-clear): one voice.
+      if (metric === 'disk' && diskAlertSuppressed(srv.id)) continue;
       const key = `${srv.id}:${metric}`;
       const s = state.get(key) ?? { over: 0, alerted: false };
       const limit = limits[metric];

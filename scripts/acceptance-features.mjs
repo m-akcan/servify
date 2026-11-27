@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * End-to-end checks for the platform features (real Docker, owner access needed for settings):
- * secrets at rest, notifications, git webhooks, HTTPS, backups + restore, persistent logs/metrics,
+ * secrets at rest, notifications, git webhooks, HTTPS, backups + restore, safety backups, persistent logs/metrics,
  * Docker Compose import, environments and pull-request previews, the router access log.
  *
  * Access log: pass this script the instance's SERVIFY_TRUSTED_PROXIES. With 127.0.0.1 in it, X-Forwarded-For must tell
@@ -14,14 +14,58 @@
  * SERVIFY_DATA_DIR enables the "no plaintext secrets on disk" check.
  * DOCKER_CONFIG (a scratch folder, never ~/.docker; Servify must run with the same one) enables the registry-login
  * checks: the test writes a login for a local password-protected registry there.
+ *
+ * Streaming backups (ONLY=backups runs just that section) start their own MinIO container (servify-acc-minio, removed
+ * afterwards). Run Servify — and this script — with SERVIFY_S3_PART_MB=5 so a modest volume goes up in many parts.
+ *
+ * Scoped API tokens (ONLY=tokens): needs sign-in on (not SERVIFY_AUTH=none) and SERVIFY_COOKIE, plus SERVIFY_DATA_DIR
+ * for the `servify token` CLI and the pre-scopes token record. A route-by-scope matrix generated from server/src/policy.ts
+ * (itself checked against every route in api.ts and every tool in mcp.ts) over REST and MCP, then streams, uploads,
+ * deploy hooks and every cross-project path.
+ *
+ * Low disk space protection (ONLY=disk): the lines are moved above the real free space through the instance settings
+ * (PATCH /settings/disk), so protect mode is entered and left on demand; they are put back afterwards. Needs
+ * SERVIFY_DATA_DIR for the row counts and the "doesn't fit" restore (a backup record made to claim a huge size), and
+ * starts its own MinIO (servify-acc-minio-disk) for the S3 side. Run Servify with SERVIFY_DISK_INTERVAL_MS=3000.
+ *
+ * Scheduled jobs (ONLY=cron): the catch-up math first (cron.ts, no server needed: a clock change, inside and outside
+ * the window, several missed runs, a run that did happen), then skipped runs and de-duplicated failure notifications
+ * on the instance, then catch-up across a real restart. That part stops Servify (the pid in SERVIFY_DATA_DIR) and
+ * starts it again with SERVIFY_START_CMD — a shell command that starts the same instance in the background with the
+ * same environment, e.g. `sh start-servify.sh` (nohup … &). Run Servify with SERVIFY_CATCHUP_GRACE_SECONDS=5 so a
+ * catch-up doesn't wait the default 20 s. Takes about 8 minutes (it waits for real minutes to pass).
+ *
+ * The everyday CLI commands (ONLY=cli; also part of a full run): exec argv and exit codes, variables (get, stdin,
+ * --from-file, --shared, read-only masking, --deploy), backup create/list/test/download with checksum verification
+ * against a damaged stored file, restore (confirmation, progress, failure exit code), rollback, restart and help.
+ * Needs SERVIFY_DATA_DIR (the `servify token` CLI and the stored backup file).
+ *
+ * Router access control (ONLY=access; also the last section of a full run): IP allow/deny lists (direct and through
+ * X-Forwarded-For, with and without trust — pass the instance's SERVIFY_TRUSTED_PROXIES, as for the access log), the
+ * untrusted-proxy warning, basic auth and its brute-force limit, rate limits, WebSocket upgrades, the HTTPS router,
+ * TCP proxy ports, the ACME path, the deploy-hook limits, the local CA fingerprint and the dashboard domain. The
+ * dashboard domain needs sign-in on (SERVIFY_COOKIE) and, for the login over HTTPS, SERVIFY_PASSWORD_FILE (a file
+ * holding the owner password; never printed). Without trust, the hook check locks 127.0.0.1 out of the deploy hooks
+ * for a few minutes (that is the point): run it last, or wait before running hook checks again.
+ *
+ * The phone app mirror (ONLY=mobileapp): this script serves a fake release feed (GitHub-API-shaped JSON and assets) on
+ * SERVIFY_MOBILE_FEED_PORT (default 17899) and signs its manifests with a THROWAWAY Ed25519 key, SERVIFY_MOBILE_KEY (a
+ * PEM file; never the real release key). Start Servify with SERVIFY_UPDATE_FEED=http://127.0.0.1:<port>/repos/test/servify/releases/latest,
+ * SERVIFY_UPDATE_KEYS=<that key's public key> and SERVIFY_MOBILE_MIRROR_DELAY_MS=86400000 (the script triggers every
+ * check itself). Unsigned releases, bad signatures, manifests for another version, hash and size mismatches and
+ * releases without an app; the API, Range requests, keeping two apps; the app version a phone reports. Needs sign-in on
+ * (SERVIFY_COOKIE) and SERVIFY_PASSWORD_FILE (to sign in a test phone), SERVIFY_DATA_DIR for the files on disk.
  */
-import { execSync } from 'node:child_process';
-import { createHmac } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { execSync, spawnSync } from 'node:child_process';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import https from 'node:https';
+import tls from 'node:tls';
+import { networkInterfaces } from 'node:os';
 
 const BASE = process.env.SERVIFY_URL ?? 'http://localhost:7700';
 const PROXY = Number(process.env.SERVIFY_PROXY_PORT ?? 8080);
@@ -31,6 +75,14 @@ const COOKIE = process.env.SERVIFY_COOKIE;
 /** Mirror of the instance's SERVIFY_TRUSTED_PROXIES (pass the same value to both): does it believe X-Forwarded-For from us? */
 const TRUSTS_LOCAL = (process.env.SERVIFY_TRUSTED_PROXIES ?? '').split(',').some((t) => ['127.0.0.1', '127.0.0.0/8', '0.0.0.0/0'].includes(t.trim()));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The CLI checks block this process in execSync/spawnSync, often for longer than the API's 5 s keep-alive. A fetch
+// right after would reuse a pooled socket the server has closed meanwhile (fetch failed … ECONNRESET): one turn of the
+// event loop first lets fetch see the close (and expire idle sockets) before it picks a connection.
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = async (...args) => {
+  await new Promise((r) => setImmediate(r));
+  return nativeFetch(...args);
+};
 let failures = 0;
 const projectsToDelete = [];
 const cleanups = [];
@@ -93,12 +145,1483 @@ async function exec(serviceId, command) {
 }
 const git = (cwd, cmd) => execSync(`git -c user.email=t@t -c user.name=t ${cmd}`, { cwd, stdio: 'pipe' }).toString().trim();
 
+/**
+ * A TCP pass-through that can cut every connection after a number of bytes sent, and refuse new ones until restored
+ * (`cutAfter`); or drop just the connection that is receiving once a number of bytes came back (`dropReplyAfter`).
+ */
+async function cuttableProxy(targetPort) {
+  let down = false;
+  let budget = Infinity;
+  let replyBudget = Infinity;
+  let drops = 0;
+  const socks = new Set();
+  const cut = () => {
+    down = true;
+    for (const x of socks) x.destroy();
+  };
+  const srv = net.createServer((c) => {
+    if (down) return c.destroy();
+    const u = net.connect(targetPort, '127.0.0.1');
+    socks.add(c);
+    socks.add(u);
+    const end = () => {
+      c.destroy();
+      u.destroy();
+      socks.delete(c);
+      socks.delete(u);
+    };
+    c.on('data', (d) => {
+      if (down) return;
+      budget -= d.length;
+      if (budget <= 0) return cut();
+      if (!u.write(d)) c.pause();
+    });
+    u.on('drain', () => c.resume());
+    c.on('drain', () => u.resume());
+    u.on('data', (d) => {
+      replyBudget -= d.length;
+      if (replyBudget <= 0) {
+        replyBudget = Infinity;
+        drops++;
+        return end();
+      }
+      if (!c.write(d)) u.pause();
+    });
+    for (const x of [c, u]) {
+      x.on('error', end);
+      x.on('close', end);
+    }
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return {
+    port: srv.address().port,
+    cutAfter: (n) => (budget = n),
+    dropReplyAfter: (n) => (replyBudget = n),
+    drops: () => drops,
+    restore: () => {
+      down = false;
+      budget = Infinity;
+    },
+    close: () => (cut(), srv.close()),
+  };
+}
+
+const sha256File = (p) => createHash('sha256').update(readFileSync(p)).digest('hex');
+/** Files under a folder, recursively (relative paths). */
+const filesUnder = (dir) => readdirSync(dir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => join(e.parentPath ?? e.path, e.name).slice(dir.length + 1));
+
+/**
+ * Streaming, checksummed, verified backups: to a folder and to S3 (a local MinIO, multipart), restores from both, a
+ * damaged and a cut-off archive refused with the live data intact, test restores passing and failing, an S3 upload cut
+ * mid-way (failed, nothing left behind), an old record without a checksum, and a Postgres dump test-restored.
+ */
+async function streamingBackupChecks(P) {
+  console.log('\n▸ streaming, verified backups (folder + S3)');
+  const PART_MB = Number(process.env.SERVIFY_S3_PART_MB ?? 64);
+  // ── MinIO with generated credentials (never printed), a bucket, and a cuttable proxy in front of it.
+  const MINIO = 'servify-acc-minio';
+  const user = `acc${randomBytes(5).toString('hex')}`;
+  const pass = randomBytes(20).toString('hex');
+  const dockerEnv = { ...process.env, MINIO_ROOT_USER: user, MINIO_ROOT_PASSWORD: pass, MC_HOST_acc: `http://${user}:${pass}@127.0.0.1:9000` };
+  execSync(`docker rm -f -v ${MINIO}`, { stdio: 'ignore' });
+  execSync(`docker run -d --name ${MINIO} --log-driver none -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD -p 127.0.0.1::9000 minio/minio:latest server /data`, { env: dockerEnv, stdio: 'ignore' });
+  cleanups.push(async () => execSync(`docker rm -f -v ${MINIO}`, { stdio: 'ignore' }));
+  const minioPort = Number(execSync(`docker port ${MINIO} 9000/tcp`).toString().trim().split(':').pop());
+  const mc = (args) => execSync(`docker exec -e MC_HOST_acc ${MINIO} mc ${args}`, { env: dockerEnv, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  await waitFor(async () => (mc('ready acc'), true), 30_000, 'minio');
+  mc('mb -p acc/servify-acc');
+  const incomplete = () => mc('ls --incomplete -r acc/servify-acc').trim();
+  const proxy = await cuttableProxy(minioPort);
+  cleanups.push(async () => proxy.close());
+
+  const folder = mkdtempSync(join(tmpdir(), 'servify-acc-dest-'));
+  cleanups.push(async () => rmSync(folder, { recursive: true, force: true }));
+  const local = await api('POST', '/settings/backups/destinations', { name: 'acc-folder', type: 'local', path: folder });
+  const s3 = await api('POST', '/settings/backups/destinations', { name: 'acc-minio', type: 's3', endpoint: `http://127.0.0.1:${proxy.port}`, region: 'us-east-1', bucket: 'servify-acc', prefix: 'acc', accessKeyId: user, secretAccessKey: pass, forcePathStyle: true });
+  cleanups.push(async () => {
+    await api('DELETE', `/settings/backups/destinations/${local.id}`).catch(() => {});
+    await api('DELETE', `/settings/backups/destinations/${s3.id}`).catch(() => {});
+  });
+  check('the MinIO destination passes the connection test', (await api('POST', `/settings/backups/destinations/${s3.id}/test`).catch((e) => ({ error: e.message }))).ok === true);
+
+  // A notification sink for failures (test restores report through backup.failed).
+  const notes = [];
+  const sink = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      try {
+        notes.push(JSON.parse(b));
+      } catch {}
+      res.end('ok');
+    });
+  });
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  cleanups.push(async () => sink.close());
+  const ch = await api('POST', '/settings/notifications/channels', { name: 'acc-backups', type: 'webhook', url: `http://127.0.0.1:${sink.address().port}/hook`, events: ['backup.failed'] });
+  cleanups.push(() => api('DELETE', `/settings/notifications/channels/${ch.id}`).catch(() => {}));
+
+  // ── A service with ~80 MB of random data on a volume.
+  execSync('docker pull -q alpine:3.20', { stdio: 'ignore' });
+  const vault = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'vault', protocol: 'none', startCommand: 'sleep 1d' })).service;
+  await running(P.id, 'vault');
+  const vv = await api('POST', `/projects/${P.id}/volumes`, { name: 'vault-data', serviceId: vault.id, mountPath: '/data' });
+  await waitFor(async () => {
+    const s = await api('GET', `/services/${vault.id}`);
+    return s.status === 'running' && (!vv.deployment || s.activeDeploymentId === vv.deployment.id);
+  }, 120_000, 'vault with a volume');
+  await exec(vault.id, 'head -c 83886080 /dev/urandom > /data/big.bin && echo original > /data/file');
+  const bigSum = async () => (await exec(vault.id, 'sha256sum /data/big.bin | cut -c1-64')).output.trim();
+  const fileIs = async () => (await exec(vault.id, 'cat /data/file').catch(() => ({ output: '' }))).output?.trim();
+  const original = await bigSum();
+  const backups = () => api('GET', `/services/${vault.id}/backups`);
+  const restoreAndWait = async (id) => {
+    await api('POST', `/backups/${id}/restore`);
+    await sleep(1500);
+    await waitFor(async () => !(await api('GET', `/services/${vault.id}`)).restoring, 300_000, 'restore');
+    await running(P.id, 'vault');
+  };
+  const scratchLeft = () => execSync('docker ps -aq --filter label=servify.testrestore; docker volume ls -q --filter label=servify.testrestore').toString().trim();
+
+  // ── To a folder: streamed straight there (no staging copy), checksum recorded and matching the file.
+  const lb = await api('POST', `/services/${vault.id}/backups`, { destinationId: local.id });
+  const lfile = lb.key ? join(folder, lb.key) : '';
+  check('a volume backup streams to a folder, with a SHA-256 checksum', lb.status === 'succeeded' && /^[0-9a-f]{64}$/.test(lb.sha256 ?? '') && lb.sizeBytes > 80_000_000, `${lb.status} ${lb.error ?? ''}`);
+  check('…the checksum and size are those of the stored file', !!lfile && existsSync(lfile) && statSync(lfile).size === lb.sizeBytes && sha256File(lfile) === lb.sha256);
+  check('…and no partial file is left next to it', filesUnder(folder).every((f) => !f.endsWith('.part')), filesUnder(folder).join(', '));
+  if (DATA) check('…nor a staging copy in the data directory', !existsSync(join(DATA, 'tmp')) || readdirSync(join(DATA, 'tmp')).length === 0);
+
+  // ── To S3: streamed multipart, through the proxy.
+  const sb = await api('POST', `/services/${vault.id}/backups`, { destinationId: s3.id });
+  check('a volume backup streams to S3 (MinIO), with a checksum', sb.status === 'succeeded' && /^[0-9a-f]{64}$/.test(sb.sha256 ?? ''), `${sb.status} ${sb.error ?? ''}`);
+  const etag = sb.key ? (mc(`stat --json acc/servify-acc/${sb.key}`).match(/"etag":\s*"([^"]+)"/)?.[1] ?? '') : '';
+  const parts = Number(etag.split('-')[1] ?? 1);
+  check(`…as a multipart upload (${parts} parts of ${PART_MB} MiB)`, parts > 1 && (PART_MB > 5 || parts >= 10), `etag ${etag}`);
+  check('…the same bytes as recorded (download → sha256)', await (async () => {
+    const dl = await fetch(`${BASE}/api/backups/${sb.id}/download`, { headers: COOKIE ? { cookie: COOKIE } : {} });
+    return dl.status === 200 && createHash('sha256').update(Buffer.from(await dl.arrayBuffer())).digest('hex') === sb.sha256;
+  })());
+  check('…with no unfinished upload left in the bucket', incomplete() === '', incomplete());
+  check('the API lists both backups with their checksums', (await backups()).filter((b) => b.sha256 && [lb.id, sb.id].includes(b.id)).length === 2);
+
+  // ── Restores from both (each verified end to end first).
+  await exec(vault.id, 'echo changed > /data/file && rm /data/big.bin');
+  // The download is dropped once, 20 MB into the second read (the restore itself, after the check and the safety
+  // backup): it must pick up where it stopped.
+  proxy.dropReplyAfter(sb.sizeBytes + 20 * 1024 * 1024);
+  await restoreAndWait(sb.id);
+  check('restore from S3 brings the data back (streamed, verified)', (await fileIs()) === 'original' && (await bigSum()) === original, await fileIs());
+  check('…even with the download dropped mid-restore (resumed with a range request)', proxy.drops() === 1, `drops=${proxy.drops()}`);
+  proxy.dropReplyAfter(Infinity);
+  await exec(vault.id, 'echo changed-again > /data/file');
+  await restoreAndWait(lb.id);
+  check('restore from the folder brings the data back', (await fileIs()) === 'original' && (await bigSum()) === original, await fileIs());
+
+  // ── Test restores: passing (scratch volume, nothing left behind) …
+  const t1 = await api('POST', `/backups/${sb.id}/test?wait=1`);
+  check('a test restore of the S3 backup passes', t1.test?.status === 'passed' && /checksum ok/.test(t1.test.message) && /scratch volume: \d/.test(t1.test.message), JSON.stringify(t1.test));
+  check('…leaves no scratch volume or container behind', scratchLeft() === '', scratchLeft());
+  check('…and did not touch the service', (await fileIs()) === 'original' && (await svcOf(P.id, 'vault')).status === 'running');
+
+  // ── A damaged archive (one byte flipped): refused before anything changes; test restore fails and notifies.
+  await exec(vault.id, 'echo live > /data/file');
+  const preBefore = (await backups()).filter((b) => b.trigger === 'pre-restore').length;
+  if (lfile) {
+    const buf = readFileSync(lfile);
+    buf[Math.floor(buf.length / 2)] ^= 0xff;
+    writeFileSync(lfile, buf);
+  }
+  const t0 = Date.now();
+  await restoreAndWait(lb.id);
+  const acts = await api('GET', `/projects/${P.id}/activity?limit=30`);
+  const refused = acts.find((a) => a.action === 'backup.restore_failed' && a.serviceId === vault.id && (a.ts ?? a.createdAt) >= t0 - 1000);
+  check('restoring a damaged archive is refused (checksum mismatch / damaged)', !!refused && /checksum mismatch|damaged/.test(refused.summary ?? refused.message ?? JSON.stringify(refused)), JSON.stringify(refused ?? null).slice(0, 200));
+  check('…with the live data intact and no safety backup taken for nothing', (await fileIs()) === 'live' && (await bigSum()) === original && (await backups()).filter((b) => b.trigger === 'pre-restore').length === preBefore);
+  const t2 = await api('POST', `/backups/${lb.id}/test?wait=1`);
+  check('a test restore of the damaged archive fails', t2.test?.status === 'failed' && /checksum mismatch|damaged/.test(t2.test.message), JSON.stringify(t2.test));
+  check('…and the failure is notified', !!(await waitFor(() => notes.find((n) => n.event === 'backup.failed' && /Test restore/.test(n.title ?? '')), 15_000, 'test restore notification')));
+  check('…leaving nothing behind', scratchLeft() === '', scratchLeft());
+
+  // ── A cut-off archive (half the file): refused too.
+  const cb = await api('POST', `/services/${vault.id}/backups`, { destinationId: local.id });
+  if (cb.key) {
+    const p = join(folder, cb.key);
+    writeFileSync(p, readFileSync(p).subarray(0, Math.floor(statSync(p).size / 2)));
+  }
+  const t3 = Date.now();
+  await restoreAndWait(cb.id);
+  const cut = (await api('GET', `/projects/${P.id}/activity?limit=30`)).find((a) => a.action === 'backup.restore_failed' && a.serviceId === vault.id && (a.ts ?? a.createdAt) >= t3 - 1000);
+  check('restoring a truncated archive is refused, the data intact', !!cut && (await fileIs()) === 'live' && (await bigSum()) === original, JSON.stringify(cut ?? null).slice(0, 200));
+
+  // ── An S3 upload cut mid-way: failed, and (once the store is reachable again) no unfinished upload or object left.
+  proxy.cutAfter(20 * 1024 * 1024);
+  const ab = await api('POST', `/services/${vault.id}/backups`, { destinationId: s3.id });
+  check('an S3 upload cut mid-way marks the backup failed', ab.status === 'failed' && !!ab.error, `${ab.status} ${ab.error ?? ''}`);
+  const stuck = incomplete();
+  proxy.restore();
+  const cleaned = await waitFor(async () => incomplete() === '' && (await backups()).find((b) => b.id === ab.id)?.cleanupPending !== true, 150_000, 'the unfinished upload to be aborted');
+  // What is in the bucket: exactly the backups listed as succeeded there (the restores' safety backups among them).
+  const objects = mc('ls -r acc/servify-acc').trim().split('\n').filter(Boolean).map((l) => l.split(' ').pop());
+  const known = (await backups()).filter((b) => b.status === 'succeeded' && b.destinationId === s3.id).map((b) => b.key);
+  check(`…and its unfinished upload is aborted once the store is back (${stuck ? 'it was left while unreachable' : 'aborted at once'})`, !!cleaned, incomplete());
+  check('…no object of it is left, and it is not listed as a backup', objects.length === known.length && objects.every((o) => known.includes(o)) && (await backups()).find((b) => b.id === ab.id)?.status === 'failed', `${objects.join(' | ')} vs ${known.join(' | ')}`);
+
+  // ── A backup recorded before checksums existed: restores (archive-checked only) and test-restores.
+  if (DATA) {
+    const ob = await api('POST', `/services/${vault.id}/backups`, { destinationId: local.id });
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(join(DATA, 'servify.db'));
+    db.prepare(`UPDATE backups SET data = json_remove(data, '$.sha256', '$.image') WHERE id = ?`).run(ob.id);
+    db.close();
+    const old = (await backups()).find((b) => b.id === ob.id);
+    check('an old-style backup record has no checksum', old && !old.sha256 && old.status === 'succeeded');
+    await exec(vault.id, 'echo before-old > /data/file');
+    await restoreAndWait(ob.id);
+    check('…and still restores', (await fileIs()) === 'live' && (await bigSum()) === original, await fileIs());
+    const t4 = await api('POST', `/backups/${ob.id}/test?wait=1`);
+    check('…and test-restores (archive checked, no checksum to compare)', t4.test?.status === 'passed' && /no checksum recorded/.test(t4.test.message), JSON.stringify(t4.test));
+  } else console.log('  – skipped the old-record check (set SERVIFY_DATA_DIR)');
+
+  // ── Deleting backups removes them at the destination.
+  await api('DELETE', `/backups/${sb.id}`);
+  await api('DELETE', `/backups/${lb.id}`);
+  check('deleting backups deletes the S3 object and the file', !mc('ls -r acc/servify-acc').includes(sb.key) && !existsSync(lfile));
+
+  // ── A Postgres dump: to S3, test-restored into a throwaway postgres of the same image, restored.
+  const pg = (await api('POST', `/projects/${P.id}/services`, { templateId: 'postgres', name: 'pg-stream' })).service;
+  await running(P.id, 'pg-stream');
+  await waitFor(async () => (await exec(pg.id, 'pg_isready -q -U postgres')).exitCode === 0, 60_000, 'postgres ready');
+  await exec(pg.id, `psql -U postgres -d app -c "create table kept(v text); insert into kept select 'row' || g from generate_series(1, 5000) g;"`);
+  const pb = await api('POST', `/services/${pg.id}/backups`, { destinationId: s3.id });
+  check('a Postgres dump streams to S3 with a checksum and its image', pb.status === 'succeeded' && /^[0-9a-f]{64}$/.test(pb.sha256 ?? '') && !!pb.image, `${pb.status} ${pb.error ?? ''} ${pb.image ?? ''}`);
+  const pt = await api('POST', `/backups/${pb.id}/test?wait=1`);
+  check('a test restore loads it into a throwaway postgres and queries it', pt.test?.status === 'passed' && /throwaway PostgreSQL \d+.* container: \d+ databases, [1-9]\d* tables/.test(pt.test.message), JSON.stringify(pt.test));
+  check('…and removes that container', scratchLeft() === '', scratchLeft());
+  await exec(pg.id, 'psql -U postgres -d app -c "drop table kept;"');
+  await api('POST', `/backups/${pb.id}/restore`);
+  await sleep(1500);
+  await waitFor(async () => !(await api('GET', `/services/${pg.id}`)).restoring, 240_000, 'restore');
+  check('…and restores from S3', (await exec(pg.id, 'psql -U postgres -d app -tAc "select count(*) from kept"')).output.trim() === '5000');
+
+  // ── Scheduled test restores (on the backup schedule's settings).
+  check('an invalid test restore schedule is refused', (await api('PATCH', `/services/${pg.id}`, { backup: { testSchedule: 'nope' } }).then(() => 'ok', (e) => String(e.message))).includes('→ 400'));
+  await api('PATCH', `/services/${pg.id}`, { backup: { enabled: true, schedule: '0 3 * * *', destinationId: s3.id, testSchedule: '* * * * *' } });
+  const sched = await waitFor(async () => {
+    const t = (await api('GET', `/services/${pg.id}/backups`)).find((b) => b.id === pb.id)?.test;
+    return t?.actor === 'backup-scheduler' && t.status !== 'running' && t;
+  }, 100_000, 'a scheduled test restore');
+  check('a scheduled test restore runs on its cron schedule and passes', sched?.status === 'passed', JSON.stringify(sched ?? null));
+  await api('PATCH', `/services/${pg.id}`, { backup: { enabled: false, testSchedule: null } });
+}
+
+/**
+ * Hung replicas: running, but failing the health check. Needs an instance started with short timings, e.g.
+ * SERVIFY_RESTART_AFTER_SECONDS=8 SERVIFY_RESTART_MAX=2 SERVIFY_RESTART_BACKOFF_SECONDS=3 SERVIFY_RESTART_RESET_SECONDS=15
+ * SERVIFY_RESTART_CHECK_MS=1000 (and SERVIFY_SLEEP_UNIT_MS=2000 for the sleeping case); pass the same to this script.
+ */
+async function hungReplicaChecks(P) {
+  console.log('\n▸ restarting hung replicas');
+  const AFTER = Number(process.env.SERVIFY_RESTART_AFTER_SECONDS);
+  const MAX = Number(process.env.SERVIFY_RESTART_MAX ?? 3);
+  if (!AFTER || AFTER > 30) return console.log('  – skipped (run Servify and this script with SERVIFY_RESTART_AFTER_SECONDS ≤ 30, see hungReplicaChecks)');
+  const notes = [];
+  const sink = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      try {
+        notes.push(JSON.parse(b));
+      } catch {}
+      res.end('ok');
+    });
+  });
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  cleanups.push(() => sink.close());
+  const ch = await api('POST', '/settings/notifications/channels', { name: 'hung-replicas', type: 'webhook', url: `http://127.0.0.1:${sink.address().port}/hook`, events: ['service.crashed', 'service.recovered'] });
+  cleanups.push(() => api('DELETE', `/settings/notifications/channels/${ch.id}`).catch(() => {}));
+
+  // Fails its health check (500) after GET /break (in memory: a restart fixes it) or while /tmp/stuck exists (survives a restart).
+  const app = `const fs=require('fs');let bad=false;require('http').createServer((q,s)=>{if(q.url==='/break'){bad=true;return s.end('broken')}if(q.url==='/healthz'){const b=bad||fs.existsSync('/tmp/stuck');s.writeHead(b?500:200);return s.end(b?'bad':'ok')}s.end('up')}).listen(3000)`;
+  const make = async (name, extra = {}) => {
+    const svc = (await api('POST', `/projects/${P.id}/services`, { name, image: 'node:22-alpine', port: 3000, startCommand: `node -e "${app}"`, ...extra })).service;
+    await api('PATCH', `/services/${svc.id}`, { healthcheck: { path: '/healthz', intervalSec: 1, graceSec: 5 } });
+    await running(P.id, name);
+    return svc;
+  };
+  const reps = async (sid) => (await api('GET', `/services/${sid}/metrics?seconds=10`)).replicas;
+  const acts = async (sid, action) => (await api('GET', `/projects/${P.id}/activity?limit=200`)).filter((a) => a.serviceId === sid && a.action === action);
+  const view = (sid) => api('GET', `/services/${sid}`);
+
+  const hung = await make('hung');
+  const s0 = await view(hung.id);
+  check('on by default, with the default threshold', s0.autoRestart?.enabled === true && s0.autoRestart.explicit === false && s0.autoRestart.afterSec === AFTER && s0.autoRestart.unavailable === null, JSON.stringify(s0.autoRestart));
+  const host = `hung.${P.slug}.localhost`;
+  await waitFor(async () => (await hit(host)).status === 200, 30_000, 'hung serving');
+  const [r0] = await reps(hung.id);
+  const t0 = Date.now();
+  check('the app breaks (in memory)', (await hit(host, '/break')).body === 'broken');
+  check('it is taken out of rotation first', !!(await waitFor(async () => (await reps(hung.id))[0]?.state === 'unhealthy', 20_000, 'unhealthy')));
+  const restarted = await waitFor(async () => (await acts(hung.id, 'service.restarted'))[0], (AFTER + 30) * 1000, 'automatic restart');
+  check('a replica failing its health check is restarted', !!restarted, '');
+  check('not before the threshold', !!restarted && restarted.ts - t0 >= AFTER * 1000, restarted && `${restarted.ts - t0} ms`);
+  console.log(`    (restarted ${Math.round((Date.now() - t0) / 1000)} s after breaking it; threshold ${AFTER} s)`);
+  const back = await waitFor(async () => {
+    const [r] = await reps(hung.id);
+    return r?.state === 'healthy' && r.startedAt !== r0.startedAt && r;
+  }, 30_000, 'healthy after the restart');
+  check('the same container came back healthy', !!back && back.containerId === r0.containerId, JSON.stringify(back && { c: back.containerId.slice(0, 12), was: r0.containerId.slice(0, 12) }));
+  check('and serves again', !!(await waitFor(async () => (await hit(host)).body === 'up', 20_000, 'serving again')));
+  check('the restart is in the activity log', /Restarted replica #0 of hung: it failed its health check for \d+ s while running/.test(restarted?.summary ?? ''), restarted?.summary);
+  const logs = await api('GET', `/services/${hung.id}/logs?tail=200`);
+  check("and in the service's logs", logs.some((l) => /^\[servify\] Replica #0 failed its health check .* restarted it/.test(l.text)), '');
+  check('a notification says so', !!(await waitFor(() => notes.find((n) => n.serviceId === hung.id && n.event === 'service.crashed' && /restarted a hung replica/.test(n.title)), 10_000, 'restart notification')));
+  check('the dashboard shows the recent restart', (await view(hung.id)).autoRestart?.restarts === 1);
+
+  // Keeps failing after every restart: the cap, then one notice and no more restarts.
+  console.log('    (keeping it broken: backoff and the cap)');
+  const BACKOFF = Number(process.env.SERVIFY_RESTART_BACKOFF_SECONDS ?? 0);
+  const tStuck = Date.now();
+  await exec(hung.id, 'touch /tmp/stuck');
+  const capped = await waitFor(async () => (await view(hung.id)).autoRestart?.attention, (AFTER + 30) * MAX * 1000 + 60_000, 'needs attention');
+  check(`it stops after ${MAX} restarts in the window and needs attention`, !!capped, '');
+  const nRestarts = (await acts(hung.id, 'service.restarted')).length;
+  check(`${MAX} restarts counted (1 earlier + ${MAX - 1} now) before giving up`, nRestarts === MAX, String(nRestarts));
+  if (BACKOFF && MAX >= 3) {
+    // Restart n+1 needs AFTER + BACKOFF·2^(n−1) of failing (after the startup grace): the waits grow.
+    const ts = (await acts(hung.id, 'service.restarted')).map((a) => a.ts).sort((a, b) => a - b);
+    const first = ts[1] - tStuck;
+    const gaps = ts.slice(2).map((x, i) => x - ts[i + 1]);
+    check('backoff: the 2nd restart waits threshold + backoff', first >= (AFTER + BACKOFF) * 1000, `${first} ms`);
+    check('backoff: each further restart waits longer (doubling)', gaps.every((g, i) => g >= (AFTER + BACKOFF * 2 ** (i + 2 - 1)) * 1000) && gaps.every((g) => g > first), JSON.stringify({ first, gaps }));
+    console.log(`    (waits before restarts 2…${MAX}: ${[first, ...gaps].map((g) => Math.round(g / 1000) + ' s').join(', ')})`);
+  } else console.log('  – skipped the backoff timing (run with SERVIFY_RESTART_MAX ≥ 3 and SERVIFY_RESTART_BACKOFF_SECONDS)');
+  const attentionTitle = (n) => n.serviceId === hung.id && n.event === 'service.crashed' && /needs attention/.test(n.title);
+  await waitFor(() => notes.some(attentionTitle), 10_000, 'attention notification');
+  await sleep((AFTER + 8) * 1000);
+  check('no more restarts after the cap', (await acts(hung.id, 'service.restarted')).length === nRestarts);
+  check('one "needs attention" notification, not one per check', notes.filter(attentionTitle).length === 1, String(notes.filter(attentionTitle).length));
+  check('the replica shows as unhealthy, the service as crashed', (await reps(hung.id))[0]?.state === 'unhealthy' && (await view(hung.id)).status === 'crashed', `${(await reps(hung.id))[0]?.state} ${(await view(hung.id)).status}`);
+  check('the attention entry is in the activity log', (await acts(hung.id, 'service.attention')).length === 1);
+  // Fixed by hand: healthy for a while → counting starts over and the notice clears.
+  await exec(hung.id, 'rm -f /tmp/stuck');
+  const cleared = await waitFor(async () => {
+    const v = await view(hung.id);
+    return v.autoRestart && !v.autoRestart.attention && v.autoRestart.restarts === 0 && v.status === 'running';
+  }, 90_000, 'attention cleared');
+  check('healthy for a while: the count resets and "needs attention" clears', !!cleared);
+  check('with a "healthy again" notification', !!(await waitFor(() => notes.find((n) => n.serviceId === hung.id && n.event === 'service.recovered' && /healthy again/.test(n.title)), 10_000, 'recovered notification')));
+
+  // The setting: API, MCP and off means off.
+  await api('PATCH', `/services/${hung.id}`, { healthcheck: { autoRestart: false } });
+  const off = await view(hung.id);
+  check('switched off via the API', off.autoRestart?.enabled === false && off.autoRestart.explicit === true && off.healthcheck.autoRestart === false);
+  const before = (await acts(hung.id, 'service.restarted')).length;
+  await hit(host, '/break');
+  await sleep((AFTER + 8) * 1000);
+  check('off: a hung replica is only taken out of rotation', (await acts(hung.id, 'service.restarted')).length === before && (await reps(hung.id))[0]?.state === 'unhealthy');
+  const mres = await fetch(BASE + '/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(COOKIE ? { cookie: COOKIE } : {}) },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'update_service', arguments: { service: hung.id, healthcheck: { autoRestart: null, restartAfterSec: 3600 } } } }),
+  });
+  const mj = await mres.json().catch(() => ({}));
+  const viaMcp = await view(hung.id);
+  check('MCP update_service sets it (back to the default, own threshold)', !mj.result?.isError && viaMcp.autoRestart?.enabled === true && viaMcp.autoRestart.explicit === false && viaMcp.autoRestart.afterSec === 3600 && !('autoRestart' in viaMcp.healthcheck), JSON.stringify(viaMcp.autoRestart));
+  check('updating the health check keeps the other fields', viaMcp.healthcheck.path === '/healthz' && viaMcp.healthcheck.intervalSec === 1);
+  await sleep((AFTER + 4) * 1000);
+  check('its own longer threshold is respected', (await acts(hung.id, 'service.restarted')).length === before);
+  await api('DELETE', `/services/${hung.id}`);
+
+  // Mid-deploy: a pre-deploy step holds the deploy while the running replica is hung.
+  const dep = await make('hung-deploy');
+  await api('PATCH', `/services/${dep.id}`, { preDeployCommand: `sleep ${AFTER + 15}` });
+  await exec(dep.id, 'touch /tmp/stuck');
+  await waitFor(async () => (await reps(dep.id))[0]?.state === 'unhealthy', 20_000, 'unhealthy before the deploy');
+  const oldActive = (await view(dep.id)).activeDeploymentId;
+  await api('POST', `/services/${dep.id}/deploy`);
+  await sleep((AFTER + 10) * 1000);
+  const mid = await view(dep.id);
+  check('a service mid-deploy is left alone', mid.activeDeploymentId === oldActive && (await acts(dep.id, 'service.restarted')).length === 0, `${mid.status} ${(await acts(dep.id, 'service.restarted')).length}`);
+  const deployed = await waitFor(async () => (await view(dep.id)).activeDeploymentId !== oldActive && (await view(dep.id)).status === 'running', 120_000, 'deploy done');
+  check('the deploy finishes and replaces it (no restart in between)', !!deployed && (await acts(dep.id, 'service.restarted')).length === 0);
+  await api('DELETE', `/services/${dep.id}`);
+
+  // Sleeping: stopped containers are not hung, and stay asleep.
+  if (process.env.SERVIFY_SLEEP_UNIT_MS) {
+    const sl = await make('hung-sleeper');
+    await api('PATCH', `/services/${sl.id}`, { sleepAfterMinutes: 1 });
+    const asleep = await waitFor(async () => (await view(sl.id)).status === 'sleeping', 60_000, 'asleep');
+    await sleep((AFTER + 8) * 1000);
+    const v = await view(sl.id);
+    check('a sleeping service is left alone (no restart, still asleep)', !!asleep && v.status === 'sleeping' && (await acts(sl.id, 'service.restarted')).length === 0 && (await reps(sl.id)).every((r) => r.dockerState !== 'running'), v.status);
+    await api('DELETE', `/services/${sl.id}`);
+  } else console.log('  – skipped the sleeping case (run Servify with SERVIFY_SLEEP_UNIT_MS)');
+
+  // Not covered: cron jobs (and clusters, workers, routes) say why.
+  const cron = (await api('POST', `/projects/${P.id}/services`, { name: 'hung-cron', image: 'alpine:3.20', protocol: 'none', startCommand: 'true', deploy: false })).service;
+  await api('PATCH', `/services/${cron.id}`, { schedule: '0 3 * * *' });
+  check('cron jobs are not covered, and say why', /cron/.test((await view(cron.id)).autoRestart?.unavailable ?? ''), JSON.stringify((await view(cron.id)).autoRestart));
+  await api('DELETE', `/services/${cron.id}`);
+}
+
+/**
+ * Scoped API tokens. Project A (in reach) and project B (out of reach), each with a service on a volume, a spare volume,
+ * a deployment and a backup. Tokens: read, deploy, write (all projects), write and deploy limited to A, and a token
+ * record in the shape written before scopes existed. Every route of policy.ts is sent the requests that must be refused
+ * (and, for GET, the ones that must be answered); every MCP tool likewise. Details print status codes, never bodies.
+ */
+async function tokenChecks(A) {
+  const { ROUTE_POLICIES, TOOL_POLICIES } = await import(new URL('../server/src/policy.ts', import.meta.url).href);
+  const RANK = { read: 0, deploy: 1, write: 2 };
+
+  console.log('\n▸ scoped tokens: every route and tool is classified');
+  const apiSrc = readFileSync(new URL('../server/src/api.ts', import.meta.url), 'utf8');
+  const routes = [...apiSrc.matchAll(/^api\.(get|post|patch|put|delete)\(\s*'([^']+)'/gm)].map((m) => `${m[1].toUpperCase()} ${m[2]}`);
+  const policyRoutes = Object.keys(ROUTE_POLICIES);
+  check(`every REST route in api.ts has a policy (${routes.length} routes)`, routes.length > 100 && routes.every((r) => policyRoutes.includes(r)), routes.filter((r) => !policyRoutes.includes(r)).join(', '));
+  check('every policy names a registered route', policyRoutes.every((r) => routes.includes(r)), policyRoutes.filter((r) => !routes.includes(r)).join(', '));
+  check('api.ts registers routes only through api.get/post/patch/put/delete', !/\bapi\.(all|on|route|mount)\(/.test(apiSrc));
+  const mcpSrc = readFileSync(new URL('../server/src/mcp.ts', import.meta.url), 'utf8');
+  const tools = [...mcpSrc.matchAll(/^\s*tool\(\s*'([a-z_]+)'/gm)].map((m) => m[1]);
+  check(`every MCP tool has a policy (${tools.length} tools)`, tools.length > 40 && tools.every((t) => TOOL_POLICIES[t]), tools.filter((t) => !TOOL_POLICIES[t]).join(', '));
+  check('every tool policy names a registered tool', Object.keys(TOOL_POLICIES).every((t) => tools.includes(t)), Object.keys(TOOL_POLICIES).filter((t) => !tools.includes(t)).join(', '));
+  check('mcp.ts registers tools only through the policy wrapper', (mcpSrc.match(/server\.registerTool\b/g) ?? []).length === 1);
+
+  // ─── fixtures ───
+  console.log('\n▸ scoped tokens: fixtures');
+  const B = await api('POST', '/projects', { name: `tokens-b-${Date.now().toString(36)}` });
+  projectsToDelete.push(B.id);
+  const canary = `tok-canary-${randomBytes(6).toString('hex')}`;
+  const fixture = async (P) => {
+    const web = (await api('POST', `/projects/${P.id}/services`, { image: 'traefik/whoami', name: 'web', env: { API_SECRET: canary, PLAIN: 'x' } })).service;
+    await running(P.id, 'web');
+    await api('POST', `/projects/${P.id}/volumes`, { name: 'data', serviceId: web.id, mountPath: '/data' });
+    const spare = await api('POST', `/projects/${P.id}/volumes`, { name: 'spare' });
+    await waitFor(async () => {
+      const d = await api('GET', `/services/${web.id}/deployments?limit=5`);
+      return d.length >= 2 && d[0].status === 'active' && (await svcOf(P.id, 'web')).status === 'running';
+    }, 180_000, 'redeploy with the volume');
+    const deps = await api('GET', `/services/${web.id}/deployments?limit=5`);
+    const backup = await api('POST', `/services/${web.id}/backups`, {});
+    await waitFor(async () => (await api('GET', `/services/${web.id}/backups`)).find((b) => b.id === backup.id)?.status !== 'running', 120_000, 'backup');
+    return { P, web, spare, dep: deps[0], prevDep: deps[1], backup };
+  };
+  const [FA, FB] = [await fixture(A), await fixture(B)];
+  check('fixtures: two projects, each with a service, volumes, deployments and a backup', !!(FA.dep && FA.prevDep && FA.backup?.id && FB.dep && FB.backup?.id));
+
+  // Only tokens made here are revoked at the end (an install's own tokens may share a name such as "agent").
+  const tokensBefore = new Set((await api('GET', '/tokens')).map((t) => t.id));
+  const mk = async (name, scope, projects) => (await api('POST', '/tokens', { name, scope, ...(projects ? { projects } : {}) })).token;
+  const T = {
+    read: { scope: 'read', token: await mk('acc-read', 'read') },
+    deploy: { scope: 'deploy', token: await mk('acc-deploy', 'deploy') },
+    write: { scope: 'write', token: await mk('acc-write', 'write') },
+    'write[A]': { scope: 'write', projects: [A.id], token: await mk('acc-write-a', 'write', [A.slug]) },
+    'deploy[A]': { scope: 'deploy', projects: [A.id], token: await mk('acc-deploy-a', 'deploy', [A.id]) },
+  };
+  check(
+    'deploy and project-limited tokens start with svs_ (0.2.3 rejects them after a rollback), the others with svf_',
+    ['deploy', 'write[A]', 'deploy[A]'].every((k) => T[k].token?.startsWith('svs_')) && ['read', 'write'].every((k) => T[k].token?.startsWith('svf_')),
+  );
+  const list = await api('GET', '/tokens');
+  const rec = (n) => list.find((t) => t.name === n);
+  check('the token list shows scope and projects', rec('acc-write-a')?.scope === 'write' && JSON.stringify(rec('acc-write-a')?.projects) === JSON.stringify([A.id]) && rec('acc-deploy')?.scope === 'deploy' && !('projects' in rec('acc-deploy')), `${rec('acc-write-a')?.scope}`);
+  const badScope = await fetch(`${BASE}/api/tokens`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: COOKIE }, body: JSON.stringify({ name: 'x', scope: 'admin' }) });
+  const noProjects = await fetch(`${BASE}/api/tokens`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: COOKIE }, body: JSON.stringify({ name: 'x', scope: 'write', projects: [] }) });
+  check('creating a token: unknown scopes and empty project lists are refused', badScope.status === 400 && noProjects.status === 400, `${badScope.status} ${noProjects.status}`);
+
+  // ─── the REST matrix ───
+  console.log('\n▸ scoped tokens: REST, route by scope');
+  const ids = (F, kind) => ({ project: F.P.id, service: F.web.id, deployment: F.dep.id, volume: F.spare.id, backup: F.backup.id })[kind];
+  const OTHER = { name: 'data', key: 'PLAIN', host: 'example.com' };
+  const req = async (tok, method, path, body) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    try {
+      const res = await fetch(BASE + '/api' + path, { method, signal: ctrl.signal, headers: { authorization: `Bearer ${tok}`, ...(method === 'GET' ? {} : { 'content-type': 'application/json' }) }, body: method === 'GET' ? undefined : JSON.stringify(body ?? {}) });
+      // Errors are small JSON; successful answers (streams, downloads, secrets) are never read.
+      const error = res.status >= 400 ? ((await res.json().catch(() => ({}))).error ?? '') : '';
+      if (res.status < 400) ctrl.abort();
+      return { status: res.status, error };
+    } catch (e) {
+      return { status: 0, error: e.message };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  /** What a token must get: 'allow', or the status of the refusal (403 level / instance-wide, 404 out of reach). */
+  const expected = (t, key, pol, where) => {
+    const method = key.split(' ')[0];
+    if (t.scope === 'read' && method !== 'GET') return 403;
+    if (pol.level === 'owner') return 403;
+    // Uploads: a deploy token may upload where the source is an upload; out of reach that reads as not found.
+    if (RANK[t.scope] < RANK[pol.level]) return pol.deployOnUploads && t.scope === 'deploy' && t.projects && where === 'B' ? 404 : 403;
+    if (t.projects) {
+      const named = Object.keys(pol.params ?? {}).length + Object.keys(pol.body ?? {}).length;
+      if (!named && !pol.filtered) return 403;
+      if (named && where === 'B') return 404;
+    }
+    return 'allow';
+  };
+  const SECRET_GATES = /cannot (view|download|read)/;
+  const matrix = {};
+  for (const [label, t] of Object.entries(T)) {
+    const stats = { allowed: 0, denied: 0, fail: [] };
+    for (const where of t.projects ? ['A', 'B'] : ['A']) {
+      const F = where === 'A' ? FA : FB;
+      for (const [key, pol] of Object.entries(ROUTE_POLICIES)) {
+        if (pol.level === 'public') continue;
+        const [method, pattern] = key.split(' ');
+        const path = pattern.replace(/:([a-z]+)/g, (_, p) => encodeURIComponent(pol.params?.[p] ? ids(F, pol.params[p]) : OTHER[p] ?? 'local'));
+        const body = Object.fromEntries(Object.entries(pol.body ?? {}).map(([k, kind]) => [k, ids(F, kind)]));
+        const want = expected(t, key, pol, where);
+        if (want === 'allow') {
+          // Allowed requests are only sent where they change nothing.
+          if (method !== 'GET') continue;
+          const r = await req(t.token, method, path);
+          const refusedByScope = r.status === 401 || r.status === 404 || (r.status === 403 && !SECRET_GATES.test(r.error));
+          if (refusedByScope || r.status === 0) stats.fail.push(`${where} ${key}: want allowed, got ${r.status}`);
+          else stats.allowed++;
+        } else {
+          const r = await req(t.token, method, path, body);
+          if (r.status !== want) stats.fail.push(`${where} ${key}: want ${want}, got ${r.status}`);
+          else stats.denied++;
+        }
+      }
+    }
+    matrix[label] = stats;
+    check(`REST ${label}: ${stats.denied} refusals and ${stats.allowed} allowed reads as the policy says`, stats.fail.length === 0, stats.fail.slice(0, 12).join(' | '));
+  }
+
+  // Hand-picked allowed actions and the cross-project escapes.
+  console.log('\n▸ scoped tokens: allowed actions, secrets and cross-project paths');
+  const call = (label, method, path, body) => req(T[label].token, method, path, body);
+  const jcall = async (label, method, path, body) => {
+    const res = await fetch(BASE + '/api' + path, { method, headers: { authorization: `Bearer ${T[label].token}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    return { status: res.status, json: await res.json().catch(() => ({})) };
+  };
+  const projList = (await jcall('write[A]', 'GET', '/projects')).json;
+  check('a project-limited token lists only its projects', Array.isArray(projList) && projList.some((p) => p.id === A.id) && !projList.some((p) => p.id === B.id));
+  const allList = (await jcall('read', 'GET', '/projects')).json;
+  check('a token for all projects still lists every project', allList.some((p) => p.id === A.id) && allList.some((p) => p.id === B.id));
+
+  const d1 = await jcall('deploy[A]', 'POST', `/services/${FA.web.id}/deploy`, {});
+  const masked = d1.json?.config?.env && Object.values(d1.json.config.env).every((v) => v === '••••••••');
+  check('deploy token: deploys a service in reach, and the reply masks every variable', d1.status === 200 && masked && !JSON.stringify(d1.json).includes(canary), `${d1.status}`);
+  await waitFor(async () => !['queued', 'building', 'deploying'].includes((await api('GET', `/deployments/${d1.json.id}`)).status), 180_000, 'deploy');
+  const r1 = await jcall('deploy[A]', 'POST', `/services/${FA.web.id}/restart`, {});
+  check('deploy token: restarts', r1.status === 200 && !JSON.stringify(r1.json).includes(canary), `${r1.status}`);
+  await waitFor(async () => !['queued', 'building', 'deploying'].includes((await api('GET', `/deployments/${r1.json.id}`)).status), 180_000, 'restart');
+  const rb = await jcall('deploy[A]', 'POST', `/services/${FA.web.id}/rollback`, { deploymentId: FA.prevDep.id });
+  check('deploy token: rolls back', rb.status === 200 && !JSON.stringify(rb.json).includes(canary), `${rb.status} ${rb.json?.error ?? ''}`);
+  await waitFor(async () => !['queued', 'building', 'deploying'].includes((await api('GET', `/deployments/${rb.json.id}`)).status), 180_000, 'rollback');
+  const ui = await jcall('deploy[A]', 'POST', `/services/${FA.web.id}/update-image`, { tag: 'latest', skipSafetyBackup: false });
+  check('deploy token: switches an image service to a tag and deploys it (the CI path)', ui.status === 202 && !JSON.stringify(ui.json).includes(canary), `${ui.status} ${ui.json?.error ?? ''}`);
+  if (ui.json?.id) await waitFor(async () => !['queued', 'building', 'deploying'].includes((await api('GET', `/deployments/${ui.json.id}`)).status), 180_000, 'image update');
+  check('deploy token: may not skip the safety backup', (await call('deploy[A]', 'POST', `/services/${FA.web.id}/deploy`, { skipSafetyBackup: true })).status === 403);
+  check('deploy token: reads logs and status', (await call('deploy[A]', 'GET', `/services/${FA.web.id}/logs?tail=5`)).status === 200 && (await call('deploy[A]', 'GET', `/deployments/${FA.dep.id}`)).status === 200);
+  const deployNo = await Promise.all([
+    call('deploy[A]', 'PATCH', `/services/${FA.web.id}`, { replicas: 1 }),
+    call('deploy[A]', 'PUT', `/services/${FA.web.id}/variables`, { variables: { X: '1' } }),
+    call('deploy[A]', 'DELETE', `/services/${FA.web.id}`),
+    call('deploy[A]', 'POST', `/projects/${A.id}/volumes`, { name: 'nope' }),
+    call('deploy[A]', 'GET', `/services/${FA.web.id}/variables/resolved`),
+  ]);
+  check('deploy token: no config, variables, volumes, deletes or secrets', deployNo.every((r) => r.status === 403), deployNo.map((r) => r.status).join(' '));
+  const exp = await jcall('deploy[A]', 'GET', `/projects/${A.id}/export?secrets=1`);
+  check('deploy token: an export keeps secrets blank', exp.status === 200 && !JSON.stringify(exp.json).includes(canary), `${exp.status}`);
+  const snap = await jcall('deploy', 'GET', `/projects/${A.id}`);
+  check('deploy token: secret variables and deployment variables are masked in snapshots', snap.status === 200 && !JSON.stringify(snap.json).includes(canary), `${snap.status}`);
+
+  // servify up: a deploy token may upload to a service whose source already is an upload.
+  const up = (await api('POST', `/projects/${A.id}/services`, { name: 'up', upload: true, deploy: false })).service;
+  const { tarEntry, tarEnd } = await import(new URL('../server/src/tar.ts', import.meta.url).href);
+  const tgz = (await import('node:zlib')).gzipSync(Buffer.concat([...tarEntry('index.html', Buffer.from('hi')), tarEnd()]));
+  const upload = (label, sid) => fetch(`${BASE}/api/services/${sid}/upload?deploy=0`, { method: 'POST', headers: { authorization: `Bearer ${T[label].token}`, 'content-type': 'application/gzip' }, body: tgz }).then((r) => r.status);
+  check('servify up: a deploy token uploads to an upload service in reach', (await upload('deploy[A]', up.id)) === 201);
+  check('servify up: …but not onto an image service (that would replace its source)', (await upload('deploy[A]', FA.web.id)) === 403);
+  check('servify up: …nor to another project, nor with a read token', (await upload('deploy[A]', FB.web.id)) === 404 && (await upload('read', up.id)) === 403);
+
+  // Cross-project paths with a write token limited to A.
+  const cross = {
+    'move a service to another project': await call('write[A]', 'POST', `/services/${FA.web.id}/move-project`, { project: B.id }),
+    'move it there by slug': await call('write[A]', 'POST', `/services/${FA.web.id}/move-project`, { project: B.slug }),
+    'attach its volume to a service there': await call('write[A]', 'POST', `/volumes/${FA.spare.id}/attach`, { serviceId: FB.web.id, mountPath: '/x' }),
+    'share its volume with a service there': await call('write[A]', 'POST', `/volumes/${FA.spare.id}/share`, { serviceId: FB.web.id, mountPath: '/x' }),
+    'create a volume for a service there': await call('write[A]', 'POST', `/projects/${A.id}/volumes`, { name: 'x', serviceId: FB.web.id }),
+    'watch its events': await call('write[A]', 'GET', `/events?project=${B.id}`),
+    'roll back to its deployment': await call('write[A]', 'POST', `/services/${FA.web.id}/rollback`, { deploymentId: FB.dep.id }),
+  };
+  for (const [what, r] of Object.entries(cross)) check(`a token limited to A cannot ${what}`, r.status === 404, `${r.status}`);
+  // References by name, URL-encoded as clients send them: "project/service" across projects, and a bare name that exists in both.
+  const byName = await Promise.all([call('write[A]', 'GET', `/services/${encodeURIComponent(`${B.slug}/web`)}`), call('write[A]', 'GET', `/services/${encodeURIComponent(`${A.slug}/web`)}`), call('write[A]', 'GET', '/services/web'), call('write[A]', 'GET', '/services/%E0%A4%A')]);
+  check('names: another project’s "project/service" and an ambiguous bare name read as not found, its own works', byName[0].status === 404 && byName[1].status === 200 && byName[2].status === 404 && byName[2].error === byName[0].error.replace(`${B.slug}/web`, 'web') && byName[3].status === 400, byName.map((r) => r.status).join(' '));
+  check('a token limited to A cannot create projects, import or import compose', (await Promise.all([call('write[A]', 'POST', '/projects', { name: 'x' }), call('write[A]', 'POST', '/projects/import', { spec: { servify: 1, name: 'x', services: [] } }), call('write[A]', 'POST', '/projects/import-compose', { yaml: 'services: {}', dryRun: true })])).every((r) => r.status === 403));
+  // Shared variables: references only ever resolve within the project (and its base project).
+  await api('PATCH', `/projects/${B.id}`, { variables: { SECRET: canary }, secretKeys: ['SECRET'] });
+  const setv = await call('write[A]', 'PUT', `/services/${FA.web.id}/variables`, { variables: { LEAK_SHARED: '${{ shared.SECRET }}', LEAK_SVC: `\${{ ${B.slug}.API_SECRET }}` } });
+  const resolved = await jcall('write[A]', 'GET', `/services/${FA.web.id}/variables/resolved`);
+  check("another project's shared variables and services can't be referenced", setv.status === 200 && resolved.status === 200 && resolved.json.env?.LEAK_SHARED === '' && resolved.json.env?.LEAK_SVC === '', `${setv.status} ${resolved.status}`);
+  check("…and no value of another project's shows up", !Object.entries(resolved.json.env ?? {}).some(([k, v]) => k.startsWith('LEAK') && v.includes(canary)));
+  await api('DELETE', `/services/${FA.web.id}/variables/LEAK_SHARED`);
+  await api('DELETE', `/services/${FA.web.id}/variables/LEAK_SVC`);
+  // Environments: made by a write token limited to A, they are A's — in reach; a token can't list one directly.
+  const env = await jcall('write[A]', 'POST', `/projects/${A.id}/environments`, { name: 'staging', deploy: false });
+  check('a token limited to A creates an environment of A, and reaches it', env.status === 201 && (await call('write[A]', 'GET', `/projects/${env.json.id}`)).status === 200 && (await jcall('write[A]', 'GET', '/projects')).json.some((p) => p.id === env.json.id), `${env.status}`);
+  const envTok = await fetch(`${BASE}/api/tokens`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: COOKIE }, body: JSON.stringify({ name: 'x', projects: [env.json.id] }) });
+  check('a token cannot be limited to an environment (its base project is picked instead)', envTok.status === 400, `${envTok.status}`);
+  check('activity: a token limited to A sees A only', (await jcall('write[A]', 'GET', '/activity?limit=200')).json.every((a) => a.projectId && [A.id, env.json.id].includes(a.projectId)));
+
+  // Owner-only stays owner-only for every token, with the messages it always had.
+  const own = await Promise.all([call('write', 'GET', '/tokens'), call('write', 'POST', '/servers', { name: 'x' }), call('write', 'PATCH', '/settings/general', {}), call('write', 'GET', '/settings/notifications/deliveries'), call('read', 'POST', '/tokens', {})]);
+  check('owner-only routes: refused for every token, same messages as before', own.every((r) => r.status === 403) && own[0].error === 'only the owner can manage tokens' && /^Managing servers can only be set by the owner/.test(own[1].error) && own[2].error === 'only the owner can change instance settings' && own[4].error === 'this token is read-only', own.map((r) => `${r.status}`).join(' '));
+  check('a read-only token still gets "this token is read-only" for any change', (await call('read', 'POST', `/services/${FA.web.id}/deploy`, {})).error === 'this token is read-only');
+
+  // ─── traffic and access log ───
+  const host = (svc) => new URL(svc.url).hostname;
+  const webA = await api('GET', `/services/${FA.web.id}`);
+  const webB = await api('GET', `/services/${FB.web.id}`);
+  for (let i = 0; i < 3; i++) {
+    await hit(host(webA), '/tok-a');
+    await hit(host(webB), '/tok-b');
+  }
+  await sleep(2500);
+  const recent = (await jcall('deploy[A]', 'GET', '/access-log/recent?limit=200')).json;
+  const totals = (await jcall('deploy[A]', 'GET', '/access-log/totals')).json;
+  check('traffic board: a token limited to A sees requests of A only', recent.entries?.some((e) => e.serviceId === FA.web.id) && !recent.entries.some((e) => e.serviceId === FB.web.id) && !(FB.web.id in (totals.services ?? {})), `${recent.entries?.length}`);
+  check('access log of B: not found for a token limited to A', (await call('deploy[A]', 'GET', `/services/${FB.web.id}/access-log`)).status === 404);
+
+  // ─── streams ───
+  console.log('\n▸ scoped tokens: event and log streams');
+  const listen = (tok, path, ms) =>
+    new Promise((resolveP) => {
+      const chunks = [];
+      const ctrl = new AbortController();
+      fetch(BASE + '/api' + path, { headers: { authorization: `Bearer ${tok}`, accept: 'text/event-stream' }, signal: ctrl.signal })
+        .then(async (res) => {
+          if (!res.ok) return resolveP({ status: res.status, text: '' });
+          setTimeout(() => ctrl.abort(), ms);
+          const dec = new TextDecoder();
+          try {
+            for await (const c of res.body) chunks.push(dec.decode(c, { stream: true }));
+          } catch {}
+          resolveP({ status: res.status, text: chunks.join('') });
+        })
+        .catch(() => resolveP({ status: 0, text: chunks.join('') }));
+    });
+  const scopedStream = listen(T['deploy[A]'].token, '/events', 9000);
+  const openStream = listen(T.read.token, '/events', 9000);
+  await sleep(1500);
+  await api('PATCH', `/projects/${A.id}`, { color: '#7ce0c3' });
+  await api('PATCH', `/projects/${B.id}`, { color: '#7ce0c3' });
+  await api('POST', `/services/${FB.web.id}/restart`, {});
+  await api('POST', `/services/${FA.web.id}/restart`, {});
+  for (let i = 0; i < 3; i++) {
+    await hit(host(webA), '/tok-a2');
+    await hit(host(webB), '/tok-b2');
+  }
+  const [ss, os] = await Promise.all([scopedStream, openStream]);
+  const sawA = ss.text.includes(A.id) && ss.text.includes(FA.web.id);
+  const leakB = [B.id, FB.web.id, FB.spare.id, FB.backup.id].some((x) => ss.text.includes(x));
+  check('events: a token limited to A gets its project’s events…', ss.status === 200 && sawA, `${ss.status} ${ss.text.length}`);
+  check('…and never one of another project (project, service, deployment, traffic, activity)', !leakB);
+  check('events: a token for all projects still gets both', os.text.includes(A.id) && os.text.includes(B.id));
+  check('events: only the event types the stream had, plus nothing instance-wide for a limited token', !/"type":"(settings|cert)\./.test(ss.text));
+  const logsA = await listen(T['deploy[A]'].token, `/services/${FA.web.id}/logs/stream?tail=5`, 1500);
+  const logsB = await listen(T['deploy[A]'].token, `/services/${FB.web.id}/logs/stream?tail=5`, 1500);
+  const depB = await listen(T['deploy[A]'].token, `/deployments/${FB.dep.id}/logs/stream`, 1500);
+  check('log streams: its own service streams, another project’s is not found', logsA.status === 200 && logsA.text.includes('event: backlog') && logsB.status === 404 && depB.status === 404, `${logsA.status} ${logsB.status} ${depB.status}`);
+
+  // ─── MCP ───
+  console.log('\n▸ scoped tokens: MCP, tool by scope');
+  const mcp = async (tok, name, args) => {
+    const r = await fetch(BASE + '/mcp', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+    });
+    const j = await r.json().catch(() => ({}));
+    const text = j.result?.content?.[0]?.text ?? j.error?.message ?? '';
+    return { status: r.status, error: j.result?.isError || j.error ? text : null, text };
+  };
+  const toolArgs = (F, name, pol) => {
+    const a = {};
+    for (const [k, kind] of Object.entries(pol.params ?? {})) a[k] = kind === 'backup' ? F.backup.id : ids(F, kind);
+    const extra = {
+      scale_service: { replicas: 1 }, set_variables: { variables: {} }, delete_variable: { key: 'PLAIN' }, exec_command: { command: 'true' }, rollback_service: { deploymentId: F.prevDep.id },
+      create_environment: { name: 'x' }, set_previews: { enabled: false }, create_volume: { name: 'x' }, attach_volume: { mount_path: '/x' }, share_volume: { mount_path: '/x' }, unmount: { mount_path: '/x' },
+      move_service: { server: 'local' }, import_project: { spec: { servify: 1, name: 'x', services: [] } }, import_compose: { yaml: 'services: {}', dry_run: true }, create_project: { name: 'x' }, wait_for_deployment: { timeoutSec: 1 },
+    }[name];
+    return { ...a, ...(extra ?? {}) };
+  };
+  const toolWant = (t, pol, where) => {
+    if (pol.level === 'owner') return /only the owner/;
+    if (RANK[t.scope] < RANK[pol.level]) return t.scope === 'read' ? /read-only/ : /can only deploy/;
+    if (t.projects) {
+      if (!Object.keys(pol.params ?? {}).length && !pol.filtered) return /limited to some projects/;
+      if (where === 'B' && Object.keys(pol.params ?? {}).length) return /not found/;
+    }
+    return 'allow';
+  };
+  const READ_TOOLS = new Set(Object.entries(TOOL_POLICIES).filter(([, p]) => p.level === 'read').map(([n]) => n));
+  for (const [label, t] of Object.entries(T)) {
+    const stats = { allowed: 0, denied: 0, fail: [] };
+    for (const where of t.projects ? ['A', 'B'] : ['A']) {
+      const F = where === 'A' ? FA : FB;
+      for (const [name, pol] of Object.entries(TOOL_POLICIES)) {
+        const want = toolWant(t, pol, where);
+        if (want === 'allow' && !READ_TOOLS.has(name)) continue; // allowed changes: hand-picked below
+        const r = await mcp(t.token, name, toolArgs(F, name, pol));
+        if (want === 'allow') {
+          if (r.error && /read-only|can only deploy|not found|limited to some|only the owner|Invalid/i.test(r.error)) stats.fail.push(`${where} ${name}: want allowed, got an error`);
+          else stats.allowed++;
+        } else if (!r.error || !want.test(r.error)) stats.fail.push(`${where} ${name}: want ${want}, got ${r.error ? 'another error' : 'success'}`);
+        else stats.denied++;
+      }
+    }
+    check(`MCP ${label}: ${stats.denied} refusals and ${stats.allowed} allowed reads as the policy says`, stats.fail.length === 0, stats.fail.slice(0, 12).join(' | '));
+  }
+  const ov = await mcp(T['write[A]'].token, 'overview', {});
+  check('MCP overview: a token limited to A lists A (and its environment) only', !ov.error && ov.text.includes(A.id) && !ov.text.includes(B.id));
+  const act = await mcp(T['deploy[A]'].token, 'get_activity', { limit: 200 });
+  check('MCP get_activity: nothing of another project', !act.error && !act.text.includes(B.name));
+  const md = await mcp(T['deploy[A]'].token, 'deploy_service', { service: FA.web.id });
+  check('MCP deploy_service with a deploy token: deploys, variables masked', !md.error && !md.text.includes(canary), md.error ?? '');
+  const mdB = await mcp(T['deploy[A]'].token, 'deploy_service', { service: `${B.slug}/web` });
+  check('MCP deploy_service on another project: not found', /not found/.test(mdB.error ?? ''));
+  const mskip = await mcp(T['deploy[A]'].token, 'restart_service', { service: FA.web.id, skipSafetyBackup: true });
+  check('MCP: deploy tokens cannot skip the safety backup', /safety backup/.test(mskip.error ?? ''));
+  const mlogs = await mcp(T['deploy[A]'].token, 'get_service_logs', { service: `${B.slug}/web` });
+  check('MCP logs of another project: not found', /not found/.test(mlogs.error ?? ''));
+  const mui = await mcp(T['deploy[A]'].token, 'update_image', { service: FA.web.id, tag: 'latest' });
+  check('MCP update_image with a deploy token', !mui.error && !mui.text.includes(canary), mui.error ?? '');
+  const mset = await mcp(T['write[A]'].token, 'set_variables', { service: FA.web.id, variables: { FROM_MCP: '1' } });
+  check('MCP set_variables with a write token limited to A, in A', !mset.error, mset.error ?? '');
+  await sleep(2000);
+
+  // ─── deploy hooks ───
+  console.log('\n▸ scoped tokens: deploy hooks, CLI, tokens from before scopes');
+  const hook = await api('GET', `/services/${FA.web.id}/deploy-hook`);
+  const hookRes = await fetch(`${BASE}/api/hooks/deploy/${hook.path.split('/').slice(-2).join('/')}`, { method: 'POST' });
+  check('deploy hooks keep working', hookRes.status < 300, `${hookRes.status}`);
+  check('a deploy token cannot read deploy hook URLs (they are secrets)', (await call('deploy[A]', 'GET', `/services/${FA.web.id}/deploy-hook`)).status === 403);
+
+  if (DATA) {
+    const cliToken = (args) => {
+      try {
+        const out = execSync(`node --disable-warning=ExperimentalWarning server/bin/servify.mjs token ${args}`, { env: { ...process.env, SERVIFY_DATA_DIR: DATA }, stdio: 'pipe' }).toString();
+        return { code: 0, token: out.match(/sv[fs]_[A-Za-z0-9_-]+/)?.[0], out: out.replace(/sv[fs]_[A-Za-z0-9_-]+/g, 'svf_…') };
+      } catch (e) {
+        return { code: e.status ?? 1, token: null, out: String(e.stderr ?? '') };
+      }
+    };
+    const c1 = cliToken(`acc-cli-ci --scope deploy --project ${A.slug}`);
+    const c1rec = (await api('GET', '/tokens')).find((t) => t.name === 'acc-cli-ci');
+    check('servify token --scope deploy --project: a deploy token limited to that project', c1.code === 0 && c1rec?.scope === 'deploy' && JSON.stringify(c1rec?.projects) === JSON.stringify([A.id]), c1.out);
+    check('…which deploys there and nowhere else', (await req(c1.token, 'POST', `/services/${FA.web.id}/image-check`)).status !== 403 && (await req(c1.token, 'GET', `/projects/${B.id}`)).status === 404);
+    // `servify deploy --tag` with that token, as CI runs it.
+    const cliHome = mkdtempSync(join(tmpdir(), 'servify-cli-'));
+    const deployCli = (svc, extra = '') => {
+      try {
+        const out = execSync(`node --disable-warning=ExperimentalWarning server/bin/servify.mjs deploy ${extra}`, { env: { ...process.env, SERVIFY_CLI_HOME: cliHome, SERVIFY_URL: BASE, SERVIFY_TOKEN: c1.token, SERVIFY_PROJECT: A.slug, SERVIFY_SERVICE: svc }, stdio: 'pipe', timeout: 300_000 }).toString();
+        return { code: 0, out };
+      } catch (e) {
+        return { code: e.status ?? 1, out: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+      }
+    };
+    const dt = deployCli('web', '--tag latest');
+    check('servify deploy --tag with a deploy token: switches the tag, follows the build, exits 0', dt.code === 0 && /Deployed/.test(dt.out), `exit ${dt.code}`);
+    const du = deployCli('up', '--tag latest');
+    check('servify deploy --tag on a service without a registry image: a clear refusal', du.code === 1 && /doesn't run a registry image/.test(du.out), `exit ${du.code}`);
+    const dB = (() => {
+      try {
+        execSync(`node --disable-warning=ExperimentalWarning server/bin/servify.mjs deploy`, { env: { ...process.env, SERVIFY_CLI_HOME: cliHome, SERVIFY_URL: BASE, SERVIFY_TOKEN: c1.token, SERVIFY_PROJECT: B.slug, SERVIFY_SERVICE: 'web' }, stdio: 'pipe' });
+        return 0;
+      } catch (e) {
+        return e.status ?? 1;
+      }
+    })();
+    check('servify deploy into another project with that token fails', dB === 1);
+    rmSync(cliHome, { recursive: true, force: true });
+    const c2 = cliToken('acc-cli-ro --read');
+    check('servify token --read still makes a read-only token for all projects', c2.code === 0 && (await api('GET', '/tokens')).find((t) => t.name === 'acc-cli-ro')?.scope === 'read' && !('projects' in (await api('GET', '/tokens')).find((t) => t.name === 'acc-cli-ro')));
+    check('servify token: bad scopes, environments and unknown projects are refused', cliToken('x --scope admin').code === 1 && cliToken(`x --project ${env.json.slug}`).code === 1 && cliToken('x --project no-such-project').code === 1 && cliToken('--scope deploy').code === 0);
+
+    // A token record exactly as 0.2.3 wrote it (and older ones, without `kind`): full access, every project.
+    const { DatabaseSync } = await import('node:sqlite');
+    const sdb = new DatabaseSync(join(DATA, 'servify.db'));
+    sdb.exec('PRAGMA busy_timeout = 3000');
+    const legacyRaw = `svf_${randomBytes(24).toString('base64url')}`;
+    const legacy = { id: `tok_legacy${randomBytes(4).toString('hex')}`, name: 'acc-legacy', prefix: legacyRaw.slice(0, 10), scope: 'write', createdAt: Date.now(), lastUsedAt: null };
+    sdb.prepare('INSERT INTO tokens (id, hash, data, created_at) VALUES (?, ?, ?, ?)').run(legacy.id, createHash('sha256').update(legacyRaw).digest('hex'), JSON.stringify(legacy), legacy.createdAt);
+    const lr = await Promise.all([req(legacyRaw, 'GET', `/projects/${B.id}`), req(legacyRaw, 'GET', '/overview'), req(legacyRaw, 'GET', '/system'), req(legacyRaw, 'POST', `/services/${FB.web.id}/image-check`), req(legacyRaw, 'GET', '/tokens')]);
+    const lp = await fetch(`${BASE}/api/projects`, { method: 'POST', headers: { authorization: `Bearer ${legacyRaw}`, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'legacy-made' }) }).then((r) => r.json().then((j) => ({ status: r.status, j })));
+    if (lp.j?.id) projectsToDelete.push(lp.j.id);
+    const lm = await mcp(legacyRaw, 'overview', {});
+    check('a token record from before scopes: still full access to every project, as before', lr[0].status === 200 && lr[1].status === 200 && lr[2].status === 200 && lr[3].status !== 403 && lp.status === 201 && !lm.error && lm.text.includes(B.id), lr.map((r) => r.status).join(' ') + ` ${lp.status}`);
+    check('…and still not the owner', lr[4].status === 403);
+    const stored = JSON.parse(sdb.prepare('SELECT data FROM tokens WHERE id = ?').get(legacy.id).data);
+    check('…and its record is left as it was (nothing to migrate)', !('projects' in stored) && stored.scope === 'write' && !('kind' in stored));
+    sdb.prepare('DELETE FROM tokens WHERE id = ?').run(legacy.id);
+    sdb.close();
+  } else console.log('  – skipped CLI and pre-scopes token checks (set SERVIFY_DATA_DIR)');
+
+  // Revoke what this section made.
+  for (const t of (await api('GET', '/tokens')).filter((t) => !tokensBefore.has(t.id))) await api('DELETE', `/tokens/${t.id}`);
+}
+
+/**
+ * Low disk space protection, entered and left through the instance settings (a protection line above the real free
+ * space): what is paused (and the live log tail that isn't), what is refused, what never is (deletes, restarts, S3
+ * backups, restores that fit), one notification each way, and the automatic resume.
+ */
+async function diskChecks() {
+  console.log('\n▸ low disk space protection');
+  // A project of its own (service names like "vault" are taken in the shared one by the full run).
+  const P = await api('POST', '/projects', { name: `disk-${Date.now().toString(36)}` });
+  projectsToDelete.push(P.id);
+  const state = async () => (await api('GET', '/system')).disk;
+  const before = (await api('GET', '/settings')).disk;
+  const s0 = await state();
+  check('the data disk and Docker’s disk are watched, with the default lines', !!s0 && s0.disks.some((d) => d.roles.includes('data') && d.freeBytes > 0) && s0.disks.some((d) => d.roles.includes('docker') && d.freeBytes > 0) && s0.thresholds.protectGb === 3 && s0.thresholds.warnGb === 10 && s0.thresholds.protectPct === 5 && s0.thresholds.warnPct === 10, JSON.stringify(s0?.thresholds));
+  if (s0?.level !== 'ok') return console.log(`  – skipped: a disk is really low (${s0?.level}) — free space first`);
+  const restoreLines = async () => {
+    await api('PATCH', '/settings/disk', before).catch(() => {});
+    await waitFor(async () => (await state()).level === 'ok', 20_000, 'disk state back to ok');
+  };
+  cleanups.push(restoreLines);
+  check('disk thresholds are validated', (await api('PATCH', '/settings/disk', { protectPct: 99 }).then(() => 'ok', (e) => String(e.message))).includes('→ 400'));
+
+  const notes = [];
+  const sink = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      try {
+        notes.push(JSON.parse(b));
+      } catch {}
+      res.end('ok');
+    });
+  });
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  cleanups.push(async () => sink.close());
+  const ch = await api('POST', '/settings/notifications/channels', { name: 'acc-disk', type: 'webhook', url: `http://127.0.0.1:${sink.address().port}/hook`, events: ['server.usage'] });
+  cleanups.push(() => api('DELETE', `/settings/notifications/channels/${ch.id}`).catch(() => {}));
+  const usage = (from) => notes.slice(from).filter((n) => n.event === 'server.usage');
+
+  // MinIO for an S3 destination (credentials generated, never printed).
+  const MINIO = 'servify-acc-minio-disk';
+  const user = `acc${randomBytes(5).toString('hex')}`;
+  const pass = randomBytes(20).toString('hex');
+  const dockerEnv = { ...process.env, MINIO_ROOT_USER: user, MINIO_ROOT_PASSWORD: pass, MC_HOST_acc: `http://${user}:${pass}@127.0.0.1:9000` };
+  execSync(`docker rm -f -v ${MINIO}`, { stdio: 'ignore' });
+  execSync(`docker run -d --name ${MINIO} --log-driver none -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD -p 127.0.0.1::9000 minio/minio:latest server /data`, { env: dockerEnv, stdio: 'ignore' });
+  cleanups.push(async () => execSync(`docker rm -f -v ${MINIO}`, { stdio: 'ignore' }));
+  const minioPort = Number(execSync(`docker port ${MINIO} 9000/tcp`).toString().trim().split(':').pop());
+  const mc = (args) => execSync(`docker exec -e MC_HOST_acc ${MINIO} mc ${args}`, { env: dockerEnv, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  await waitFor(async () => (mc('ready acc'), true), 30_000, 'minio');
+  mc('mb -p acc/servify-acc');
+  const s3 = await api('POST', '/settings/backups/destinations', { name: 'acc-disk-minio', type: 's3', endpoint: `http://127.0.0.1:${minioPort}`, region: 'us-east-1', bucket: 'servify-acc', prefix: 'disk', accessKeyId: user, secretAccessKey: pass, forcePathStyle: true });
+  cleanups.push(() => api('DELETE', `/settings/backups/destinations/${s3.id}`).catch(() => {}));
+
+  // ── Fixtures, made while there is room.
+  const app = `let n=0;setInterval(()=>console.log('tick '+(n++)),250);require('http').createServer((q,s)=>s.end('ok')).listen(3000)`;
+  const talker = (await api('POST', `/projects/${P.id}/services`, { name: 'talker', image: 'node:22-alpine', port: 3000, startCommand: `node -e "${app}"` })).service;
+  const vault = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'vault', protocol: 'none', startCommand: 'sleep 1d' })).service;
+  await running(P.id, 'talker');
+  await running(P.id, 'vault');
+  const vv = await api('POST', `/projects/${P.id}/volumes`, { name: 'vault-data', serviceId: vault.id, mountPath: '/data' });
+  await waitFor(async () => {
+    const s = await api('GET', `/services/${vault.id}`);
+    return s.status === 'running' && (!vv.deployment || s.activeDeploymentId === vv.deployment.id);
+  }, 120_000, 'vault with a volume');
+  await exec(vault.id, 'echo original > /data/file');
+  const localBak = await api('POST', `/services/${vault.id}/backups`, {});
+  const s3Bak = await api('POST', `/services/${vault.id}/backups`, { destinationId: s3.id });
+  check('fixtures: a folder and an S3 backup taken while there is room', localBak.status === 'succeeded' && s3Bak.status === 'succeeded', `${localBak.status} ${s3Bak.status}`);
+  await exec(vault.id, 'echo changed > /data/file');
+  const dir = mkdtempSync(join(tmpdir(), 'servify-acc-disk-'));
+  cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'Dockerfile'), 'FROM alpine:3.20\nCMD ["sleep", "1d"]\n');
+  const built = (await api('POST', `/projects/${P.id}/services`, { name: 'built', path: dir, protocol: 'none', deploy: false })).service;
+  const pulled = (await api('POST', `/projects/${P.id}/services`, { name: 'pulled', image: 'traefik/whoami:latest', deploy: false })).service;
+  const spare = await api('POST', `/projects/${P.id}/volumes`, { name: 'spare' });
+  const thost = new URL((await api('GET', `/services/${talker.id}`)).url).hostname;
+  await waitFor(async () => (await hit(thost)).status === 200, 30_000, 'talker serving');
+  let sdb = null;
+  if (DATA) {
+    const { DatabaseSync } = await import('node:sqlite');
+    sdb = new DatabaseSync(join(DATA, 'servify.db'));
+    cleanups.push(async () => sdb.close());
+  }
+  const rows = (table, col, since) => Number(sdb.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE service_id = ? AND ${col} >= ?`).get(talker.id, since).n);
+
+  // A build checkout a crash left behind: the automatic clean-up removes it.
+  const stale = DATA ? join(DATA, 'builds', `dep_accdisk${randomBytes(4).toString('hex')}`) : null;
+  if (stale) {
+    mkdirSync(stale, { recursive: true });
+    writeFileSync(join(stale, 'junk.bin'), randomBytes(2 * 1024 * 1024));
+  }
+
+  // ── Enter protect mode: a protection line far above the real free space.
+  const seen = notes.length;
+  const tEnter = Date.now();
+  await api('PATCH', '/settings/disk', { protectGb: 100000 });
+  const s1 = await waitFor(async () => {
+    const s = await state();
+    return s.level === 'protect' && s.disks.filter((d) => d.freeBytes != null).every((d) => d.level === 'protect') && s;
+  }, 20_000, 'protect mode');
+  check('protect mode entered once free space is below the protection line (data and Docker disk)', !!s1, JSON.stringify((await state()).disks.map((d) => [d.id, d.level])));
+  check('the state says what is paused, what is refused and how to free space', !!s1 && s1.paused.some((p) => /logs/.test(p)) && s1.refused.some((r) => /builds/.test(r)) && s1.refused.some((r) => /pulls/.test(r)) && /delet/.test(s1.howToFree ?? ''), JSON.stringify(s1 && { paused: s1.paused, refused: s1.refused }));
+  check('…in /overview too', (await api('GET', '/overview')).disk?.level === 'protect');
+  const mres = await fetch(BASE + '/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'overview', arguments: {} } }) }).then((r) => r.json()).catch(() => ({}));
+  const mtext = (mres.result?.content ?? []).map((c) => c.text);
+  check('MCP overview: the project list as before, then a low-disk note', mtext.length === 2 && mtext[0].includes(P.id) && /LOW DISK SPACE \(protect\)/.test(mtext[1]) && !mtext[1].includes(DATA ?? '\0'), mtext[1]?.slice(0, 160));
+  const cleaned = await waitFor(async () => (await state()).lastCleanup?.at >= tEnter && (await state()).lastCleanup, 20_000, 'automatic clean-up');
+  check('the safe clean-ups ran once on entering protect mode', !!cleaned && (!stale || (!existsSync(stale) && cleaned.steps.some((x) => /leftover build checkouts/.test(x)))), JSON.stringify(cleaned));
+  const enterNote = await waitFor(() => usage(seen).find((n) => n.level === 'error'), 15_000, 'protect notification');
+  check('entering protect mode is notified (server.usage)', /low disk space/i.test(enterNote?.title ?? '') && /free/.test(enterNote?.message ?? ''), enterNote?.title);
+  await sleep(4000);
+  check('…once, for both disks', usage(seen).length === 1, JSON.stringify(usage(seen).map((n) => n.title)));
+
+  // ── Persistence paused, the live tail kept.
+  const sk0 = (await state()).skipped;
+  for (let i = 0; i < 6; i++) await hit(thost, `/disk-${i}`);
+  const sk = await waitFor(async () => {
+    const k = (await state()).skipped;
+    return k && k.logLines > sk0.logLines && k.metricRows > sk0.metricRows && k.accessRows >= sk0.accessRows + 6 && k;
+  }, 25_000, 'skipped counters');
+  check('log lines, metric samples and access-log rows are not stored (counted as skipped)', !!sk, JSON.stringify((await state()).skipped));
+  const tail = await api('GET', `/services/${talker.id}/logs?since=${tEnter + 1500}&tail=50`);
+  check('the live log tail still shows new lines (kept in memory)', tail.length > 3 && tail.every((l) => /tick/.test(l.text)), `${tail.length} lines`);
+  const stream = await (async () => {
+    const ac = new AbortController();
+    const res = await fetch(`${BASE}/api/services/${talker.id}/logs/stream?tail=20`, { headers: COOKIE ? { cookie: COOKIE } : {}, signal: ac.signal });
+    const reader = res.body.getReader();
+    let text = '';
+    const end = Date.now() + 6000;
+    while (Date.now() < end && !/event: lines/.test(text)) {
+      const r = await Promise.race([reader.read(), sleep(6000).then(() => ({ done: true }))]);
+      if (r.done) break;
+      text += Buffer.from(r.value).toString();
+    }
+    ac.abort();
+    return text;
+  })().catch((e) => String(e));
+  check('…and the live stream too (backlog and new lines)', /event: backlog/.test(stream) && /event: lines/.test(stream) && /tick/.test(stream));
+  const al = await api('GET', `/services/${talker.id}/access-log?since=${tEnter}&path=/disk-`);
+  check('no access-log rows stored meanwhile', (al.entries ?? []).length === 0, JSON.stringify(al.entries?.length));
+  if (sdb) {
+    const t = tEnter + 1500;
+    check('the database got no log, metric or access-log rows for it meanwhile', rows('logs', 'ts', t) === 0 && rows('metrics', 't', t + 10_000) === 0 && rows('access_log', 'ts', t) === 0, `${rows('logs', 'ts', t)} ${rows('metrics', 't', t + 10_000)} ${rows('access_log', 'ts', t)}`);
+  }
+
+  // ── Refused, with a clear message (which disk, how much is free, the line).
+  const err = (p) => p.then(() => 'ok', (e) => String(e.message));
+  const b1 = await err(api('POST', `/services/${built.id}/deploy`));
+  check('a build is refused at once (507) with which disk, its free space and the line', /→ 507 Low disk space: the data disk \(.+\) has [\d.]+ [GM]B free, below its 100000 GB protection line — builds are refused/.test(b1), b1.slice(0, 220));
+  const pd = await api('POST', `/services/${pulled.id}/deploy`);
+  const pdone = await waitFor(async () => {
+    const d = (await api('GET', `/services/${pulled.id}/deployments?limit=1`))[0];
+    return d && ['failed', 'active'].includes(d.status) && d;
+  }, 60_000, 'pull deploy');
+  check('an image pull for a new deploy fails without downloading, saying why', pdone?.id === pd.id && pdone.status === 'failed' && /Low disk space: the Docker disk .*image pulls are refused/.test(pdone.error ?? ''), (pdone?.error ?? '').slice(0, 200));
+  const fb = await err(api('POST', `/services/${vault.id}/backups`, {}));
+  check('a backup to a folder on the data disk is refused (507)', /→ 507 Low disk space: the data disk .*backups to folders on this disk are refused/.test(fb), fb.slice(0, 200));
+  const sb = await api('POST', `/services/${vault.id}/backups`, { destinationId: s3.id }).catch((e) => ({ status: String(e.message) }));
+  check('…while a backup to S3 goes through (it streams, nothing lands here)', sb.status === 'succeeded', sb.status);
+  const tr = await err(api('POST', `/backups/${s3Bak.id}/test`));
+  check('a test restore is refused (it needs a scratch volume on the Docker disk)', /→ 507 Low disk space: the Docker disk .*test restores are refused/.test(tr), tr.slice(0, 200));
+  if (sdb) {
+    const raw = sdb.prepare('SELECT data FROM backups WHERE id = ?').get(localBak.id).data;
+    const huge = JSON.parse(raw);
+    huge.sizeBytes = 2 ** 50; // a petabyte: more than the whole disk
+    sdb.prepare('UPDATE backups SET data = ? WHERE id = ?').run(JSON.stringify(huge), localBak.id);
+    const big = await err(api('POST', `/backups/${localBak.id}/restore`));
+    sdb.prepare('UPDATE backups SET data = ? WHERE id = ?').run(raw, localBak.id);
+    check('a restore that clearly can’t fit is refused, nothing changed', /→ 507 restoring this .* backup needs at least .* can't fit; nothing was changed/.test(big) && (await exec(vault.id, 'cat /data/file')).output.trim() === 'changed', big.slice(0, 220));
+  } else console.log('  – skipped the restore that doesn’t fit (set SERVIFY_DATA_DIR)');
+  await api('POST', `/backups/${s3Bak.id}/restore`);
+  await sleep(1500);
+  await waitFor(async () => !(await api('GET', `/services/${vault.id}`)).restoring, 180_000, 'restore');
+  await running(P.id, 'vault');
+  const restored = (await exec(vault.id, 'cat /data/file').catch(() => ({ output: '' }))).output.trim();
+  check('a restore that fits is allowed (from S3, its safety backup to S3 as well)', restored === 'original', restored);
+  await exec(vault.id, 'echo changed-again > /data/file');
+  await api('POST', `/backups/${localBak.id}/restore`);
+  await sleep(1500);
+  await waitFor(async () => !(await api('GET', `/services/${vault.id}`)).restoring, 180_000, 'folder restore');
+  await running(P.id, 'vault');
+  const restored2 = (await exec(vault.id, 'cat /data/file').catch(() => ({ output: '' }))).output.trim();
+  const preRestore = (await api('GET', `/services/${vault.id}/backups`)).find((b) => b.trigger === 'pre-restore' && b.destinationId === 'local' && b.createdAt > tEnter);
+  check('…and from a folder backup too (its safety backup is held to the room check, not refused)', restored2 === 'original' && preRestore?.status === 'succeeded', `${restored2} ${preRestore?.status}`);
+
+  // ── Never refused: what frees space or keeps things running.
+  const rs = await api('POST', `/services/${talker.id}/restart`);
+  const rsd = await waitFor(async () => {
+    const d = (await api('GET', `/services/${talker.id}/deployments?limit=1`))[0];
+    return d?.id === rs.id && ['active', 'failed'].includes(d.status) && d;
+  }, 90_000, 'restart');
+  check('restarting an existing service still works', rsd?.status === 'active', rsd?.error ?? '');
+  check('deleting a backup works', (await err(api('DELETE', `/backups/${sb.id}`))) === 'ok');
+  // A volume with no recent backup: its safety backup can't go to the full data disk, so deleting it asks for the
+  // explicit "without a safety backup" (as when a backup doesn't fit) — then it goes.
+  const dv0 = await err(api('DELETE', `/volumes/${spare.volume?.id ?? spare.id}`));
+  check('deleting a volume with no recent backup asks to skip its safety backup (it can’t land on the full disk)', /→ 409 .*Low disk space/.test(dv0), dv0.slice(0, 200));
+  const dv = await err(api('DELETE', `/volumes/${spare.volume?.id ?? spare.id}?skipSafetyBackup=1`));
+  check('…and with skipSafetyBackup, deleting the volume works', dv === 'ok', dv);
+  check('stopping a service works', (await err(api('POST', `/services/${vault.id}/stop`))) === 'ok');
+  check('deleting a service works', (await err(api('DELETE', `/services/${pulled.id}`))) === 'ok');
+
+  // ── Hysteresis: between the lines, protection stays until the disk is above the warn line.
+  await api('PATCH', '/settings/disk', { protectGb: 1, warnGb: 100000 });
+  await sleep(3000);
+  check('between the protection and the warn line it stays protected (no flapping)', (await state()).level === 'protect');
+
+  // ── Resume.
+  const seen2 = notes.length;
+  const tResume = Date.now();
+  await api('PATCH', '/settings/disk', { protectGb: before.protectGb, warnGb: before.warnGb });
+  const s2 = await waitFor(async () => (await state()).level === 'ok' && (await state()), 20_000, 'resume');
+  check('resumes on its own once the disk is back above the warn line', !!s2 && s2.paused.length === 0 && s2.refused.length === 0);
+  const back = await waitFor(() => usage(seen2).find((n) => n.level === 'success'), 15_000, 'all-clear notification');
+  check('the all-clear is notified', /protection lifted/.test(back?.title ?? ''), back?.title);
+  await sleep(3000);
+  check('…once', usage(seen2).length === 1, JSON.stringify(usage(seen2).map((n) => n.title)));
+  if (sdb) {
+    const ok = await waitFor(() => rows('logs', 'ts', tResume + 1000) > 0 && rows('metrics', 't', tResume + 10_000) > 0, 30_000, 'rows again');
+    check('logs and metrics are stored again', !!ok);
+    check('the lines kept in memory meanwhile were written too', rows('logs', 'ts', tEnter + 1500) - rows('logs', 'ts', tResume) > 3);
+  }
+  const bd = await api('POST', `/services/${built.id}/deploy`);
+  const bdone = await waitFor(async () => {
+    const d = (await api('GET', `/services/${built.id}/deployments?limit=1`))[0];
+    return d?.id === bd.id && ['failed', 'active'].includes(d.status) && d;
+  }, 180_000, 'build');
+  check('builds work again', bdone?.status === 'active', bdone?.error ?? '');
+
+  // ── Warn only: notified, nothing refused.
+  const seen3 = notes.length;
+  await api('PATCH', '/settings/disk', { warnGb: 100000 });
+  const s3w = await waitFor(async () => (await state()).level === 'warn' && (await state()), 20_000, 'warn');
+  check('below the warn line only: warned, nothing paused or refused', !!s3w && s3w.paused.length === 0 && s3w.refused.length === 0);
+  const wn = await waitFor(() => usage(seen3).find((n) => n.level === 'error'), 15_000, 'warn notification');
+  check('…and notified once', /getting low/.test(wn?.title ?? '') && usage(seen3).length === 1, wn?.title);
+  await restoreLines();
+}
+
+/**
+ * Scheduled jobs: catch-up of runs missed while Servify was down (once, within the window), skipped starts in the run
+ * history, failure notifications de-duplicated (first failure, reminder, recovered) and kept across a restart, and a
+ * missed scheduled backup caught up once.
+ */
+async function cronChecks(P) {
+  console.log('\n▸ catch-up math (cron.ts)');
+  const C = await import(new URL('../server/src/cron.ts', import.meta.url).href);
+  const H = 3_600_000;
+  const at = (s) => new Date(s);
+  const tz = 'Europe/Berlin';
+  const daily = C.parseCron('0 3 * * *');
+  // Ran at 03:00 Berlin (02:00Z) on the 10th; Servify was down over the 11th's 03:00.
+  const ran10 = { afterMs: at('2026-03-10T02:00:00Z').getTime(), lastFired: '2026-3-10 3:0' };
+  let p = C.catchUpPlan(daily, tz, { ...ran10, now: at('2026-03-11T05:00:20Z') });
+  check('a daily run missed by 3 h is caught up (once)', p.catchUp && p.missed === 1 && p.last === at('2026-03-11T02:00:00Z').getTime(), JSON.stringify(p));
+  check('…its window is half a day', p.windowMs === 12 * H, String(p.windowMs));
+  p = C.catchUpPlan(daily, tz, { ...ran10, now: at('2026-03-11T15:00:20Z') });
+  check('missed by 13 h: outside the window, not caught up', !p.catchUp && p.missed === 1, JSON.stringify(p));
+  p = C.catchUpPlan(daily, tz, { ...ran10, now: at('2026-03-10T05:00:00Z') });
+  check('no catch-up for a run that did happen', !p.catchUp && p.missed === 0, JSON.stringify(p));
+  const hourly = C.parseCron('0 * * * *');
+  p = C.catchUpPlan(hourly, null, { afterMs: at('2026-03-10T02:00:00Z').getTime(), now: at('2026-03-10T05:10:00Z') });
+  check('several missed runs (03, 04, 05:00) → one catch-up run', p.catchUp && p.missed === 3 && p.last === at('2026-03-10T05:00:00Z').getTime() && p.windowMs === H / 2, JSON.stringify(p));
+  p = C.catchUpPlan(hourly, null, { afterMs: at('2026-03-10T02:00:00Z').getTime(), now: at('2026-03-10T05:40:00Z') });
+  check('…but not 40 min late (an hourly job catches up for 30 min)', !p.catchUp, JSON.stringify(p));
+  const minutely = C.parseCron('* * * * *');
+  p = C.catchUpPlan(minutely, null, { afterMs: at('2026-03-10T02:00:00Z').getTime(), now: at('2026-03-10T02:05:30Z') });
+  check('an every-minute job never replays (its window is 30 s, and it is due now anyway)', !p.catchUp && p.dueNow && p.windowMs === 30_000, JSON.stringify(p));
+  const at230 = C.parseCron('30 2 * * *');
+  // Berlin, 29 March 2026: 02:00 → 03:00. A 02:30 job runs at 03:00 that day (01:00Z); Servify was down over it.
+  p = C.catchUpPlan(at230, tz, { afterMs: at('2026-03-28T01:30:00Z').getTime(), lastFired: '2026-3-28 2:30', now: at('2026-03-29T01:20:00Z') });
+  check('DST (clocks forward): the 02:30 run that day (03:00) missed → caught up once', p.catchUp && p.missed === 1 && p.last === at('2026-03-29T01:00:00Z').getTime(), JSON.stringify(p));
+  // 25 October 2026: 02:30 comes twice (00:30Z and 01:30Z). It ran at the first; Servify was down over the second.
+  p = C.catchUpPlan(at230, tz, { afterMs: at('2026-10-25T00:30:00Z').getTime(), lastFired: '2026-10-25 2:30', now: at('2026-10-25T02:00:00Z') });
+  check('DST (clocks back): the repeated 02:30 is not a missed run', !p.catchUp && p.missed === 0, JSON.stringify(p));
+  p = C.catchUpPlan(at230, tz, { afterMs: at('2026-10-24T00:30:00Z').getTime(), lastFired: '2026-10-24 2:30', now: at('2026-10-25T02:00:00Z') });
+  check('…and down over both: one missed run, one catch-up', p.catchUp && p.missed === 1 && p.last === at('2026-10-25T00:30:00Z').getTime(), JSON.stringify(p));
+  p = C.catchUpPlan(daily, tz, { ...ran10, now: at('2026-03-11T05:00:20Z'), windowMs: 60 * 60_000 });
+  check('SERVIFY_CATCHUP_WINDOW_MINUTES (windowMs) replaces the window: 1 h → 3 h late is too late', !p.catchUp && p.windowMs === H, JSON.stringify(p));
+  const nowRun = C.nextRun('0 3 * * *', new Date(), tz);
+  check('nextRun from an earlier moment is not answered from the cache', C.nextRun('0 3 * * *', at('2026-01-01T00:00:00Z'), tz)?.toISOString() === '2026-01-01T02:00:00.000Z' && C.nextRun('0 3 * * *', new Date(), tz)?.getTime() === nowRun?.getTime());
+
+  console.log('\n▸ scheduled jobs: skipped runs, failure notifications');
+  const notes = [];
+  const sink = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      try {
+        notes.push(JSON.parse(b));
+      } catch {}
+      res.end('ok');
+    });
+  });
+  await new Promise((r) => sink.listen(0, '127.0.0.1', r));
+  cleanups.push(() => sink.close());
+  const ch = await api('POST', '/settings/notifications/channels', { name: 'acc-cron', type: 'webhook', url: `http://127.0.0.1:${sink.address().port}/hook`, events: ['job.failed', 'backup.failed'] });
+  cleanups.push(() => api('DELETE', `/settings/notifications/channels/${ch.id}`).catch(() => {}));
+  const remindBefore = (await api('GET', '/settings')).alerts.failureRemindHours;
+  cleanups.push(() => api('PATCH', '/settings/alerts', { failureRemindHours: remindBefore ?? 24 }).catch(() => {}));
+  check('reminders default to every 24 h', remindBefore === 24, String(remindBefore));
+
+  const deployed = async (sid) => {
+    const d = await api('POST', `/services/${sid}/deploy`);
+    return waitFor(async () => {
+      const x = await api('GET', `/deployments/${d.id}`);
+      return ['active', 'failed', 'cancelled'].includes(x.status) && x;
+    }, 120_000, 'deploy');
+  };
+  const job = async (name, schedule, extra = {}) => {
+    const svc = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name, protocol: 'none', deploy: false, ...extra })).service;
+    await api('PATCH', `/services/${svc.id}`, { schedule, ...(extra.patch ?? {}) });
+    const d = await deployed(svc.id);
+    if (d?.status !== 'active') throw new Error(`${name} did not deploy: ${d?.status}`);
+    return svc;
+  };
+  const runs = (sid) => api('GET', `/services/${sid}/runs?limit=50`);
+  const jobNotes = (sid) => notes.filter((n) => n.serviceId === sid && n.event === 'job.failed');
+  const runNow = async (sid) => {
+    const before = (await runs(sid)).filter((r) => r.status !== 'skipped').length;
+    await waitFor(async () => (await api('POST', `/services/${sid}/run`), true), 30_000, 'run accepted');
+    return waitFor(async () => {
+      const r = (await runs(sid)).filter((x) => x.status !== 'skipped');
+      return r.length > before && r[0].status !== 'running' && r[0];
+    }, 60_000, 'run finished');
+  };
+
+  // A run that outlasts its interval: the next starts are skipped — and say so, once per streak.
+  const slow = await job('slow', '* * * * *', { startCommand: 'sleep 130' });
+  // A job that fails until MODE=ok (a new deploy), run by hand (the de-duplication covers every run of a job).
+  const flaky = await job('flaky', '0 0 1 1 *', { startCommand: 'echo "mode $MODE"; test "$MODE" = ok', env: { MODE: 'bad' } });
+  const svcView = (sid) => api('GET', `/services/${sid}`);
+  check('catch-up is off for jobs by default', (await svcView(flaky.id)).cron?.catchUp === false && (await svcView(flaky.id)).cron?.catchUpExplicit === false, JSON.stringify((await svcView(flaky.id)).cron));
+  for (let i = 0; i < 3; i++) await runNow(flaky.id);
+  const fruns = (await runs(flaky.id)).filter((r) => r.status === 'failed');
+  check('three failed runs, all recorded', fruns.length === 3, String(fruns.length));
+  await sleep(1500);
+  check('…but one failure notification', jobNotes(flaky.id).length === 1 && /Cron job flaky failed/.test(jobNotes(flaky.id)[0].title), JSON.stringify(jobNotes(flaky.id).map((n) => n.title)));
+  let fv = await svcView(flaky.id);
+  check('the service says since when it is failing', fv.cron?.failing?.count === 3 && fv.cron.failing.since <= fruns[fruns.length - 1].finishedAt + 1000 && !!fv.cron.failing.notifiedAt, JSON.stringify(fv.cron));
+  // A reminder after failureRemindHours (shortened to 30 s here).
+  await api('PATCH', '/settings/alerts', { failureRemindHours: 30 / 3600 });
+  await sleep(31_000);
+  await runNow(flaky.id);
+  await sleep(1500);
+  check('a reminder once the reminder interval has passed', jobNotes(flaky.id).length === 2 && /flaky is still failing/.test(jobNotes(flaky.id)[1].title) && /4 failed runs in a row/.test(jobNotes(flaky.id)[1].message), JSON.stringify(jobNotes(flaky.id).map((n) => n.title)));
+  await runNow(flaky.id);
+  await sleep(1500);
+  check('…and not at the next failure right after', jobNotes(flaky.id).length === 2);
+  await api('PATCH', '/settings/alerts', { failureRemindHours: 24 });
+  await api('PUT', `/services/${flaky.id}/variables`, { variables: { MODE: 'ok' } });
+  await deployed(flaky.id);
+  const okRun = await runNow(flaky.id);
+  await sleep(1500);
+  check('fixed: the run succeeds and one "recovered" notification goes out', okRun?.status === 'succeeded' && jobNotes(flaky.id).length === 3 && jobNotes(flaky.id)[2].level === 'success' && /flaky recovered/.test(jobNotes(flaky.id)[2].title) && /after 5 failed runs/.test(jobNotes(flaky.id)[2].message), JSON.stringify(jobNotes(flaky.id).slice(2)));
+  await runNow(flaky.id);
+  await sleep(1000);
+  check('…once: another success says nothing', jobNotes(flaky.id).length === 3 && (await svcView(flaky.id)).cron?.failing === null);
+  // Failing again, notified: this streak must survive the restart below without a second notice.
+  await api('PUT', `/services/${flaky.id}/variables`, { variables: { MODE: 'bad' } });
+  await deployed(flaky.id);
+  await runNow(flaky.id);
+  await sleep(1500);
+  check('a new streak notifies again', jobNotes(flaky.id).length === 4 && jobNotes(flaky.id)[3].level === 'error');
+
+  const skip = await waitFor(async () => (await runs(slow.id)).find((r) => r.status === 'skipped' && (r.skipCount ?? 1) >= 2), 200_000, 'two skipped starts');
+  check('a start while the previous run is still going is recorded as skipped, with the reason', /previous run is still going/.test(skip?.reason ?? ''), JSON.stringify(skip ?? (await runs(slow.id)).slice(0, 3)));
+  check('…consecutive skips share one record (×count, first and last time)', skip?.skipCount >= 2 && skip.finishedAt > skip.startedAt && (await runs(slow.id)).filter((r) => r.status === 'skipped').length === 1, JSON.stringify(skip));
+  const acts = await api('GET', `/projects/${P.id}/activity?limit=200`);
+  check('…and the skip is in the activity log (once)', acts.filter((a) => a.serviceId === slow.id && a.action === 'job.skipped').length === 1);
+  const mcpRuns = await fetch(BASE + '/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(COOKIE ? { cookie: COOKIE } : {}) },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_runs', arguments: { service: slow.id } } }),
+  }).then((r) => r.text());
+  check('MCP list_runs shows the skipped start with its reason and count', /skipped/.test(mcpRuns) && /previous run is still going/.test(mcpRuns) && /\\"count\\":\s*\d/.test(mcpRuns), mcpRuns.slice(0, 300));
+
+  console.log('\n▸ catch-up across a restart');
+  const START = process.env.SERVIFY_START_CMD;
+  if (!DATA || !START) return console.log('  – skipped (set SERVIFY_DATA_DIR and SERVIFY_START_CMD, see the header)');
+  const health = () => fetch(BASE + '/api/health').then((r) => r.ok, () => false);
+  const stop = async () => {
+    const { pid } = JSON.parse(readFileSync(join(DATA, 'servify.pid'), 'utf8'));
+    process.kill(pid, 'SIGTERM');
+    await waitFor(async () => !(await health()), 30_000, 'Servify stopped');
+  };
+  const start = async () => {
+    execSync(START, { stdio: 'ignore' });
+    if (!(await waitFor(health, 60_000, 'Servify up'))) throw new Error('Servify did not come back');
+  };
+  // Pick a minute M far enough ahead to set up; schedules "M * * * *" (hourly: a 30 min window, no override needed).
+  await api('DELETE', `/services/${slow.id}`);
+  const t0 = Date.now();
+  const dueAt = Math.ceil((t0 + 100_000) / 60_000) * 60_000;
+  const M = new Date(dueAt).getMinutes();
+  const hourlyAt = `${M} * * * *`;
+  const late = await job('late', hourlyAt, { startCommand: 'echo late-run', patch: { scheduleCatchUp: true } });
+  const nolate = await job('nolate', hourlyAt, { startCommand: 'echo no-late-run' });
+  const every = await job('every', '* * * * *', { startCommand: 'echo tick', patch: { scheduleCatchUp: true } });
+  const vault = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'vault', protocol: 'none', startCommand: 'sh -c "echo data > /data/f; exec sleep 1000000"', deploy: false })).service;
+  await api('PATCH', `/services/${vault.id}`, { volumes: [{ name: 'data', mountPath: '/data' }] });
+  await deployed(vault.id);
+  await running(P.id, 'vault');
+  await api('PATCH', `/services/${vault.id}`, { backup: { enabled: true, schedule: hourlyAt, destinationId: 'local', retention: 3 } });
+  check('scheduled backups catch up by default', (await svcView(vault.id)).backupHealth?.catchUp === true, JSON.stringify((await svcView(vault.id)).backupHealth));
+  check('jobs can opt in to catch-up', (await svcView(late.id)).cron?.catchUp === true);
+  if (Date.now() > dueAt - 12_000) return check('set up before the chosen minute', false, `${Math.round((Date.now() - t0) / 1000)} s`);
+  await sleep(dueAt - 10_000 - Date.now());
+  await stop();
+  console.log(`    (stopped Servify before ${new Date(dueAt).toLocaleTimeString()}, when "late", "nolate" and the backup were due)`);
+  await sleep(dueAt + 75_000 - Date.now());
+  await start();
+  const caught = await waitFor(async () => (await runs(late.id)).find((r) => r.catchUp && r.status === 'succeeded'), 90_000, 'catch-up run');
+  check('a run missed while Servify was down runs once after the restart, marked as a catch-up', !!caught && caught.catchUp.dueAt === dueAt && caught.catchUp.missed === 1 && caught.trigger === 'schedule', JSON.stringify(caught ?? (await runs(late.id)).slice(0, 2)));
+  const bak = await waitFor(async () => (await api('GET', `/services/${vault.id}/backups`)).find((b) => b.trigger === 'schedule' && b.status !== 'running'), 90_000, 'catch-up backup');
+  check('a scheduled backup missed while Servify was down runs once after the restart', bak?.status === 'succeeded' && bak.catchUp?.dueAt === dueAt, JSON.stringify(bak ?? null).slice(0, 300));
+  const skippedLate = await waitFor(async () => (await runs(nolate.id)).find((r) => r.status === 'skipped'), 30_000, 'skipped record');
+  check('catch-up off: no run, a skipped record says why', !!skippedLate && /missed 1 run while Servify wasn't running/.test(skippedLate.reason) && /catch-up is off/.test(skippedLate.reason) && (await runs(nolate.id)).length === 1, JSON.stringify(await runs(nolate.id)));
+  await sleep(15_000);
+  check('an every-minute job is not replayed (its regular runs go on)', (await runs(every.id)).every((r) => !r.catchUp), JSON.stringify((await runs(every.id)).map((r) => [r.status, r.catchUp])));
+  // The failing streak from before the restart: still known, no new notice.
+  fv = await svcView(flaky.id);
+  check('the failure streak survives the restart', fv.cron?.failing?.count === 1 && !!fv.cron.failing.notifiedAt, JSON.stringify(fv.cron));
+  await runNow(flaky.id);
+  await sleep(1500);
+  check('…and a failure after the restart does not notify again', jobNotes(flaky.id).length === 4 && (await svcView(flaky.id)).cron?.failing?.count === 2, String(jobNotes(flaky.id).length));
+
+  // Another restart inside the window: the missed run already caught up must not run again.
+  await stop();
+  await sleep(3000);
+  await start();
+  await sleep(20_000);
+  const lateRuns = (await runs(late.id)).filter((r) => r.status !== 'skipped');
+  const baks = (await api('GET', `/services/${vault.id}/backups`)).filter((b) => b.trigger === 'schedule');
+  check('exactly one catch-up run, also after another restart', lateRuns.length === 1, JSON.stringify(lateRuns.map((r) => [r.status, r.catchUp])));
+  check('exactly one catch-up backup, also after another restart', baks.length === 1, String(baks.length));
+  check('interrupted runs (a restart) are not reported as failures', !notes.some((n) => n.serviceId === every.id || n.serviceId === late.id));
+}
+
+/**
+ * The everyday CLI commands (ONLY=cli; also part of a full run): exec argv and exit codes, variables (masking, get,
+ * stdin, --from-file, shared, --deploy), backup create/list/test/download (checksum verification against a damaged
+ * stored file), restore (confirmation, progress, failure exit code), rollback, restart and help. Needs SERVIFY_DATA_DIR
+ * (for `servify token` and the stored backup file). Every command runs through execFileSync-style argv, never a shell.
+ */
+async function cliParityChecks(P) {
+  console.log('\n▸ servify CLI: exec, variables, backup, restore, rollback');
+  if (!DATA) return console.log('  – skipped (set SERVIFY_DATA_DIR)');
+  const BIN = join(process.cwd(), 'server/bin/servify.mjs');
+  const home = mkdtempSync(join(tmpdir(), 'servify-cli2-home-'));
+  const work = mkdtempSync(join(tmpdir(), 'servify-cli2-work-'));
+  cleanups.push(() => rmSync(home, { recursive: true, force: true }), () => rmSync(work, { recursive: true, force: true }));
+  const mkToken = (name, extra = []) => {
+    const r = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', BIN, 'token', name, ...extra], { env: { ...process.env, SERVIFY_DATA_DIR: DATA }, encoding: 'utf8' });
+    return r.stdout.match(/svf_[A-Za-z0-9_-]+|svs_[A-Za-z0-9_-]+/)?.[0];
+  };
+  const tok = mkToken('acceptance-cli-parity');
+  const readTok = mkToken('acceptance-cli-parity-read', ['--scope', 'read']);
+  const app = (await api('POST', `/projects/${P.id}/services`, { image: 'nginx:alpine', name: 'cli-parity' })).service;
+  await running(P.id, 'cli-parity');
+  await api('POST', `/projects/${P.id}/volumes`, { name: 'data', serviceId: app.id, mountPath: '/data' });
+  await waitFor(async () => {
+    const d = await api('GET', `/services/${app.id}/deployments?limit=5`);
+    return d.length >= 2 && d[0].status === 'active' && (await svcOf(P.id, 'cli-parity')).status === 'running';
+  }, 180_000, 'redeploy with the volume');
+  const baseEnv = { ...process.env, SERVIFY_CLI_HOME: home, SERVIFY_URL: BASE, SERVIFY_TOKEN: tok, SERVIFY_PROJECT: P.slug, SERVIFY_SERVICE: 'cli-parity', NO_COLOR: '1' };
+  /** argv in, { code, out (stdout), err (stderr), all } out — no shell anywhere. */
+  const cli = (argv, opts = {}) => {
+    const r = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', BIN, ...argv], { cwd: opts.cwd ?? work, env: { ...baseEnv, ...(opts.env ?? {}) }, input: opts.input ?? '', encoding: 'utf8', timeout: 300_000 });
+    return { code: r.status ?? 1, out: r.stdout ?? '', err: r.stderr ?? '', all: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+  };
+
+  // ─── exec ───
+  const quoted = cli(['exec', '--', 'sh', '-c', 'printf "%s|" "$@"', 'x', 'a b', 'c"d', "e'f"]);
+  check('exec passes argv as is (spaces and quotes survive)', quoted.code === 0 && quoted.out.trim() === `a b|c"d|e'f|`, JSON.stringify(quoted.out));
+  const echo = cli(['exec', '--', 'sh', '-c', 'echo "a b"']);
+  check('`exec -- sh -c \'echo "a b"\'` reaches the container as ["sh","-c","echo \\"a b\\""]', echo.code === 0 && echo.out.trim() === 'a b', JSON.stringify(echo.out));
+  const seven = cli(['exec', '--', 'sh', '-c', 'exit 7']);
+  check('exec exits with the remote command’s exit code', seven.code === 7, String(seven.code));
+  const shellForm = cli(['exec', 'echo hi | tr a-z A-Z']);
+  check('one argument with shell syntax still runs through /bin/sh -c', shellForm.code === 0 && shellForm.out.trim() === 'HI', shellForm.all);
+  const viaApiArr = await api('POST', `/services/${app.id}/exec`, { command: ['printf', '%s', 'x y'] });
+  const viaApiStr = await api('POST', `/services/${app.id}/exec`, { command: 'printf %s "x y"' });
+  check('the exec API takes an argv array and still takes a string', viaApiArr.output === 'x y' && viaApiArr.exitCode === 0 && viaApiStr.output === 'x y', `${JSON.stringify(viaApiArr)} ${JSON.stringify(viaApiStr)}`);
+  const badArr = await fetch(`${BASE}/api/services/${app.id}/exec`, { method: 'POST', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ command: [1, 2] }) });
+  const emptyArr = await fetch(`${BASE}/api/services/${app.id}/exec`, { method: 'POST', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ command: [] }) });
+  check('the exec API refuses a malformed command (400)', badArr.status === 400 && emptyArr.status === 400, `${badArr.status} ${emptyArr.status}`);
+
+  // ─── variables ───
+  const set1 = cli(['variables', 'set', 'GREETING=hello', 'TWO=two words', 'EQ=a=b']);
+  check('variables set NAME=value… (says a redeploy is needed)', set1.code === 0 && /Set GREETING, TWO, EQ/.test(set1.out) && /next deploy/.test(set1.out) && !set1.all.includes('two words'), set1.all);
+  const masked = cli(['variables', 'list']);
+  check('variables list masks values by default', masked.code === 0 && /GREETING=••••••••/.test(masked.out) && !masked.out.includes('hello') && !masked.out.includes('two words'), masked.all);
+  const revealed = cli(['vars', 'list', '--reveal']);
+  check('vars list --reveal shows them', revealed.code === 0 && revealed.out.includes('TWO=two words') && revealed.out.includes('EQ=a=b'), revealed.all);
+  const got = cli(['variables', 'get', 'TWO']);
+  check('variables get prints only the value', got.code === 0 && got.out === 'two words\n', JSON.stringify(got.out));
+  const missing = cli(['variables', 'get', 'NOPE']);
+  check('variables get of a missing name exits 1 and prints nothing on stdout', missing.code === 1 && missing.out === '', missing.all);
+  const piped = cli(['variables', 'set', 'API_TOKEN'], { input: 'from-stdin-value\n' });
+  const pipedGet = cli(['variables', 'get', 'API_TOKEN']);
+  check('variables set NAME reads the value from stdin (one trailing newline dropped)', piped.code === 0 && pipedGet.out === 'from-stdin-value\n' && !piped.all.includes('from-stdin-value'), `${piped.all} ${JSON.stringify(pipedGet.out)}`);
+  const envFile = join(work, 'prod.env');
+  writeFileSync(envFile, ['# a comment', '', 'export FILE_A=one', 'FILE_B="two \\"quoted\\"\\nline"', "FILE_C='single $not_expanded' # comment", 'FILE_D=x=y   # trailing comment', 'FILE_E="multi', 'line"', ''].join('\n'));
+  const fromFile = cli(['variables', 'set', '--from-file', envFile]);
+  const env1 = (await api('GET', `/services/${app.id}`)).env;
+  check(
+    'variables set --from-file reads a .env file (export, comments, quotes, = in values, multi-line)',
+    fromFile.code === 0 && env1.FILE_A === 'one' && env1.FILE_B === 'two "quoted"\nline' && env1.FILE_C === 'single $not_expanded' && env1.FILE_D === 'x=y' && env1.FILE_E === 'multi\nline',
+    `${fromFile.all} ${JSON.stringify([env1.FILE_A, env1.FILE_B, env1.FILE_C, env1.FILE_D, env1.FILE_E])}`,
+  );
+  const fromStdinFile = cli(['variables', 'set', '--from-file', '-'], { input: 'FILE_F=ff\n' });
+  check('--from-file - reads the .env from stdin', fromStdinFile.code === 0 && (await api('GET', `/services/${app.id}`)).env.FILE_F === 'ff', fromStdinFile.all);
+  const badFile = join(work, 'bad.env');
+  writeFileSync(badFile, 'GOOD=1\nthis is not a variable\n');
+  const bad = cli(['variables', 'set', '--from-file', badFile]);
+  check('a malformed .env is refused with its line number, nothing set', bad.code === 1 && /bad\.env:2/.test(bad.err) && !('GOOD' in (await api('GET', `/services/${app.id}`)).env), bad.all);
+  const svcNow = await api('GET', `/services/${app.id}`);
+  check('new secret-looking names are masked for read-only tokens', svcNow.secretKeys.includes('API_TOKEN') && !svcNow.secretKeys.includes('GREETING'), JSON.stringify(svcNow.secretKeys));
+  const roGet = cli(['variables', 'get', 'API_TOKEN'], { env: { SERVIFY_TOKEN: readTok } });
+  const roList = cli(['variables', 'list', '--reveal'], { env: { SERVIFY_TOKEN: readTok } });
+  check('read-only token: get of a secret fails without printing it; list --reveal keeps it masked', roGet.code === 1 && !roGet.all.includes('from-stdin-value') && roList.code === 0 && roList.out.includes('API_TOKEN=••••••••') && roList.out.includes('GREETING=hello') && !roList.all.includes('from-stdin-value'), `${roGet.all} | ${roList.all}`);
+  const roSet = cli(['variables', 'set', 'X=1'], { env: { SERVIFY_TOKEN: readTok } });
+  check('read-only token: set is refused (exit 1)', roSet.code === 1, roSet.all);
+  const unset = cli(['variables', 'unset', 'FILE_A', 'FILE_F']);
+  const env2 = (await api('GET', `/services/${app.id}`)).env;
+  check('variables unset removes them', unset.code === 0 && !('FILE_A' in env2) && !('FILE_F' in env2) && env2.FILE_B, unset.all);
+  const unsetMissing = cli(['variables', 'unset', 'FILE_A']);
+  check('variables unset of a missing name exits 1', unsetMissing.code === 1, unsetMissing.all);
+  const sharedSet = cli(['variables', 'set', '--shared', 'REGION=eu-1']);
+  const sharedGet = cli(['variables', 'get', '--shared', 'REGION']);
+  check('--shared sets and gets the project’s shared variables', sharedSet.code === 0 && sharedGet.out === 'eu-1\n' && (await api('GET', `/projects/${P.id}`)).project.variables?.REGION === 'eu-1', `${sharedSet.all} ${JSON.stringify(sharedGet.out)}`);
+  cli(['variables', 'set', 'USES_REGION=${{shared.REGION}}']);
+  const sharedChange = cli(['variables', 'set', '--shared', 'REGION=eu-2', 'OTHER=1']);
+  check('changing a shared variable names the services that use it', sharedChange.code === 0 && /cli-parity/.test(sharedChange.out) && (await api('GET', `/projects/${P.id}`)).project.variables?.REGION === 'eu-2', sharedChange.all);
+  const sharedUnset = cli(['variables', 'unset', '--shared', 'OTHER']);
+  const sharedNow = (await api('GET', `/projects/${P.id}`)).project.variables ?? {};
+  check('--shared unset keeps the other shared variables', sharedUnset.code === 0 && !('OTHER' in sharedNow) && sharedNow.REGION === 'eu-2', JSON.stringify(Object.keys(sharedNow)));
+  const deployed = cli(['variables', 'set', 'GREETING=hi again', '--deploy']);
+  const afterDeploy = await api('GET', `/services/${app.id}`);
+  check('variables set --deploy redeploys and the change is live', deployed.code === 0 && /Deployed/.test(deployed.out) && !afterDeploy.pendingChanges.includes('variables'), deployed.all.slice(-300));
+  const live = cli(['exec', '--', 'sh', '-c', 'printf %s "$GREETING|$USES_REGION"']);
+  check('…the container sees the new values (and the shared one)', live.out.trimEnd() === 'hi again|eu-2', JSON.stringify(live.out));
+
+  // ─── backups ───
+  cli(['exec', '--', 'sh', '-c', 'echo v1 > /data/file.txt']);
+  const bk = cli(['backup']);
+  const list1 = await api('GET', `/services/${app.id}/backups`);
+  const b1 = list1[0];
+  check('`backup` takes a backup and waits for it', bk.code === 0 && /Backed up cli-parity/.test(bk.out) && b1?.status === 'succeeded' && bk.out.includes(b1.id), bk.all);
+  const bl = cli(['backup', 'list']);
+  check('`backup list` shows id, short checksum, size and test status', bl.code === 0 && bl.out.includes(b1.id) && bl.out.includes(`sha256:${b1.sha256.slice(0, 12)}`) && /\d+ (B|KB|MB)/.test(bl.out) && /untested/.test(bl.out), bl.all);
+  const bt = cli(['backup', 'test', b1.id]);
+  check('`backup test` restores into a scratch copy and reports it', bt.code === 0 && /Test restore passed/.test(bt.out) && (await api('GET', `/backups/${b1.id}`)).test?.status === 'passed', bt.all);
+  check('`backup list` shows the test result', /test passed/.test(cli(['backup', 'list']).out));
+  const nw = cli(['backup', 'create', '--no-wait']);
+  check('`backup create --no-wait` returns right away', nw.code === 0 && /background|queued/.test(nw.out), nw.all);
+  await waitFor(async () => (await api('GET', `/services/${app.id}/backups`)).every((b) => b.status !== 'running'), 120_000, 'background backup');
+  const badDest = cli(['backup', '--destination', 'nowhere']);
+  check('`backup --destination` with an unknown destination fails', badDest.code === 1 && /destination/i.test(badDest.err), badDest.all);
+
+  const dlFile = join(work, 'b1.tar.gz');
+  const dl = cli(['backup', 'download', b1.id, '-o', dlFile]);
+  check('`backup download -o` saves it and verifies the sha256', dl.code === 0 && /sha256 verified/.test(dl.out) && existsSync(dlFile) && createHash('sha256').update(readFileSync(dlFile)).digest('hex') === b1.sha256, dl.all);
+  const dlDefault = cli(['backup', 'download', b1.id], { cwd: work });
+  check('`backup download` without -o names the file after the backup (no path from the server)', dlDefault.code === 0 && existsSync(join(work, b1.key.split('/').pop())), dlDefault.all);
+  const dlAgain = cli(['backup', 'download', b1.id], { cwd: work });
+  check('…and won’t overwrite it without --force', dlAgain.code === 1 && /already exists/.test(dlAgain.err), dlAgain.all);
+
+  // Restore: refused without --yes when not interactive; then a real one.
+  cli(['exec', '--', 'sh', '-c', 'echo v2 > /data/file.txt']);
+  const noYes = cli(['restore', b1.id]);
+  check('`restore` without --yes (not a terminal) refuses and changes nothing', noYes.code === 1 && /--yes/.test(noYes.err) && cli(['exec', 'cat', '/data/file.txt']).out.trim() === 'v2', noYes.all);
+  const rs = cli(['restore', '--yes', b1.id]);
+  check('`restore --yes` follows the restore to the end', rs.code === 0 && /│ /.test(rs.out) && /Restored cli-parity/.test(rs.out), rs.all);
+  await running(P.id, 'cli-parity');
+  check('…and the data is back', (await waitFor(async () => cli(['exec', 'cat', '/data/file.txt']).out.trim() === 'v1', 60_000, 'restored data')) === true);
+  const rec1 = await api('GET', `/backups/${b1.id}`);
+  check('the restore’s outcome is on the backup record', rec1.restore?.status === 'succeeded' && !!rec1.restore.safetyBackupId && !!rec1.restoredAt, JSON.stringify(rec1.restore));
+
+  // A damaged stored file: one byte flipped (same length). Download, restore and test all fail, nothing changes.
+  const stored = join(DATA, 'backups', b1.key);
+  if (existsSync(stored)) {
+    const orig = readFileSync(stored);
+    const broken = Buffer.from(orig);
+    broken[Math.floor(broken.length / 2)] ^= 0xff;
+    writeFileSync(stored, broken);
+    try {
+      const out = join(work, 'damaged.tar.gz');
+      const dlBad = cli(['backup', 'download', b1.id, '-o', out]);
+      check('`backup download` of a damaged backup fails the checksum and leaves no file', dlBad.code === 1 && /Checksum mismatch/.test(dlBad.err) && !existsSync(out) && !readdirSync(work).some((f) => f.includes('damaged')), dlBad.all);
+      const toOut = cli(['backup', 'download', b1.id, '-o', '-']);
+      check('…also to stdout (exit 1)', toOut.code === 1 && /Checksum mismatch/.test(toOut.err), toOut.err);
+      cli(['exec', '--', 'sh', '-c', 'echo v3 > /data/file.txt']);
+      const rsBad = cli(['restore', '--yes', b1.id]);
+      check('`restore` of a damaged backup exits non-zero with the reason', rsBad.code === 1 && /Restore failed — .+nothing was changed/.test(rsBad.out), rsBad.all);
+      check('…and the data is untouched', cli(['exec', 'cat', '/data/file.txt']).out.trim() === 'v3');
+      const btBad = cli(['backup', 'test', b1.id]);
+      check('`backup test` of a damaged backup exits non-zero', btBad.code === 1 && /Test restore failed/.test(btBad.out), btBad.all);
+    } finally {
+      writeFileSync(stored, orig);
+    }
+  } else check('the stored backup file is where expected', false, stored);
+  const noSuch = cli(['restore', '--yes', 'bak_doesnotexist']);
+  check('`restore` of an unknown backup exits 1', noSuch.code === 1 && /not found/.test(noSuch.err), noSuch.all);
+
+  // ─── deployments, rollback, restart ───
+  const deps = await api('GET', `/services/${app.id}/deployments?limit=20`);
+  const active = deps.find((d) => d.status === 'active');
+  const prev = deps.find((d) => d.status === 'superseded' && d.image && d.image !== active.image);
+  const dl2 = cli(['deployments']);
+  check('`deployments` lists them', dl2.code === 0 && dl2.out.includes(active.id) && /active/.test(dl2.out), dl2.all);
+  const rb = cli(['rollback']);
+  const afterRb = await api('GET', `/services/${app.id}`);
+  const rbDep = await api('GET', `/deployments/${afterRb.activeDeploymentId}`);
+  check('`rollback` goes back to the previous live image and follows it', rb.code === 0 && rb.out.includes(prev.id) && /Deployed/.test(rb.out) && rbDep.trigger === 'rollback' && rbDep.image === prev.image, `${rb.all.slice(-300)} ${rbDep.trigger} ${rbDep.image} ${prev.image}`);
+  const rbTo = cli(['rollback', active.id.slice(0, 10), '--skip-safety-backup']);
+  const rbToDep = await api('GET', `/deployments/${(await api('GET', `/services/${app.id}`)).activeDeploymentId}`);
+  check('`rollback <id prefix> --skip-safety-backup` rolls back to that deployment', rbTo.code === 0 && /Deployed/.test(rbTo.out) && rbToDep.image === active.image, rbTo.all.slice(-300));
+  const rbBad = cli(['rollback', 'dep_nope']);
+  check('`rollback` to an unknown deployment exits 1', rbBad.code === 1 && /No deployment/.test(rbBad.err), rbBad.all);
+  const rst = cli(['restart', '--skip-safety-backup']);
+  const rstDep = await api('GET', `/deployments/${(await api('GET', `/services/${app.id}`)).activeDeploymentId}`);
+  check('`restart --skip-safety-backup` restarts and follows it', rst.code === 0 && /Restarting cli-parity/.test(rst.out) && /Deployed/.test(rst.out) && rstDep.trigger === 'restart', rst.all.slice(-300));
+
+  // ─── help ───
+  const help = cli(['help']);
+  check('`servify help` lists the new commands', help.code === 0 && ['variables', 'backup', 'restore', 'rollback', 'restart', '--skip-safety-backup', 'from-file'].every((w) => help.out.includes(w)), help.out.slice(-400));
+  const per = ['variables', 'vars', 'backup', 'restore', 'rollback', 'restart', 'deployments', 'exec'].map((c) => [c, cli(['help', c]), cli([c, '--help'])]);
+  check('per-command help for each (servify help <cmd> and <cmd> --help)', per.every(([c, a, b]) => a.code === 0 && b.code === 0 && a.out === b.out && a.out.startsWith(`servify ${c === 'vars' ? 'variables' : c}`)), per.filter(([, a, b]) => a.code || b.code).map(([c]) => c).join(', '));
+  const exHelp = cli(['exec', '--', 'sh', '-c', 'echo --help']);
+  check('`--help` after `--` belongs to the command', exHelp.code === 0 && exHelp.out.trim() === '--help', exHelp.all);
+  const unknown = cli(['backup', 'frobnicate']);
+  check('an unknown subcommand exits 1 with the usage', unknown.code === 1 && /Unknown subcommand/.test(unknown.err) && /backup list/.test(unknown.err), unknown.all);
+  await api('DELETE', `/services/${app.id}?deleteVolumes=1&skipSafetyBackup=1`).catch(() => {});
+}
+
 async function main() {
   const settings = await api('GET', '/settings');
   const secret = settings.webhooks.secret;
   if (!secret || secret.includes('•')) throw new Error('needs owner access: set SERVIFY_COOKIE or run Servify with SERVIFY_AUTH=none');
   const P = await api('POST', '/projects', { name: `features-${Date.now().toString(36)}` });
   projectsToDelete.push(P.id);
+  if (process.env.ONLY === 'restarts') return hungReplicaChecks(P);
+  if (process.env.ONLY === 'backups') return streamingBackupChecks(P);
+  if (process.env.ONLY === 'tokens') return tokenChecks(P);
+  if (process.env.ONLY === 'disk') return diskChecks();
+  if (process.env.ONLY === 'cron') return cronChecks(P);
+  if (process.env.ONLY === 'access') return accessChecks(P);
+  if (process.env.ONLY === 'cli') return cliParityChecks(P);
+  if (process.env.ONLY === 'mobileapp') return mobileAppChecks();
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ secrets at rest');
@@ -263,6 +1786,122 @@ async function main() {
     check('which restores', (await exec(rdb.id, 'psql -U postgres -tAc "select v from r"')).output.trim() === 'kept');
   }
 
+  await streamingBackupChecks(P);
+
+  // ─────────────────────────────────────────────────────────────
+  console.log('\n▸ safety backups before risky operations');
+  {
+    execSync('docker pull -q alpine:3.20 && docker pull -q busybox:1.36', { stdio: 'ignore' });
+    const keeper = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'keeper', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'keeper');
+    const kv = await api('POST', `/projects/${P.id}/volumes`, { name: 'keeper-data', serviceId: keeper.id, mountPath: '/data' });
+    await waitFor(async () => {
+      const s = await api('GET', `/services/${keeper.id}`);
+      return s.status === 'running' && (!kv.deployment || s.activeDeploymentId === kv.deployment.id);
+    }, 120_000, 'keeper with a volume');
+    await exec(keeper.id, 'echo precious > /data/file');
+    const svcNow = () => api('GET', `/services/${keeper.id}`);
+    const backups = () => api('GET', `/services/${keeper.id}/backups`);
+    const logOf = async (depId) => (await api('GET', `/deployments/${depId}/logs`)).map((l) => l.text).join('\n');
+    // Only status fields of deployments are looked at (never printed: they carry the environment).
+    const finished = (depId) => waitFor(async () => {
+      const d = await api('GET', `/deployments/${depId}`);
+      return ['active', 'failed', 'cancelled'].includes(d.status) && { id: d.id, status: d.status, error: d.error, safetyRefused: !!d.safetyRefused, safetyBackupId: d.safetyBackupId ?? null };
+    }, 240_000, 'the deployment to finish');
+    let img = 'alpine:3.20';
+    // A new image on the service's data: PATCH + deploy (update-image takes a backup of its own and would prove nothing).
+    const newImage = async (body = {}) => {
+      img = img === 'alpine:3.20' ? 'busybox:1.36' : 'alpine:3.20';
+      await api('PATCH', `/services/${keeper.id}`, { image: img });
+      return finished((await api('POST', `/services/${keeper.id}/deploy`, body)).id);
+    };
+    const dataKept = async () => (await exec(keeper.id, 'cat /data/file').catch(() => ({ output: '' }))).output?.trim() === 'precious';
+
+    let s0 = await svcNow();
+    check('without scheduled backups, new images default to no safety backup (deleting volumes still needs one)', s0.safetyPolicy?.deploy.mode === 'off' && s0.safetyPolicy?.delete.mode === 'auto', JSON.stringify(s0.safetyPolicy));
+    let d = await newImage();
+    check('…so such a deploy goes ahead as before, and its log says there was no backup', d?.status === 'active' && /No safety backup: safety backups are off/.test(await logOf(d.id)) && (await backups()).length === 0, `${d?.status} ${d?.error ?? ''}`);
+
+    await api('PATCH', `/services/${keeper.id}`, { backup: { enabled: true, schedule: '0 3 * * *' } });
+    s0 = await svcNow();
+    check('with scheduled backups on, the default is: reuse a backup up to 24 h old, else take one', s0.safetyPolicy?.deploy.mode === 'auto' && s0.safetyPolicy?.deploy.maxAgeHours === 24 && !s0.safetyPolicy?.deploy.explicit, JSON.stringify(s0.safetyPolicy?.deploy));
+    d = await newImage();
+    let bk = await backups();
+    let log = d ? await logOf(d.id) : '';
+    check('a new image on a service with data takes a safety backup first', d?.status === 'active' && bk.length === 1 && bk[0].trigger === 'safety' && bk[0].status === 'succeeded' && d.safetyBackupId === bk[0].id, `${d?.status} ${d?.error ?? ''} backups=${bk.map((b) => `${b.trigger}:${b.status}`).join(',')}`);
+    check('…and allows the longer first-start grace for the new image', /Safety backup: no successful backup .* backing it up/.test(log) && /allowing up to 600s for the first start/.test(log));
+    check('…with the data in place afterwards', await dataKept());
+    const firstSafety = bk[0]?.id;
+
+    d = await finished((await api('POST', `/services/${keeper.id}/restart`)).id);
+    log = d ? await logOf(d.id) : '';
+    check('a restart (same image) needs no safety backup', d?.status === 'active' && (await backups()).length === 1 && !/Safety backup/.test(log) && !/allowing up to/.test(log));
+
+    d = await newImage();
+    log = d ? await logOf(d.id) : '';
+    check('the next new image reuses the recent backup instead of taking another', d?.status === 'active' && (await backups()).length === 1 && /Safety backup: reusing the safety backup from/.test(log) && d.safetyBackupId === firstSafety, `${d?.status} ${d?.error ?? ''}`);
+
+    // Refused: "require" a recent backup when there is none. Nothing changes; the override goes through.
+    await api('PATCH', `/services/${keeper.id}`, { safetyBackup: { mode: 'require', maxAgeHours: 1 } });
+    for (const b of await backups()) await api('DELETE', `/backups/${b.id}`);
+    const activeBefore = (await svcNow()).activeDeploymentId;
+    d = await newImage();
+    s0 = await svcNow();
+    check('without a recent backup ("require"), the deploy is refused and nothing changes', d?.status === 'failed' && d.safetyRefused && /^no safety backup: .*require/.test(d.error ?? '') && s0.activeDeploymentId === activeBefore && s0.status === 'running' && (await dataKept()), `${d?.status} ${d?.error ?? ''}`);
+    d = await finished((await api('POST', `/services/${keeper.id}/deploy`, { skipSafetyBackup: true })).id);
+    check('…and goes through with skipSafetyBackup, without a backup', d?.status === 'active' && (await backups()).length === 0 && /No safety backup: skipped as asked/.test(await logOf(d.id)) && (await dataKept()), `${d?.status} ${d?.error ?? ''}`);
+    const acts = await api('GET', `/projects/${P.id}/activity?limit=50`);
+    check('the skip is in the activity log', acts.some((a) => a.action === 'backup.skipped' && a.serviceId === keeper.id));
+
+    // A backup that can't be stored (here: a destination folder that can't exist) refuses the deploy too.
+    const nowhere = await api('POST', '/settings/backups/destinations', { name: 'acc-nowhere', type: 'local', path: '/dev/null/servify-acc' });
+    cleanups.push(async () => api('DELETE', `/settings/backups/destinations/${nowhere.id}`).catch(() => {}));
+    await api('PATCH', `/services/${keeper.id}`, { backup: { destinationId: nowhere.id }, safetyBackup: { mode: 'auto', maxAgeHours: 0 } });
+    d = await newImage();
+    check('a safety backup that does not fit or cannot be stored refuses the deploy', d?.status === 'failed' && d.safetyRefused && /^no safety backup: (a backup of up to .* doesn't fit on|the backup failed)/.test(d.error ?? '') && (await svcNow()).status === 'running', `${d?.status} ${d?.error ?? ''}`);
+    await api('PATCH', `/services/${keeper.id}`, { backup: { destinationId: 'local', enabled: false } });
+
+    // Deleting a volume: blocked without a backup ("require"), unless skipped.
+    await api('PATCH', `/services/${keeper.id}`, { safetyBackup: { mode: 'require', maxAgeHours: 1 } });
+    const keeperVol = kv.volume.id;
+    await api('POST', `/volumes/${keeperVol}/detach`);
+    const blocked = await api('DELETE', `/volumes/${keeperVol}`).then(() => 'deleted', (e) => String(e.message));
+    check('deleting a volume with no recent backup of it is refused', /→ 409 no safety backup: no recent backup holds volume/.test(blocked) && (await api('GET', `/projects/${P.id}/volumes`)).some((v) => v.id === keeperVol), blocked);
+    const forced = await api('DELETE', `/volumes/${keeperVol}?skipSafetyBackup=1`);
+    check('…and deleted with skipSafetyBackup', forced.ok && !forced.safetyBackup && !(await api('GET', `/projects/${P.id}/volumes`)).some((v) => v.id === keeperVol));
+
+    // By default deleting a volume takes a backup of it first (an archive of just that volume, listed under its id).
+    const spare = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'spare', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'spare');
+    const sv = await api('POST', `/projects/${P.id}/volumes`, { name: 'spare-data', serviceId: spare.id, mountPath: '/data' });
+    await waitFor(async () => {
+      const s = await api('GET', `/services/${spare.id}`);
+      return s.status === 'running' && (!sv.deployment || s.activeDeploymentId === sv.deployment.id);
+    }, 120_000, 'spare with a volume');
+    await exec(spare.id, 'echo spare-data > /data/file');
+    await api('POST', `/volumes/${sv.volume.id}/detach`);
+    const del = await api('DELETE', `/volumes/${sv.volume.id}`);
+    const volBackups = await api('GET', `/services/${sv.volume.id}/backups`).catch(() => []);
+    check('deleting a volume takes a safety backup of it first', del.ok && del.safetyBackup?.status === 'taken' && volBackups.length === 1 && volBackups[0].status === 'succeeded' && volBackups[0].trigger === 'safety', JSON.stringify(del.safetyBackup ?? null));
+    if (volBackups[0]) {
+      const dl = await fetch(`${BASE}/api/backups/${volBackups[0].id}/download`, { headers: COOKIE ? { cookie: COOKIE } : {} });
+      const buf = Buffer.from(await dl.arrayBuffer());
+      check('…which downloads as an archive', dl.status === 200 && buf[0] === 0x1f && buf[1] === 0x8b);
+    }
+
+    // Deleting a service with its volumes: a backup first, by default.
+    const goner = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'goner', protocol: 'none', startCommand: 'sleep 1d' })).service;
+    await running(P.id, 'goner');
+    const gv = await api('POST', `/projects/${P.id}/volumes`, { name: 'goner-data', serviceId: goner.id, mountPath: '/data' });
+    await waitFor(async () => {
+      const s = await api('GET', `/services/${goner.id}`);
+      return s.status === 'running' && (!gv.deployment || s.activeDeploymentId === gv.deployment.id);
+    }, 120_000, 'goner with a volume');
+    await api('DELETE', `/services/${goner.id}?deleteVolumes=1`);
+    const gb = await api('GET', `/services/${goner.id}/backups`).catch(() => []);
+    check('deleting a service with its volumes backs them up first', gb.length === 1 && gb[0].trigger === 'safety' && gb[0].status === 'succeeded' && !(await api('GET', `/projects/${P.id}/volumes`)).some((v) => v.id === gv.volume.id));
+  }
+
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ persistent logs and metrics');
   const logger = (await api('POST', `/projects/${P.id}/services`, { image: 'alpine:3.20', name: 'logger', protocol: 'none', startCommand: 'i=0; while true; do i=$((i+1)); echo "line $i"; sleep 1; done' })).service;
@@ -381,6 +2020,28 @@ async function main() {
     await api('POST', `/services/${upd.id}/update-image`, { tag: '2.0' });
     const bks = await api('GET', `/services/${upd.id}/backups`);
     check('a tag switch on a service with data backs it up first', bks.length === backupsBefore + 1 && bks[0].status === 'succeeded' && (await api('GET', `/services/${upd.id}`)).source.image === `${reg}:2.0`, JSON.stringify(bks[0] ?? null).slice(0, 200));
+    // Unattended: an auto-update of a service with data never takes a backup itself. Without a recent one it waits.
+    await waitFor(async () => (await api('GET', `/services/${upd.id}`)).imageUpdate?.ref === `${reg}:2.0`, 60_000, 'recheck of 2.0');
+    await sleep(3000); // the check after that deploy may still be finishing: it must not answer for the image pushed next
+    await api('PATCH', `/services/${upd.id}`, { imageAutoUpdate: true, safetyBackup: { mode: 'auto', maxAgeHours: 1 } });
+    for (const b of await api('GET', `/services/${upd.id}/backups`)) await api('DELETE', `/backups/${b.id}`);
+    push('busybox:1.36', '2.0');
+    const updates = async () => (await api('GET', `/services/${upd.id}/deployments`)).filter((x) => x.trigger === 'update').length;
+    const skipNotes = () => received.map((r) => JSON.parse(r.body)).filter((b) => b.serviceId === upd.id && /^Auto-update of .* skipped$/.test(b.title ?? ''));
+    const u0 = await updates();
+    await api('POST', `/services/${upd.id}/image-check`);
+    await waitFor(() => skipNotes().length > 0, 10_000, 'skip notification');
+    const st2 = (await api('GET', `/services/${upd.id}`)).imageUpdate;
+    check('the new image under the same tag is found', st2?.status === 'changed', `${st2?.status} ${st2?.reason ?? ''}`);
+    await sleep(2000);
+    check('an auto-update of a service with data and no recent backup is skipped, and says so', (await updates()) === u0 && skipNotes().length === 1, `${u0} → ${await updates()} updates, ${skipNotes().length} notices`);
+    await api('POST', `/services/${upd.id}/image-check`);
+    await sleep(1500);
+    check('…told once, and still not deployed at the next check', (await updates()) === u0 && skipNotes().length === 1);
+    await api('POST', `/services/${upd.id}/backups`, {});
+    await api('POST', `/services/${upd.id}/image-check`);
+    check('once a recent backup exists, the next check updates it (reusing that backup)', !!(await waitFor(async () => (await imageOf()) === idOf('busybox:1.36'), 120_000, 'auto-update after a backup')) && (await api('GET', `/services/${upd.id}/backups`)).length === 1);
+    await api('PATCH', `/services/${upd.id}`, { imageAutoUpdate: false });
 
     // A pinned local copy (like a migrated image) can be pointed back at its registry image without a redeploy.
     push('alpine:3.20', 'track');
@@ -799,6 +2460,7 @@ async function main() {
     await api('DELETE', `/services/${svc.id}`);
     check('deleting the service removes its uploads', !existsSync(join(DATA, 'uploads', svc.id)));
   } else console.log('  – skipped (set SERVIFY_DATA_DIR)');
+  await cliParityChecks(P);
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ app sleeping');
@@ -850,6 +2512,9 @@ async function main() {
     check('and it stays up', (await api('GET', `/services/${sl.id}`)).status === 'running');
     await api('DELETE', `/services/${sl.id}`);
   } else console.log('  – skipped (run Servify with SERVIFY_SLEEP_UNIT_MS)');
+
+  await diskChecks();
+  await hungReplicaChecks(P);
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ moving a service to another project');
@@ -993,6 +2658,9 @@ services:
     const envs = await api('GET', `/projects/${P.id}/environments`);
     return !envs.some((e) => e.preview) && envs.some((e) => e.name === 'staging');
   }, 60_000, 'preview removal')));
+
+  // Last: without trust its hook check locks 127.0.0.1 out of the deploy hooks for a while.
+  await accessChecks(P);
 }
 
 /** Router access log: one record per request, no IPs, read-only tokens over REST and MCP, filters, paging, on/off. */
@@ -1152,6 +2820,521 @@ async function accessLogChecks(P, web) {
     const leaked = files.filter((f) => readFileSync(f).includes(canaryIp));
     check('no client IP in the database files', leaked.length === 0, leaked.join(', '));
   }
+}
+
+/**
+ * Router access control: IP lists (direct, X-Forwarded-For with and without trust, IPv6), the untrusted-proxy warning,
+ * basic auth (401, exempt paths, ACME, brute force), rate limits, WebSockets, HTTPS, TCP proxy ports, deploy-hook limits,
+ * MCP, exports, the local CA fingerprint (B1) and the dashboard domain (B2).
+ */
+async function accessChecks(P) {
+  console.log('\n▸ access control: setup');
+  const { X509Certificate } = await import('node:crypto');
+  const web = (await api('POST', `/projects/${P.id}/services`, { image: 'traefik/whoami', name: 'guarded' })).service;
+  await running(P.id, 'guarded');
+  const host = `guarded.${P.slug}.localhost`;
+  const fresh = await api('GET', `/services/${web.id}`);
+  check('access control is off for a new service', fresh.access === null && Array.isArray(fresh.accessWarnings) && fresh.accessWarnings.length === 0, JSON.stringify(fresh.access));
+  const caInfo = await api('GET', '/certs/local-ca');
+  const CA = caInfo.pem;
+  /** One request through the router (or anywhere): status, headers, body. */
+  const request = (o) =>
+    new Promise((resolve) => {
+      const mod = o.tls ? https : http;
+      const req = mod.request(
+        { host: '127.0.0.1', port: o.port ?? (o.tls ? HTTPS_PORT : PROXY), path: o.path ?? '/', method: o.method ?? 'GET', headers: { host: o.host ?? host, ...(o.headers ?? {}) }, agent: false, timeout: 10_000, ...(o.tls ? { ca: CA, servername: o.servername ?? o.host ?? host } : {}) },
+        (res) => {
+          let body = '';
+          res.on('data', (c) => (body += c));
+          res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+        },
+      );
+      req.on('error', (e) => resolve({ status: 0, headers: {}, body: e.message }));
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+      req.end(o.body);
+    });
+  const get = (path = '/', headers = {}, extra = {}) => request({ path, headers, ...extra });
+  const setAccess = (access) => fetch(`${BASE}/api/services/${web.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ access }) }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => ({})) }));
+  const xff = (ip) => ({ 'x-forwarded-for': ip });
+  const uniq = () => `198.51.100.${10 + Math.floor(Math.random() * 240)}`;
+  console.log(`  (instance trusts 127.0.0.1 as a proxy: ${TRUSTS_LOCAL ? 'yes' : 'no'} — pass SERVIFY_TRUSTED_PROXIES as on the instance)`);
+
+  // ─── IP lists ───
+  console.log('\n▸ access control: IP allow/deny lists');
+  await setAccess({ allow: ['203.0.113.0/24'] });
+  const direct = await get('/');
+  check('allowlist: a direct client outside it gets 403 with a small page', direct.status === 403 && direct.body.length < 4000 && /Access denied/.test(direct.body), `${direct.status}`);
+  const viaDoc = await get('/', xff('203.0.113.7'));
+  if (TRUSTS_LOCAL) check('allowlist: X-Forwarded-For from a trusted proxy names the client (inside → 200)', viaDoc.status === 200, `${viaDoc.status}`);
+  else check('allowlist: X-Forwarded-For from an untrusted peer is never believed (still 403)', viaDoc.status === 403, `${viaDoc.status}`);
+  check('allowlist: a forwarded client outside it gets 403', (await get('/', xff('198.51.100.7'))).status === 403);
+  await setAccess({ allow: ['private'] });
+  check('"private networks only": a direct local client passes', (await get('/')).status === 200);
+  const pubFwd = await get('/', xff('198.51.100.8'));
+  if (TRUSTS_LOCAL) check('"private networks only": a forwarded public client (trusted proxy) gets 403', pubFwd.status === 403, `${pubFwd.status}`);
+  else check('"private networks only": behind an untrusted proxy everyone looks private (200) — hence the warning', pubFwd.status === 200, `${pubFwd.status}`);
+  const warned = await api('GET', `/services/${web.id}`);
+  const hasWarning = (warned.accessWarnings ?? []).some((w) => w.includes('SERVIFY_TRUSTED_PROXIES') && w.includes('127.0.0.1'));
+  if (TRUSTS_LOCAL) check('no untrusted-proxy warning when 127.0.0.1 is trusted', !hasWarning, JSON.stringify(warned.accessWarnings));
+  else check('the API warns: a private peer sends X-Forwarded-For but is not in SERVIFY_TRUSTED_PROXIES', hasWarning, JSON.stringify(warned.accessWarnings));
+  await setAccess({ allow: ['private'], deny: ['127.0.0.1'] });
+  check('denylist is checked first (a denied direct client gets 403)', (await get('/')).status === 403);
+  if (TRUSTS_LOCAL) check('denylist goes by the forwarded client when trusted (192.168.1.5 passes)', (await get('/', xff('192.168.1.5'))).status === 200);
+  await setAccess({ allow: ['2001:db8:1::/48'], deny: [] });
+  if (TRUSTS_LOCAL) {
+    check('IPv6 CIDR: a forwarded 2001:db8:1::5 passes', (await get('/', xff('2001:db8:1::5'))).status === 200);
+    check('IPv6 CIDR: a forwarded 2001:db8:2::1 gets 403', (await get('/', xff('2001:db8:2::1'))).status === 403);
+  } else check('IPv6 CIDR: an IPv4 client outside it gets 403', (await get('/')).status === 403);
+  const bad = await Promise.all([{ allow: ['10.0.0.0/33'] }, { allow: ['not-an-ip'] }, { deny: ['2001:db8::/129'] }, { basicAuth: { username: 'x' } }, { basicAuth: { username: 'x', password: 'short' } }, { rateLimit: { requests: 0, perSeconds: 10 } }].map(setAccess));
+  check('bad input is refused with 400 (CIDRs parsed, passwords checked, limits bounded)', bad.every((r) => r.status === 400), bad.map((r) => `${r.status} ${r.json.error ?? ''}`).join(' | '));
+  check('nothing was changed by the refused updates', JSON.stringify((await api('GET', `/services/${web.id}`)).access.allow) === JSON.stringify(['2001:db8:1::/48']));
+
+  // ─── ACME + WebSocket + HTTPS with an allowlist ───
+  await setAccess({ allow: ['203.0.113.0/24'] });
+  const acme = await get('/.well-known/acme-challenge/acc-unknown-token');
+  check('the ACME path always passes (an app\'s own HTTP-01 challenge is not blocked)', acme.status === 200, `${acme.status}`);
+  const ws = (headers = {}) =>
+    new Promise((resolve) => {
+      const req = http.request({ host: '127.0.0.1', port: PROXY, path: '/echo', headers: { host, connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', ...headers } });
+      req.on('upgrade', (res, socket) => {
+        socket.end();
+        resolve(res.statusCode);
+      });
+      req.on('response', (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      });
+      req.on('error', () => resolve(0));
+      req.end();
+    });
+  check('WebSocket upgrade from outside the allowlist: 403', (await ws()) === 403);
+  const tlsDenied = await get('/', {}, { tls: true });
+  check('HTTPS router: outside the allowlist → 403', tlsDenied.status === 403, `${tlsDenied.status} ${tlsDenied.body.slice(0, 80)}`);
+  await setAccess({ allow: ['private'] });
+  check('WebSocket upgrade from a private address: 101', (await ws()) === 101);
+  check('HTTPS router: inside the allowlist → 200', (await get('/', {}, { tls: true })).status === 200);
+
+  // ─── TCP proxy port: IP lists at accept time ───
+  const tcpPort = (await api('PATCH', `/services/${web.id}`, { publicTcpPort: 0 })).publicTcpPort;
+  const rawTcp = () =>
+    new Promise((resolve) => {
+      let got = '';
+      const s = net.connect(tcpPort, '127.0.0.1', () => s.write(`GET / HTTP/1.0\r\nHost: x\r\n\r\n`));
+      s.on('data', (c) => (got += c));
+      s.on('close', () => resolve(got));
+      s.on('error', () => resolve(got));
+      s.setTimeout(5000, () => s.destroy());
+    });
+  await sleep(1500); // the TCP listener starts within a second
+  check('TCP proxy port: a private client connects', /^HTTP\/1\.[01] 200/.test(await rawTcp()));
+  await setAccess({ allow: ['203.0.113.0/24'] });
+  check('TCP proxy port: outside the allowlist the connection is closed at once', (await rawTcp()) === '');
+  await setAccess({ allow: [], basicAuth: { username: 'acc', password: 'tcp-check-1' } });
+  check('a TCP proxy port next to basic auth is flagged (it skips the password)', (await api('GET', `/services/${web.id}`)).accessWarnings.some((w) => w.includes('TCP proxy port')));
+  await api('PATCH', `/services/${web.id}`, { publicTcpPort: null });
+
+  // ─── basic auth ───
+  console.log('\n▸ access control: basic auth');
+  const pw = `acc-${randomBytes(9).toString('base64url')}`;
+  const basic = (u, p) => ({ authorization: `Basic ${Buffer.from(`${u}:${p}`).toString('base64')}` });
+  const set = await setAccess({ allow: [], basicAuth: { username: 'acc', password: pw, exemptPaths: ['/public'] } });
+  check('basic auth is set; the API shows a mask, never the password or its hash', set.status === 200 && set.json.access.basicAuth.password === '••••••••' && !JSON.stringify(set.json).includes(pw) && !/[0-9a-f]{32}:[0-9a-f]{64}/.test(JSON.stringify(set.json)), `${set.status}`);
+  const none = await get('/');
+  check('no credentials → 401 with WWW-Authenticate: Basic', none.status === 401 && /^Basic realm=/.test(none.headers['www-authenticate'] ?? ''), `${none.status} ${none.headers['www-authenticate']}`);
+  check('the right user name and password → 200', (await get('/', basic('acc', pw))).status === 200);
+  check('cached: the same credentials again → 200', (await get('/', basic('acc', pw))).status === 200);
+  check('the right password with another user name → 401', (await get('/', basic('eve', pw))).status === 401);
+  check('an exempt path passes without credentials', (await get('/public/health')).status === 200);
+  check('dot segments can\'t escape into a protected path (/public/../secret → 401)', (await get('/public/../secret')).status === 401 && (await get('/public/%2e%2e/secret')).status === 401 && (await get('/public%2f..%2fsecret')).status === 401);
+  check('a longer name is not the exempt path (/publicity → 401)', (await get('/publicity')).status === 401);
+  check('the ACME path passes basic auth too', (await get('/.well-known/acme-challenge/acc-token')).status === 200);
+  check('WebSocket upgrades need the password too (401 / 101)', (await ws()) === 401 && (await ws(basic('acc', pw))) === 101);
+  check('HTTPS router: 401 without, 200 with the password', (await get('/', {}, { tls: true })).status === 401 && (await get('/', basic('acc', pw), { tls: true })).status === 200);
+  const kept = await setAccess({ basicAuth: { username: 'acc', password: '••••••••' } });
+  check('sending the mask back keeps the password', kept.status === 200 && (await get('/', basic('acc', pw))).status === 200, `${kept.status}`);
+  if (DATA) {
+    await sleep(1500);
+    const files = ['servify.db', 'servify.db-wal'].map((f) => join(DATA, f)).filter(existsSync);
+    check('the password is nowhere in the database files', !files.some((f) => readFileSync(f).includes(pw)));
+  }
+  // Brute force: per client address and service. With trust a fresh forwarded address, else 127.0.0.1 itself.
+  const attacker = TRUSTS_LOCAL ? xff(uniq()) : {};
+  // Without trust the wrong user name above already counted against 127.0.0.1: stop at the first 429.
+  const tries = [];
+  let locked = null;
+  for (let i = 0; i < 12 && !locked; i++) {
+    const r = await get('/', { ...attacker, ...basic('acc', `wrong-${i}`) });
+    if (r.status === 429) locked = r;
+    else tries.push(r.status);
+  }
+  check(
+    `wrong passwords → 401 each, then 429 with Retry-After (after ${tries.length}${TRUSTS_LOCAL ? '' : ' + 1 earlier'} of 10)`,
+    tries.every((t) => t === 401) && tries.length === (TRUSTS_LOCAL ? 10 : 9) && Number(locked?.headers['retry-after']) > 0,
+    `${tries.join(',')} → ${locked?.status} ${locked?.headers['retry-after']}`,
+  );
+  check('once locked out, even the right password waits (429)', (await get('/', { ...attacker, ...basic('acc', pw) })).status === 429);
+  if (TRUSTS_LOCAL) check('another client is not locked out', (await get('/', { ...xff(uniq()), ...basic('acc', pw) })).status === 200);
+
+  // ─── rate limit ───
+  console.log('\n▸ access control: rate limit');
+  await setAccess({ basicAuth: null, rateLimit: { requests: 5, perSeconds: 60 } });
+  const who = TRUSTS_LOCAL ? xff(uniq()) : {};
+  const burst = [];
+  for (let i = 0; i < 5; i++) burst.push((await get('/', who)).status);
+  const limited = await get('/', who);
+  check('5 requests pass, the 6th gets 429 with Retry-After', burst.every((b) => b === 200) && limited.status === 429 && Number(limited.headers['retry-after']) >= 1, `${burst.join(',')} → ${limited.status} ${limited.headers['retry-after']}`);
+  const other = await get('/', xff(uniq()));
+  if (TRUSTS_LOCAL) check('another (forwarded) client has its own budget', other.status === 200, `${other.status}`);
+  else check('behind an untrusted proxy all visitors share one budget (429 for a "different" X-Forwarded-For)', other.status === 429, `${other.status}`);
+  check('rate limits apply to WebSocket upgrades too', (await ws(who)) === 429);
+  await setAccess(null);
+  check('access: null switches everything off', (await get('/')).status === 200 && (await api('GET', `/services/${web.id}`)).access === null);
+
+  // ─── MCP and exports ───
+  console.log('\n▸ access control: MCP, exports, copies');
+  const mcpCall = async (name, args) => {
+    const r = await fetch(BASE + '/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });
+    const j = await r.json().catch(() => ({}));
+    const text = j.result?.content?.[0]?.text ?? '';
+    try {
+      return { error: j.result?.isError ? text : null, data: JSON.parse(text) };
+    } catch {
+      return { error: text || JSON.stringify(j).slice(0, 200), data: null };
+    }
+  };
+  const viaMcp = await mcpCall('update_service', { service: web.id, access: { allow: ['private'], basicAuth: { username: 'mcp', password: pw } } });
+  check('MCP update_service sets access control (password masked in the answer)', !viaMcp.error && viaMcp.data?.access?.basicAuth?.password === '••••••••' && JSON.stringify(viaMcp.data.access.allow) === '["private"]' && !JSON.stringify(viaMcp.data).includes(pw), viaMcp.error ?? '');
+  const badMcp = await mcpCall('update_service', { service: web.id, access: { allow: ['300.1.1.1'] } });
+  check('MCP update_service refuses a bad address', !!badMcp.error && /not an IP/.test(badMcp.error), badMcp.error ?? '');
+  const spec = await api('GET', `/projects/${P.id}/export`);
+  const specSvc = spec.services.find((x) => x.name === 'guarded');
+  check('a spec export carries the rules but no password hash', JSON.stringify(specSvc?.access?.allow) === '["private"]' && specSvc.access.basicAuth?.username === 'mcp' && !('passwordHash' in specSvc.access.basicAuth));
+  const imp = await api('POST', '/projects/import', { spec: { ...spec, services: [specSvc] }, deploy: false, name: `acc-import-${Date.now().toString(36)}` });
+  projectsToDelete.push(imp.project.id);
+  const copy = await api('GET', `/services/${imp.services[0]}`);
+  check('an imported copy keeps the rules (basic auth locked until a password is set)', JSON.stringify(copy.access?.allow) === '["private"]' && copy.access?.basicAuth?.username === 'mcp', JSON.stringify(copy.access));
+  await setAccess(null);
+
+  // ─── deploy hooks ───
+  console.log('\n▸ access control: deploy-hook rate limit');
+  const hookFrom = TRUSTS_LOCAL ? xff(uniq()) : {};
+  // Failed hook calls from earlier sections (same client) count too: stop at the first 429.
+  const hookStatuses = [];
+  let hookLocked = null;
+  for (let i = 0; i < 25 && !hookLocked; i++) {
+    const r = await request({ path: `/_servify/hooks/deploy/${web.id}/not-the-token-${i}`, method: 'POST', host: 'anything.example', headers: hookFrom });
+    if (r.status === 429) hookLocked = r;
+    else hookStatuses.push(r.status);
+  }
+  check(
+    `bad deploy-hook calls are refused, then 429 with Retry-After (on by default; after ${hookStatuses.length})`,
+    hookStatuses.length >= 1 && (TRUSTS_LOCAL ? hookStatuses.length === 20 : hookStatuses.length <= 20) && hookStatuses.every((x) => x === 401 || x === 404) && Number(hookLocked?.headers['retry-after']) > 0,
+    `${[...new Set(hookStatuses)].join(',')} → ${hookLocked?.status}`,
+  );
+  const dashHook = await request({ port: Number(new URL(BASE).port), path: `/api/hooks/deploy/${web.id}/not-the-token`, method: 'POST', host: new URL(BASE).host, headers: hookFrom });
+  check('the dashboard port\'s /api/hooks/… shares the limit', dashHook.status === 429, `${dashHook.status}`);
+  if (TRUSTS_LOCAL) check('another client can still call hooks', [401, 404].includes((await request({ path: `/_servify/hooks/deploy/${web.id}/nope`, method: 'POST', host: 'anything.example', headers: xff(uniq()) })).status));
+
+  // ─── B1: local CA fingerprint ───
+  console.log('\n▸ local CA fingerprint');
+  const pemRes = await fetch(`${BASE}/api/certs/local-ca.pem`, { headers: COOKIE ? { cookie: COOKIE } : {} });
+  const pemFile = await pemRes.text();
+  const dir = mkdtempSync(join(tmpdir(), 'servify-ca-'));
+  writeFileSync(join(dir, 'ca.pem'), pemFile);
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const viaOpenssl = execSync(`openssl x509 -noout -fingerprint -sha256 -in ${join(dir, 'ca.pem')}`).toString().trim().split('=')[1];
+  check('GET /api/certs/local-ca: the same PEM as the download', caInfo.pem === pemFile);
+  check('fingerprint256 = X509Certificate(pem).fingerprint256 = openssl -fingerprint -sha256', caInfo.fingerprint256 === new X509Certificate(pemFile).fingerprint256 && caInfo.fingerprint256 === viaOpenssl && /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(caInfo.fingerprint256), `${caInfo.fingerprint256} / ${viaOpenssl}`);
+  // Clients without SNI (connecting by IP) get a local-CA certificate naming this machine's addresses.
+  const noSni = await new Promise((resolve) => {
+    const t = tls.connect({ host: '127.0.0.1', port: HTTPS_PORT, ca: CA, rejectUnauthorized: false }); // an IP: no SNI is sent
+    t.once('secureConnect', () => {
+      const san = t.getPeerCertificate()?.subjectaltname ?? '';
+      t.end();
+      resolve(san);
+    });
+    t.once('error', () => resolve(''));
+  });
+  const lan = Object.values(networkInterfaces()).flat().find((a) => a && !a.internal && a.family === 'IPv4')?.address;
+  check('a client without SNI gets a certificate for 127.0.0.1 and this machine\'s LAN address', noSni.includes('IP Address:127.0.0.1') && (!lan || noSni.includes(`IP Address:${lan}`)), noSni.replace(/\d+\.\d+\.\d+\.\d+/g, (ip) => (ip === '127.0.0.1' ? ip : 'x.x.x.x')));
+
+  // ─── B2: the dashboard domain ───
+  console.log('\n▸ dashboard domain');
+  const settings0 = await api('GET', '/settings');
+  const DD = `servify-acc-${randomBytes(3).toString('hex')}.home.arpa`;
+  const patchGeneral = (body) => fetch(`${BASE}/api/settings/general`, { method: 'PATCH', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => ({})) }));
+  const authNone = (await api('GET', '/auth/status')).authMode === 'none';
+  if (authNone) {
+    const r = await patchGeneral({ dashboardDomain: DD });
+    check('with SERVIFY_AUTH=none a dashboard domain is refused', r.status === 400, `${r.status}`);
+    console.log('  – skipped the dashboard-domain checks (they need sign-in on and SERVIFY_COOKIE)');
+    return;
+  }
+  cleanups.push(() => patchGeneral({ dashboardDomain: settings0.dashboardDomain ?? null, dashboardAllow: settings0.dashboardAllow }));
+  const setDd = await patchGeneral({ dashboardDomain: DD });
+  check('setting a dashboard domain: private networks only by default', setDd.status === 200 && setDd.json.dashboardDomain === DD && JSON.stringify(setDd.json.dashboardAllow) === '["private"]', `${setDd.status} ${JSON.stringify(setDd.json.dashboardAllow)}`);
+  const clash = await fetch(`${BASE}/api/services/${web.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie: COOKIE }, body: JSON.stringify({ domains: [DD] }) });
+  check('a service can\'t take the dashboard domain (409)', clash.status === 409);
+  const redirect = await request({ host: DD, path: '/api/auth/status?x=1' });
+  check('plain HTTP on the router redirects to HTTPS', redirect.status === 308 && redirect.headers.location === `https://${DD}:${HTTPS_PORT}/api/auth/status?x=1`, `${redirect.status} ${redirect.headers.location}`);
+  // As a browser sends it: Host with the port (the CSRF check compares it with Origin), SNI without.
+  const dd = (o) => request({ tls: true, host: `${DD}:${HTTPS_PORT}`, servername: DD, ...o });
+  // curl with the local CA and --resolve, as a browser on the LAN would connect.
+  const curlOut = execSync(`curl -s --max-time 10 --resolve ${DD}:${HTTPS_PORT}:127.0.0.1 --cacert ${join(dir, 'ca.pem')} -o - -w '\\n%{http_code}' https://${DD}:${HTTPS_PORT}/api/auth/status`).toString();
+  check('curl --resolve with the local CA: the dashboard API answers over HTTPS (certificate verifies)', /"app":"servify"/.test(curlOut) && curlOut.trim().endsWith('200'), curlOut.slice(-60));
+  const page = await dd({ path: '/' });
+  check('the dashboard page itself is served', page.status === 200 && /<html/i.test(page.body), `${page.status}`);
+  check('the host is allowed on the dashboard port too (SERVIFY_ALLOWED_HOSTS not needed)', (await request({ port: Number(new URL(BASE).port), host: DD, path: '/api/auth/status' })).status === 200);
+  const origin = `https://${DD}:${HTTPS_PORT}`;
+  if (process.env.SERVIFY_PASSWORD_FILE) {
+    const password = readFileSync(process.env.SERVIFY_PASSWORD_FILE, 'utf8').trim();
+    const login = await dd({ path: '/api/auth/login', method: 'POST', headers: { 'content-type': 'application/json', origin }, body: JSON.stringify({ password }) });
+    const cookie = String(login.headers['set-cookie']?.[0] ?? '').split(';')[0];
+    check('login over HTTPS with the domain\'s Origin sets a session cookie', login.status === 200 && cookie.startsWith('servify_session='), `${login.status}`);
+    check('the session works through the domain (GET /api/projects)', (await dd({ path: '/api/projects', headers: { cookie } })).status === 200);
+    check('a write with the domain\'s own Origin passes the CSRF check', (await dd({ path: '/api/settings/general', method: 'PATCH', headers: { cookie, origin, 'content-type': 'application/json' }, body: '{}' })).status === 200);
+    check('a write with a foreign Origin is refused (403)', (await dd({ path: '/api/settings/general', method: 'PATCH', headers: { cookie, origin: 'https://evil.example', 'content-type': 'application/json' }, body: '{}' })).status === 403);
+    await dd({ path: '/api/auth/logout', method: 'POST', headers: { cookie, origin } });
+  } else console.log('  – skipped the login over HTTPS (set SERVIFY_PASSWORD_FILE)');
+  const { token: ddToken } = await api('POST', '/tokens', { name: 'acc-dashboard-domain', scope: 'read' });
+  const tokId = (await api('GET', '/tokens')).find((t) => t.name === 'acc-dashboard-domain')?.id;
+  cleanups.push(() => api('DELETE', `/tokens/${tokId}`).catch(() => {}));
+  const bearer = { authorization: `Bearer ${ddToken}` };
+  check('a bearer token works through the domain (the app)', (await dd({ path: '/api/projects', headers: bearer })).status === 200);
+  const appCors = await dd({ path: '/api/projects', headers: { ...bearer, origin: 'https://localhost' } });
+  check('the app\'s WebView origin gets CORS through the domain', appCors.status === 200 && appCors.headers['access-control-allow-origin'] === 'https://localhost');
+  const mcpTools = await dd({ path: '/mcp', method: 'POST', headers: { ...bearer, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) });
+  check('MCP works through the domain', mcpTools.status === 200 && mcpTools.body.includes('update_service'), `${mcpTools.status}`);
+  const sse = await new Promise((resolve) => {
+    const req = https.get({ host: '127.0.0.1', port: HTTPS_PORT, path: '/api/events', servername: DD, ca: CA, headers: { host: `${DD}:${HTTPS_PORT}`, ...bearer, accept: 'text/event-stream' }, agent: false }, (res) => {
+      let b = '';
+      const t = setTimeout(() => (req.destroy(), resolve(`${res.statusCode} ${b}`)), 5000);
+      res.on('data', (c) => {
+        b += c;
+        if (b.includes('hello')) {
+          clearTimeout(t);
+          req.destroy();
+          resolve(`${res.statusCode} ${res.headers['content-type']} ${b}`);
+        }
+      });
+    });
+    req.on('error', (e) => resolve(`error ${e.message}`));
+  });
+  check('server-sent events stream through the domain right away', /^200 text\/event-stream/.test(sse) && sse.includes('hello'), sse.slice(0, 80));
+  const fwdPublic = await dd({ path: '/api/auth/status', headers: xff('198.51.100.9') });
+  if (TRUSTS_LOCAL) check('private-only default: a forwarded public address (trusted proxy) gets 403', fwdPublic.status === 403, `${fwdPublic.status}`);
+  else {
+    check('behind an untrusted proxy the dashboard domain refuses forwarded requests (fails closed)', fwdPublic.status === 403, `${fwdPublic.status}`);
+    check('…and Settings says why (SERVIFY_TRUSTED_PROXIES)', /SERVIFY_TRUSTED_PROXIES/.test((await api('GET', '/settings')).dashboardWarning ?? ''));
+  }
+  check('a direct private client is let in', (await dd({ path: '/api/auth/status' })).status === 200);
+  await patchGeneral({ dashboardAllow: ['203.0.113.0/24'] });
+  check('the owner can change the list (outside it → 403)', (await dd({ path: '/api/auth/status' })).status === 403);
+  const notOwner = await fetch(`${BASE}/api/settings/general`, { method: 'PATCH', headers: { ...bearer, 'content-type': 'application/json' }, body: JSON.stringify({ dashboardAllow: [] }) });
+  check('tokens can\'t change it', notOwner.status === 403);
+  const cleared = await patchGeneral({ dashboardDomain: null });
+  const gone = await request({ host: DD, path: '/api/auth/status' });
+  check('clearing the domain stops serving it (no redirect, nothing routed)', cleared.status === 200 && gone.status === 404, `${cleared.status} ${gone.status}`);
+}
+
+// ───────────────────────────── phone app mirror ─────────────────────────────
+
+async function mobileAppChecks() {
+  const { createPrivateKey, createPublicKey, sign: edSign, generateKeyPairSync } = await import('node:crypto');
+  const { ANDROID_SIGNER_SHA256 } = await import(new URL('../server/src/releasekey.ts', import.meta.url).href);
+  const keyFile = process.env.SERVIFY_MOBILE_KEY;
+  if (!keyFile) throw new Error('ONLY=mobileapp needs SERVIFY_MOBILE_KEY (a throwaway Ed25519 key, PEM) and Servify started with its public key in SERVIFY_UPDATE_KEYS');
+  const key = createPrivateKey(readFileSync(keyFile));
+  const otherKey = generateKeyPairSync('ed25519').privateKey;
+  const port = Number(process.env.SERVIFY_MOBILE_FEED_PORT ?? 17899);
+  const status = await api('GET', '/auth/status');
+  const version = status.version;
+  const tag = `v${version}`;
+  const sha = (b) => createHash('sha256').update(b).digest('hex');
+
+  // The fake feed: whatever `feed` says, answered GitHub style.
+  const feed = { release: null, files: {} };
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const rel = feed.release;
+    const json = (code, body) => {
+      res.writeHead(code, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    if (u.pathname === '/repos/test/servify/releases/latest' || u.pathname === `/repos/test/servify/releases/tags/${encodeURIComponent(tag)}`) {
+      if (!rel) return json(404, { message: 'Not Found' });
+      return json(200, { tag_name: rel.tag, html_url: '', body: '', assets: Object.keys(feed.files).map((n) => ({ name: n, browser_download_url: `http://127.0.0.1:${port}/dl/${encodeURIComponent(n)}` })) });
+    }
+    if (u.pathname.startsWith('/repos/test/servify/releases/tags/')) return json(404, { message: 'Not Found' });
+    const name = decodeURIComponent(u.pathname.replace(/^\/dl\//, ''));
+    if (u.pathname.startsWith('/dl/') && feed.files[name]) {
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': feed.files[name].length });
+      return res.end(feed.files[name]);
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r, j) => server.once('error', j).listen(port, '127.0.0.1', r));
+  cleanups.push(() => new Promise((r) => server.close(r)));
+
+  /** A release of the running version: the package, optionally an app, and a manifest signed as asked. */
+  const publish = ({ apk = null, signWith = key, unsigned = false, manifestOver = {}, serveApk = apk?.bytes, tamper = false } = {}) => {
+    const pkg = Buffer.from(`package ${version}`);
+    const files = { [`servify-v${version}.tar.gz`]: pkg };
+    const m = { format: 1, product: 'servify', version, tag, createdAt: new Date().toISOString(), assets: { [`servify-v${version}.tar.gz`]: { sha256: sha(pkg), size: pkg.length } }, ...manifestOver };
+    if (apk) {
+      const file = `servify-android-${apk.name}.apk`;
+      m.assets[file] = { sha256: sha(apk.bytes), size: apk.bytes.length };
+      m.android = { file, versionName: apk.name, versionCode: apk.code, sha256: sha(apk.bytes), size: apk.bytes.length, signerSha256: ANDROID_SIGNER_SHA256 };
+      files[file] = serveApk;
+    }
+    let bytes = Buffer.from(JSON.stringify(m, null, 2) + '\n');
+    const sig = edSign(null, bytes, signWith).toString('base64') + '\n';
+    if (tamper) bytes = Buffer.from(bytes.toString().replace('"format": 1', '"format": 1, "x": 1'));
+    if (!unsigned) {
+      files[`servify-v${version}.manifest.json`] = bytes;
+      files[`servify-v${version}.manifest.json.sig`] = Buffer.from(sig);
+    }
+    feed.release = { tag };
+    feed.files = files;
+  };
+  const fakeApk = (code, name) => ({ code, name, bytes: Buffer.concat([Buffer.from(`fake apk ${code} `), randomBytes(300_000 + code)]) });
+  const refresh = () => api('POST', '/mobile/app/check');
+  const info = () => api('GET', '/mobile/app');
+  const getApk = async (headers = {}) => {
+    const res = await fetch(`${BASE}/api/mobile/app.apk`, { headers: { cookie: COOKIE, ...headers } });
+    return { status: res.status, headers: res.headers, body: Buffer.from(await res.arrayBuffer()) };
+  };
+  const files = () => (DATA && existsSync(join(DATA, 'mobile')) ? readdirSync(join(DATA, 'mobile')).sort() : null);
+
+  console.log('\n▸ phone app: the API before anything is mirrored');
+  check('/auth/status lists the app-version-header and mobile-app features', Array.isArray(status.features) && status.features.includes('app-version-header') && status.features.includes('mobile-app'), JSON.stringify(status.features));
+  feed.release = null;
+  const none = await refresh();
+  check('no release for this version: nothing served, and it says why', none.available === false && /no release/.test(none.reason ?? ''), JSON.stringify(none));
+  const noFile = await getApk();
+  check('GET /mobile/app.apk without an app: 409 with the reason', noFile.status === 409 && /no release/.test(JSON.parse(noFile.body.toString()).error ?? ''), `${noFile.status}`);
+  const anon = await fetch(`${BASE}/api/mobile/app`);
+  const anonApk = await fetch(`${BASE}/api/mobile/app.apk`);
+  check('both need authentication', anon.status === 401 && anonApk.status === 401, `${anon.status} ${anonApk.status}`);
+
+  console.log('\n▸ phone app: fail closed');
+  publish({ apk: fakeApk(201, '0.2.1'), unsigned: true });
+  const unsigned = await refresh();
+  check('an unsigned release: no app served, the reason says so', !unsigned.available && /not signed/.test(unsigned.reason ?? ''), JSON.stringify(unsigned.reason));
+
+  console.log('\n▸ phone app: mirroring');
+  const a201 = fakeApk(201, '0.2.1');
+  publish({ apk: a201 });
+  const m201 = await refresh();
+  check('a signed release with an app: mirrored and offered', m201.available && m201.versionCode === 201 && m201.versionName === '0.2.1' && m201.sha256 === sha(a201.bytes) && m201.size === a201.bytes.length && m201.signerSha256 === ANDROID_SIGNER_SHA256 && m201.release === tag, JSON.stringify(m201));
+  check('…and the earlier block (unsigned) is lifted', !m201.reason);
+  const full = await getApk();
+  check(
+    'GET /mobile/app.apk streams exactly the signed bytes, with Content-Length and the APK content type',
+    full.status === 200 && sha(full.body) === sha(a201.bytes) && full.headers.get('content-length') === String(a201.bytes.length) && full.headers.get('content-type') === 'application/vnd.android.package-archive' && full.headers.get('accept-ranges') === 'bytes',
+    `${full.status} ${full.headers.get('content-type')}`,
+  );
+  const part = await getApk({ range: 'bytes=100-199' });
+  check('Range: bytes=100-199 → 206 with those 100 bytes', part.status === 206 && part.body.length === 100 && part.body.equals(a201.bytes.subarray(100, 200)) && part.headers.get('content-range') === `bytes 100-199/${a201.bytes.length}`, `${part.status} ${part.headers.get('content-range')}`);
+  const tail = await getApk({ range: 'bytes=-10' });
+  check('Range: the last 10 bytes', tail.status === 206 && tail.body.equals(a201.bytes.subarray(-10)), `${tail.status}`);
+  const bad = await getApk({ range: `bytes=${a201.bytes.length + 5}-` });
+  check('an unsatisfiable range → 416', bad.status === 416, `${bad.status}`);
+  if (DATA) check('stored in <data>/mobile with its signed manifest and signature', JSON.stringify(files()) === JSON.stringify(['app-201.apk', `servify-v${version}.manifest.json`, `servify-v${version}.manifest.json.sig`, 'state.json'].sort()), JSON.stringify(files()));
+
+  console.log('\n▸ phone app: who may fetch it');
+  const mkTok = async (name, scope, projects) => (await api('POST', '/tokens', { name, scope, ...(projects ? { projects } : {}) }));
+  const scratchProject = await api('POST', '/projects', { name: `mobile-${Date.now().toString(36)}` });
+  projectsToDelete.push(scratchProject.id);
+  const readTok = await mkTok('acc-mobile-read', 'read');
+  const limitedTok = await mkTok('acc-mobile-limited', 'write', [scratchProject.id]);
+  cleanups.push(async () => {
+    for (const t of [readTok, limitedTok]) await api('DELETE', `/tokens/${t.record.id}`).catch(() => {});
+  });
+  const as = (tok, path) => fetch(`${BASE}/api${path}`, { headers: { authorization: `Bearer ${tok}` } }).then((r) => r.status);
+  check('a read token may read the app info and download it', (await as(readTok.token, '/mobile/app')) === 200 && (await as(readTok.token, '/mobile/app.apk')) === 200);
+  check('a project-limited token may not (instance-wide)', (await as(limitedTok.token, '/mobile/app')) === 403 && (await as(limitedTok.token, '/mobile/app.apk')) === 403);
+  const refreshByToken = await fetch(`${BASE}/api/mobile/app/check`, { method: 'POST', headers: { authorization: `Bearer ${readTok.token}` } });
+  check('only the owner can trigger a check', refreshByToken.status === 403, `${refreshByToken.status}`);
+
+  console.log('\n▸ phone app: the version a phone reports');
+  const pre = await fetch(`${BASE}/api/mobile/app`, { method: 'OPTIONS', headers: { origin: 'http://localhost', 'access-control-request-method': 'GET', 'access-control-request-headers': 'authorization,x-servify-app' } });
+  check('CORS preflights from the app allow X-Servify-App', /x-servify-app/i.test(pre.headers.get('access-control-allow-headers') ?? ''), pre.headers.get('access-control-allow-headers') ?? '');
+  if (process.env.SERVIFY_PASSWORD_FILE) {
+    const password = readFileSync(process.env.SERVIFY_PASSWORD_FILE, 'utf8').trim();
+    const signin = await fetch(`${BASE}/api/auth/device`, { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://localhost' }, body: JSON.stringify({ password, name: 'acc-phone' }) });
+    const { token: devTok, device } = await signin.json();
+    cleanups.push(() => api('DELETE', `/devices/${device?.id}`).catch(() => {}));
+    const asPhone = (h) => fetch(`${BASE}/api/mobile/app`, { headers: { authorization: `Bearer ${devTok}`, origin: 'http://localhost', ...(h ? { 'x-servify-app': h } : {}) } });
+    const devRec = async () => (await api('GET', '/devices')).find((d) => d.id === device.id);
+    check('a signed-in phone reads GET /mobile/app', signin.status === 201 && (await asPhone()).status === 200, `${signin.status}`);
+    check('before it reports one, the device has no app version', (await devRec())?.lastAppVersion === undefined);
+    await asPhone('0.2.0/200');
+    const r1 = await devRec();
+    check('X-Servify-App: 0.2.0/200 is stored on the device (lastAppVersion)', r1?.lastAppVersion === '0.2.0' && r1?.lastAppVersionCode === 200, JSON.stringify(r1));
+    await asPhone('../etc/passwd');
+    await asPhone('0.2.0/200; drop');
+    check('a malformed header is ignored', (await devRec())?.lastAppVersion === '0.2.0');
+    await asPhone('0.2.1/201');
+    check('a newer version replaces it at once (not held back by the last-used throttle)', (await devRec())?.lastAppVersionCode === 201);
+    await fetch(`${BASE}/api/mobile/app`, { headers: { authorization: `Bearer ${readTok.token}`, 'x-servify-app': '9.9.9/90909' } });
+    check('agent tokens get no app version', !('lastAppVersion' in ((await api('GET', '/tokens')).find((t) => t.id === readTok.record.id) ?? {})));
+  } else console.log('  – skipped the phone checks (set SERVIFY_PASSWORD_FILE)');
+
+  console.log('\n▸ phone app: downloads that don\'t match');
+  const a202 = fakeApk(202, '0.2.2');
+  publish({ apk: a202, serveApk: Buffer.concat([a202.bytes.subarray(0, -1), Buffer.from([a202.bytes.at(-1) ^ 1])]) });
+  const hashBad = await refresh();
+  check('a hash mismatch: not used, the app mirrored before stays', hashBad.available && hashBad.versionCode === 201 && /not used/.test(hashBad.status) && /SHA-256/.test(hashBad.status), JSON.stringify(hashBad.status));
+  publish({ apk: a202, serveApk: Buffer.concat([a202.bytes, Buffer.from('more')]) });
+  const sizeBad = await refresh();
+  check('a download larger than the manifest says: stopped, not used', sizeBad.available && sizeBad.versionCode === 201 && /larger/.test(sizeBad.status), JSON.stringify(sizeBad.status));
+  if (DATA) check('nothing of the refused downloads is left on disk', !files().some((f) => f.includes('202') || f.includes('.tmp')), JSON.stringify(files()));
+
+  console.log('\n▸ phone app: a release without an app');
+  publish({});
+  const noApp = await refresh();
+  check('no android entry: the cached app is still served', noApp.available && noApp.versionCode === 201 && /no Android app/.test(noApp.status), JSON.stringify(noApp));
+
+  console.log('\n▸ phone app: newer apps, and keeping two');
+  const a203 = fakeApk(203, '0.2.3');
+  publish({ apk: a203 });
+  const m203 = await refresh();
+  check('a newer app replaces it', m203.available && m203.versionCode === 203, JSON.stringify(m203));
+  const again = await refresh();
+  check('the same app again: nothing downloaded, up to date', again.versionCode === 203 && /up to date/.test(again.status), again.status);
+  publish({ apk: fakeApk(202, '0.2.2') });
+  check('an older app in the manifest is not taken', (await refresh()).versionCode === 203);
+  const a204 = fakeApk(204, '0.2.4');
+  publish({ apk: a204 });
+  const m204 = await refresh();
+  check('and the next one', m204.versionCode === 204 && sha((await getApk()).body) === sha(a204.bytes));
+  if (DATA) check('only the current and the previous app are kept', JSON.stringify(files().filter((f) => f.endsWith('.apk'))) === JSON.stringify(['app-203.apk', 'app-204.apk']), JSON.stringify(files()));
+
+  console.log('\n▸ phone app: invalid manifests serve nothing');
+  publish({ apk: fakeApk(205, '0.2.5'), signWith: otherKey });
+  const badSig = await refresh();
+  check('signed by an untrusted key: no app served at all (not even the cached one)', !badSig.available && /signature invalid/.test(badSig.reason ?? '') && badSig.versionCode === null, JSON.stringify(badSig.reason));
+  check('…and the download says why', (await getApk()).status === 409);
+  publish({ apk: a204 });
+  check('a valid manifest again: served again', (await refresh()).available === true);
+  publish({ apk: fakeApk(205, '0.2.5'), tamper: true });
+  const tampered = await refresh();
+  check('a manifest changed after signing: nothing served', !tampered.available && /signature invalid/.test(tampered.reason ?? ''), JSON.stringify(tampered.reason));
+  publish({ apk: fakeApk(205, '0.2.5'), manifestOver: { version: '0.0.1', tag: 'v0.0.1' } });
+  const wrongVersion = await refresh();
+  check('a signed manifest for another version: nothing served', !wrongVersion.available && /not for this release/.test(wrongVersion.reason ?? ''), JSON.stringify(wrongVersion.reason));
+  if (DATA) {
+    const st = JSON.parse(readFileSync(join(DATA, 'mobile', 'state.json'), 'utf8'));
+    check('the block is stored (a restart doesn\'t serve the cached app in between)', typeof st.blocked === 'string' && /not for this release/.test(st.blocked), JSON.stringify(st.blocked));
+  }
+  feed.release = null;
+  const offline = await refresh();
+  check('the feed no longer knows the release: still blocked (fail closed until a manifest verifies)', !offline.available, JSON.stringify(offline));
+  publish({ apk: a204 });
+  const back = await refresh();
+  check('verified again: the cached 204 is served, nothing re-downloaded', back.available && back.versionCode === 204 && /up to date/.test(back.status), JSON.stringify(back));
 }
 
 main()

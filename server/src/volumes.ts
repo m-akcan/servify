@@ -8,6 +8,7 @@
  */
 import { volumesTable, services as servicesTable, projects as projectsTable } from './db.ts';
 import type { Service, Volume, VolumeRecord } from './types.ts';
+import type { SafetyOutcome } from './backups.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes } from './nodes.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { HttpError, id, slugify } from './util.ts';
@@ -363,6 +364,8 @@ export async function detachVolume(actor: Actor, volumeRef: string) {
   const spot = svc ? freeSpot(v.projectId, svc.x + 38, svc.y + 250, v.id) : null;
   for (const m of membersOf(v)) {
     m.serviceId = null;
+    m.lastServiceId = svc?.id ?? m.lastServiceId ?? null;
+    m.detachedAt = Date.now();
     if (spot) Object.assign(m, spot);
     save(m);
   }
@@ -430,16 +433,26 @@ async function foreignUsers(d: DockerClient, dockerName: string) {
  * Delete a volume and its data — or, with `keepData`, only forget it (the Docker volume stays, e.g. an adopted one you
  * want to hand back). Never removes containers that aren't Servify's.
  */
-export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keepData?: boolean } = {}) {
+export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keepData?: boolean; skipSafetyBackup?: boolean } = {}) {
   const v = getVolumeOrThrow(volumeRef);
   if (v.serviceId) throw new HttpError(409, `${v.name} is attached to ${servicesTable.get(v.serviceId)?.name ?? 'a service'} — detach it first`);
   const borrowers = borrowersOf(v);
   if (borrowers.length) throw new HttpError(409, `${borrowers.map((b) => b.name).join(', ')} mount${borrowers.length === 1 ? 's' : ''} ${v.name} read-only — remove that first`);
+  if (!opts.keepData) {
+    for (const m of membersOf(v)) {
+      const foreign = await foreignUsers(dockerFor(m.nodeId), m.dockerName);
+      if (foreign.length) throw new HttpError(409, `${v.name} is still used by container${foreign.length === 1 ? '' : 's'} outside Servify: ${foreign.map((c) => c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12)).join(', ')} — remove ${foreign.length === 1 ? 'it' : 'them'} first, or forget the volume and keep its data`);
+    }
+  }
+  // Last before anything is removed: a recent backup of the data, or a new one (refused if it can't be taken).
+  let safety: SafetyOutcome | null = null;
+  if (!opts.keepData) {
+    if (opts.skipSafetyBackup) recordActivity(actor, 'backup.skipped', `Deleting volume ${v.name} without a safety backup (skipped by ${actor.name})`, v.projectId);
+    else safety = await (await import('./backups.ts')).ensureVolumeSafetyBackup(v, { actor, what: `deleting volume ${v.name}` });
+  }
   for (const m of membersOf(v)) {
     if (!opts.keepData) {
       const d = dockerFor(m.nodeId);
-      const foreign = await foreignUsers(d, m.dockerName);
-      if (foreign.length) throw new HttpError(409, `${v.name} is still used by container${foreign.length === 1 ? '' : 's'} outside Servify: ${foreign.map((c) => c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12)).join(', ')} — remove ${foreign.length === 1 ? 'it' : 'them'} first, or forget the volume and keep its data`);
       const ours = await d.containersUsingVolume(m.dockerName, true);
       for (const c of ours) await d.removeContainer(c.Id, true);
       await d.removeVolume(m.dockerName);
@@ -447,7 +460,10 @@ export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keep
     volumesTable.delete(m.id);
     bus.publish({ type: 'volume.deleted', volumeId: m.id, projectId: m.projectId });
   }
-  recordActivity(actor, 'volume.deleted', opts.keepData ? `Forgot volume ${v.name} (the Docker volume ${v.dockerName} and its data stay)` : `Deleted volume ${v.name} and its data`, v.projectId);
+  const kept = safety?.backup ? ` — a safety backup from ${new Date(safety.backup.startedAt).toLocaleString()} is on ${safety.backup.destinationName}` : '';
+  recordActivity(actor, 'volume.deleted', opts.keepData ? `Forgot volume ${v.name} (the Docker volume ${v.dockerName} and its data stay)` : `Deleted volume ${v.name} and its data${kept}`, v.projectId);
+  const b = safety?.backup;
+  return { safetyBackup: b ? { id: b.id, status: safety!.status, destinationName: b.destinationName, key: b.key, sizeBytes: b.sizeBytes, startedAt: b.startedAt } : null };
 }
 
 /**
@@ -578,6 +594,8 @@ export async function releaseServiceVolumes(svc: Service, keep: boolean) {
     for (const member of membersOf(rec)) {
       if (keep) {
         member.serviceId = null;
+        member.lastServiceId = svc.id;
+        member.detachedAt = Date.now();
         Object.assign(member, spot);
         save(member);
       } else if (member.adopted || borrowersOf(rec).length) {
@@ -622,6 +640,31 @@ const sizes = new Map<string, number>();
 function withSize(v: VolumeRecord): VolumeRecord {
   const s = sizes.get(v.dockerName);
   return { ...v, sizeBytes: s !== undefined && s >= 0 ? s : v.sizeBytes };
+}
+
+/** Bytes in these Docker volumes of a server (the last poll, else asked now), or null when Docker can't tell. */
+/** The last measured total size of these Docker volumes, or null while one of them is unmeasured. No Docker call. */
+export function knownVolumeSize(dockerNames: string[]): number | null {
+  let n = 0;
+  for (const v of dockerNames) {
+    const s = sizes.get(v);
+    if (s === undefined || s < 0) return null;
+    n += s;
+  }
+  return n;
+}
+
+export async function measureVolumes(nodeId: string | null, dockerNames: string[]): Promise<number | null> {
+  const known = (n: string) => (sizes.get(n) ?? -1) >= 0;
+  if (!dockerNames.every(known)) {
+    const usage = await dockerFor(nodeId).volumeUsage().catch(() => new Map<string, number>());
+    for (const n of dockerNames) {
+      const s = usage.get(n);
+      if (s !== undefined && s >= 0) sizes.set(n, s);
+    }
+  }
+  if (!dockerNames.every(known)) return null;
+  return dockerNames.reduce((sum, n) => sum + sizes.get(n)!, 0);
 }
 
 async function pollSizes() {

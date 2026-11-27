@@ -1,6 +1,6 @@
 /** Scheduled jobs: run a service's active image as a one-off container on its cron schedule. */
 import { demuxLines } from './docker.ts';
-import { dockerFor, nodeOf, onlineNodes } from './nodes.ts';
+import { dockerFor, isOnline, nodeName, nodeOf, onlineNodes } from './nodes.ts';
 import { services as servicesTable, deployments as deploymentsTable, projects as projectsTable, runsTable } from './db.ts';
 import type { JobRun, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
@@ -9,9 +9,9 @@ import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from '.
 
 /** A run that outlives this is killed (a long-lived server image armed as a job by mistake, a hang…). */
 const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
-import { parseCron, cronDue } from './cron.ts';
-import { notify } from './notify.ts';
+import { minuteOf } from './cron.ts';
 import { mountsFor, hostMountsFor } from './volumes.ts';
+import { anyPending, dropPending, pruneSchedState, readBeat, reportOutcome, stepSchedule, writeBeat, type CatchUpInfo } from './schedstate.ts';
 
 const running = new Set<string>();
 const SCHEDULER: Actor = { type: 'system', name: 'scheduler' };
@@ -25,7 +25,47 @@ export function isJobRunning(serviceId: string) {
   return running.has(serviceId);
 }
 
-export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Actor): Promise<JobRun> {
+/** Runs kept per job (skipped ones included; several skips in a row for one reason share a record). */
+const KEEP_RUNS = 100;
+function trimRuns(serviceId: string) {
+  const old = runsTable.all(`WHERE service_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ${KEEP_RUNS}`, serviceId);
+  for (const r of old) runsTable.delete(r.id);
+}
+
+/**
+ * A scheduled start that didn't run, in the job's run history. The same reason again right after (a long run
+ * overlapping every minute) counts on the newest record instead of adding one per minute.
+ */
+export function recordSkip(svc: Service, reason: string) {
+  const now = Date.now();
+  const last = runsTable.all('WHERE service_id = ? ORDER BY created_at DESC LIMIT 1', svc.id)[0];
+  if (last?.status === 'skipped' && last.reason === reason) {
+    last.skipCount = (last.skipCount ?? 1) + 1;
+    last.finishedAt = now;
+    return save(last);
+  }
+  const run: JobRun = {
+    id: id('run'),
+    serviceId: svc.id,
+    projectId: svc.projectId,
+    status: 'skipped',
+    trigger: 'schedule',
+    actor: SCHEDULER.name,
+    startedAt: now,
+    finishedAt: now,
+    exitCode: null,
+    output: '',
+    reason,
+    skipCount: 1,
+    createdAt: now,
+  };
+  runsTable.insert(run);
+  bus.publish({ type: 'job.run', run });
+  recordActivity(SCHEDULER, 'job.skipped', `Scheduled run of ${svc.name} skipped: ${reason}`, svc.projectId, svc.id);
+  trimRuns(svc.id);
+}
+
+export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Actor, opts: { catchUp?: CatchUpInfo | null } = {}): Promise<JobRun> {
   if (running.has(svc.id)) throw new HttpError(409, `${svc.name} is already running`);
   const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
   if (!dep?.image) throw new HttpError(400, `deploy ${svc.name} before running it`);
@@ -45,9 +85,14 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     finishedAt: null,
     exitCode: null,
     output: '',
+    ...(opts.catchUp ? { catchUp: opts.catchUp } : {}),
     createdAt: Date.now(),
   };
   runsTable.insert(run);
+  if (opts.catchUp) {
+    const n = opts.catchUp.missed;
+    recordActivity(actor, 'job.catch_up', `Running ${svc.name} late, once, for ${n === 1 ? 'the run' : `${n} runs`} missed (due ${new Date(opts.catchUp.dueAt).toLocaleString()})`, svc.projectId, svc.id);
+  }
   bus.publish({ type: 'job.run', run });
   bus.publish({ type: 'service.updated', service: svc });
   let cid: string | null = null;
@@ -103,21 +148,22 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     if (latest) bus.publish({ type: 'service.updated', service: latest });
     if (cid) await docker.removeContainer(cid, true, true).catch(() => {});
   }
-  if (run.status === 'failed') {
-    recordActivity(actor, 'job.failed', `${svc.name} run failed (exit ${run.exitCode ?? '?'})`, svc.projectId, svc.id);
-    notify({
+  if (run.status === 'failed') recordActivity(actor, 'job.failed', `${svc.name} run failed (exit ${run.exitCode ?? '?'})`, svc.projectId, svc.id);
+  else if (trigger !== 'schedule') recordActivity(actor, 'job.run', `Ran ${svc.name} (exit 0)`, svc.projectId, svc.id);
+  // Notified on the first failure of a streak (then a reminder now and then), and once when it works again.
+  reportOutcome('job', svc.id, run.status === 'succeeded', {
+    subject: `Cron job ${svc.name}`,
+    project: project.name,
+    failure: {
       event: 'job.failed',
       level: 'error',
       title: `Cron job ${svc.name} failed`,
-      message: `${project.name}: exit code ${run.exitCode ?? '?'} (${trigger} run).\n\n${run.output.split('\n').slice(-10).join('\n')}`,
+      message: `${project.name}: exit code ${run.exitCode ?? '?'} (${run.catchUp ? 'catch-up' : trigger} run).\n\n${run.output.split('\n').slice(-10).join('\n')}`,
       projectId: svc.projectId,
       serviceId: svc.id,
-    });
-  }
-  else if (trigger !== 'schedule') recordActivity(actor, 'job.run', `Ran ${svc.name} (exit 0)`, svc.projectId, svc.id);
-  // Keep the run history bounded.
-  const old = runsTable.all('WHERE service_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET 100', svc.id);
-  for (const r of old) runsTable.delete(r.id);
+    },
+  });
+  trimRuns(svc.id);
   return run;
 }
 
@@ -126,22 +172,33 @@ export function listRuns(serviceId: string, limit = 30): JobRun[] {
 }
 
 let lastMinute = -1;
-/** The wall-clock minute each job last started at: when clocks go back, the repeated hour doesn't run it again. */
-const lastFired = new Map<string, string>();
+/** The minute the scheduler last looked at the clock: the previous process's heartbeat until the first tick. */
+let prevMinute: number | null = null;
 function tick() {
   const now = new Date();
   const minute = Math.floor(now.getTime() / 60_000);
-  if (minute === lastMinute) return;
+  const newMinute = minute !== lastMinute;
+  if (!newMinute && !anyPending('job')) return;
   lastMinute = minute;
   for (const svc of servicesTable.all()) {
     const schedule = deployedSchedule(svc);
-    if (!schedule || svc.stopped || running.has(svc.id)) continue;
+    if (!schedule) continue;
+    if (svc.stopped) {
+      dropPending('job', svc.id);
+      continue;
+    }
     try {
-      const due = cronDue(parseCron(schedule), now, svc.scheduleTz, lastFired.get(svc.id));
-      if (!due) continue;
-      lastFired.set(svc.id, due);
-      void runJob(svc, 'schedule', SCHEDULER).catch(() => {});
+      stepSchedule({ kind: 'job', id: svc.id, expr: schedule, tz: svc.scheduleTz, catchUp: svc.scheduleCatchUp === true }, now, prevMinute, newMinute, {
+        busy: () => (running.has(svc.id) ? 'the previous run is still going' : null),
+        blocked: () => (isOnline(nodeOf(svc)) ? null : `its server ${nodeName(nodeOf(svc))} is offline`),
+        start: (catchUp) => void runJob(svc, 'schedule', SCHEDULER, { catchUp }).catch((e) => recordSkip(svc, (e as Error).message)),
+        skip: (reason) => recordSkip(svc, reason),
+      });
     } catch {}
+  }
+  if (newMinute) {
+    prevMinute = minuteOf(now.getTime());
+    writeBeat('jobs', prevMinute);
   }
 }
 
@@ -168,5 +225,7 @@ export function startScheduler() {
     r.output = `${r.output}\ninterrupted: Servify restarted`.trim();
     runsTable.put(r);
   }
+  pruneSchedState((sid) => !!servicesTable.get(sid));
+  prevMinute = readBeat('jobs');
   setInterval(tick, 5000);
 }

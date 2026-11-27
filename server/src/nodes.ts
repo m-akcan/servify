@@ -72,6 +72,19 @@ export function isOnline(nodeId?: string | null): boolean {
   return n === LOCAL || !!conns.get(n)?.ready;
 }
 
+/**
+ * Since when the server's current connection has been up and answering (0 = this machine), or null when it is offline
+ * or its agent has gone quiet (a dead connection is only dropped after DEAD_AFTER_MS). Probes from before that moment,
+ * through a previous connection, say nothing about its replicas.
+ */
+export function onlineSince(nodeId?: string | null): number | null {
+  const n = nodeId || LOCAL;
+  if (n === LOCAL) return 0;
+  const c = conns.get(n);
+  if (!c?.ready || now() - c.lastSeen > 20_000) return null;
+  return c.connectedAt;
+}
+
 export function onlineNodes(): string[] {
   return [LOCAL, ...[...conns.values()].filter((c) => c.ready).map((c) => c.nodeId)];
 }

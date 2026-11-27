@@ -370,6 +370,18 @@
   min-width: 78px;
   justify-content: center;
 }
+.backup-row-head {
+  gap: 6px 8px;
+  flex-wrap: wrap;
+}
+.backup-row-head > span:first-child {
+  white-space: nowrap;
+}
+.backup-row .backup-row-head .badge {
+  min-width: 0;
+  flex: none;
+  white-space: nowrap;
+}
 .backup-row.failed .faint {
   color: var(--err);
 }
@@ -1415,4 +1427,86 @@
   .traffic-row-nums {
     min-width: 84px;
   }
+}
+
+/* ─── API tokens: project picker ─── */
+.token-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-top: 8px;
+  padding: 4px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+}
+.token-project {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.token-project:hover {
+  background: var(--line);
+}
+.token-project input {
+  accent-color: var(--signal);
+}
+.token-row-projects {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Low disk space protection (Shell) */
+.lowdisk-banner {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 14px;
+  background: var(--err-soft);
+  border-bottom: 1px solid color-mix(in srgb, var(--err) 35%, transparent);
+  color: var(--text);
+  font-size: var(--fs-12);
+  line-height: 1.45;
+}
+.lowdisk-banner > svg {
+  color: var(--err);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.lowdisk-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.lowdisk-banner .btn {
+  flex-shrink: 0;
+  margin: -4px 0;
+}
+
+/* Scheduled jobs: failing streak / waiting catch-up above the run history; skipped starts in it. */
+.callout-err {
+  border-color: color-mix(in srgb, var(--err) 35%, transparent);
+  background: var(--err-soft);
+}
+.callout-err > svg {
+  color: var(--err);
+}
+.sched-state {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
+.run-row.run-skipped {
+  cursor: default;
+}
+.run-row.run-skipped:hover {
+  background: none;
 }

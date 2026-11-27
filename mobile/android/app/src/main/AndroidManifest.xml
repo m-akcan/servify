@@ -26,6 +26,11 @@
 
         </activity>
 
+        <!-- PackageInstaller's answer to an app update (AppUpdatePlugin); only the app's own PendingIntent reaches it. -->
+        <receiver
+            android:name=".InstallStatusReceiver"
+            android:exported="false" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -40,4 +45,6 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Updates of this app, downloaded from the user's own Servify (AppUpdatePlugin). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 </manifest>

@@ -4,7 +4,7 @@
  */
 import { closeSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { dirname, resolve, sep } from 'node:path';
-import type { Readable } from 'node:stream';
+import { Writable, type Readable } from 'node:stream';
 
 // ─── writing ───
 
@@ -176,3 +176,69 @@ export async function extractTar(input: Readable, root: string, limits = { bytes
   }
 }
 
+
+// ─── checking ───
+
+export type TarListing = { entries: number; files: number; bytes: number };
+
+/**
+ * Walk a tar stream all the way through without writing anything: every header's checksum, every entry's data and
+ * the end-of-archive marker must be there. `listing()` then says what it holds (files: regular files and hard links;
+ * bytes: their total size, i.e. roughly the space it unpacks to).
+ */
+export function tarWalker(): Writable & { listing(): TarListing } {
+  const out: TarListing = { entries: 0, files: 0, bytes: 0 };
+  let buf: Buffer = Buffer.alloc(0);
+  let skip = 0; // data + padding of the current entry still to come
+  let ended = false; // the end-of-archive marker (a zero block) was seen
+  const w = new Writable({
+    write(chunk: Buffer, _enc, cb) {
+      try {
+        let c = chunk;
+        if (skip > 0) {
+          const take = Math.min(skip, c.length);
+          skip -= take;
+          c = c.subarray(take);
+        }
+        buf = buf.length ? Buffer.concat([buf, c]) : c;
+        while (skip === 0 && buf.length >= 512) {
+          const h = buf.subarray(0, 512);
+          buf = buf.subarray(512);
+          const zero = h.every((b) => b === 0);
+          if (ended) {
+            // Only zero padding may follow the marker (tar pads the archive to its record size).
+            if (!zero) throw new Error('damaged archive: data after the end-of-archive marker');
+            continue;
+          }
+          if (zero) {
+            ended = true;
+            continue;
+          }
+          let sum = 0;
+          for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : h[i];
+          if (octal(h.subarray(148, 156)) !== sum) throw new Error(`damaged archive: bad header checksum after ${out.entries} entries`);
+          const size = octal(h.subarray(124, 136));
+          const type = String.fromCharCode(h[156] || 48);
+          if (type !== 'x' && type !== 'g' && type !== 'L' && type !== 'K') {
+            out.entries++;
+            if (type === '0' || type === '7' || type === '1') out.files++;
+            if (type === '0' || type === '7') out.bytes += size;
+          }
+          skip = size + ((512 - (size % 512)) % 512);
+          const take = Math.min(skip, buf.length);
+          skip -= take;
+          buf = buf.subarray(take);
+        }
+        cb();
+      } catch (e) {
+        cb(e as Error);
+      }
+    },
+    final(cb) {
+      if (skip > 0) return cb(new Error(`truncated archive: the last entry is missing ${skip} bytes`));
+      if (!ended) return cb(new Error('truncated archive: no end-of-archive marker'));
+      cb();
+    },
+  });
+  return Object.assign(w, { listing: () => ({ ...out }) });
+}

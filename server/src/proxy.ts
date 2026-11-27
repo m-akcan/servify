@@ -9,7 +9,7 @@ import { touch, wake } from './sleep.ts';
 import https from 'node:https';
 import net from 'node:net';
 import dgram from 'node:dgram';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { config } from './config.ts';
 import { services as servicesTable, projects as projectsTable } from './db.ts';
 import { upstreamsFor, noteConn, anyReplicaStarting } from './engine.ts';
@@ -20,6 +20,7 @@ import { publicDomain } from './vars.ts';
 import { challengeResponse, hasPublicCert, sniCallback, defaultContextOptions } from './certs.ts';
 import { getSettings } from './settings.ts';
 import { recordAccess } from './accesslog.ts';
+import { compiledFor, cachedAccess, httpGate, ipGate, hookGate, hookFailed, compileRules, matches, normalizeIp, isPrivateIp, noteUntrustedProxy, parseRule, type Denial, type IpMatcher, type CompiledAccess } from './access.ts';
 
 type Upstream = ReturnType<typeof upstreamsFor>[number];
 
@@ -120,22 +121,23 @@ const agent = new http.Agent({ keepAlive: true, maxSockets: 256, keepAliveMsecs:
 const HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'proxy-authorization', 'proxy-authenticate']);
 
 const ipv4 = (ip: string) => ip.replace(/^::ffff:/, '');
-const ipToInt = (ip: string) => ip.split('.').reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
+/** SERVIFY_TRUSTED_PROXIES, compiled once (IPs or CIDRs, IPv4 or IPv6); entries that aren't addresses are skipped. */
+const trusted: IpMatcher | null = (() => {
+  const rules: string[] = [];
+  for (const t of config.trustedProxies) {
+    try {
+      rules.push(parseRule(t));
+    } catch {
+      console.warn(`[proxy] SERVIFY_TRUSTED_PROXIES: ignoring ${t} (not an IP address or CIDR)`);
+    }
+  }
+  if (rules.includes('private')) console.warn('[proxy] SERVIFY_TRUSTED_PROXIES: "private" is not accepted here — list the proxy addresses or their networks');
+  return compileRules(rules.filter((r) => r !== 'private'));
+})();
 /** Is the direct peer one of SERVIFY_TRUSTED_PROXIES (e.g. Nginx Proxy Manager in front of Servify)? */
 export function fromTrustedProxy(remote: string | undefined): boolean {
-  if (!remote || !config.trustedProxies.length) return false;
-  const ip = ipv4(remote);
-  for (const t of config.trustedProxies) {
-    if (!t.includes('/')) {
-      if (ipv4(t) === ip) return true;
-      continue;
-    }
-    const [base, bits] = t.split('/');
-    if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip) || !/^\d+\.\d+\.\d+\.\d+$/.test(base)) continue;
-    const mask = Number(bits) === 0 ? 0 : (~0 << (32 - Number(bits))) >>> 0;
-    if ((ipToInt(ip) & mask) === (ipToInt(base) & mask)) return true;
-  }
-  return false;
+  if (!remote || !trusted) return false;
+  return matches(trusted, remote);
 }
 
 /** The scheme the visitor used: ours, or what a trusted proxy in front says (it terminated HTTPS). */
@@ -205,7 +207,7 @@ function sendHtml(res: http.ServerResponse, status: number, headers: http.Outgoi
 
 function forwardHeaders(req: http.IncomingMessage, svc: Service, proto: 'http' | 'https' = 'http') {
   const h: http.OutgoingHttpHeaders = {};
-  for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k)) h[k] = v;
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k) && k !== INTERNAL_HEADER) h[k] = v;
   const ip = req.socket.remoteAddress ?? '';
   h['x-forwarded-for'] = req.headers['x-forwarded-for'] ? `${req.headers['x-forwarded-for']}, ${ip}` : ip;
   h['x-forwarded-host'] = req.headers.host ?? '';
@@ -241,6 +243,160 @@ function escapeHtml(s: string) {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 }
 
+// ───────────────────────────── access control (access.ts) ─────────────────────────────
+
+/** Servify's own requests through the router (load tests): a per-process key, honoured from loopback only. */
+const INTERNAL_HEADER = 'x-servify-internal';
+const INTERNAL_KEY = randomBytes(18).toString('base64url');
+export const internalHeaders = () => ({ [INTERNAL_HEADER]: INTERNAL_KEY });
+function internalRequest(req: http.IncomingMessage): boolean {
+  if (req.headers[INTERNAL_HEADER] !== INTERNAL_KEY) return false;
+  const peer = normalizeIp(req.socket.remoteAddress);
+  return peer === '127.0.0.1' || peer === '::1';
+}
+
+/** A private peer that isn't a trusted proxy sent X-Forwarded-For: a proxy Servify doesn't believe is in front. */
+function untrustedForwarder(req: http.IncomingMessage): string | null {
+  if (!req.headers['x-forwarded-for']) return null;
+  const peer = normalizeIp(req.socket.remoteAddress);
+  return peer && isPrivateIp(peer) && !fromTrustedProxy(peer) ? peer : null;
+}
+
+const GATED = Symbol('servify.gated');
+
+/**
+ * A service's access rules for one HTTP request or WebSocket handshake: null to go ahead, a denial, or a promise of
+ * one (basic auth is checked off the main thread). Runs once per request, also when handle() runs again after a wake.
+ */
+function guard(req: http.IncomingMessage, svc: Service): Denial | null | Promise<Denial | null> {
+  if ((req as any)[GATED]) return null;
+  (req as any)[GATED] = true;
+  const c = compiledFor(svc);
+  if (!c || internalRequest(req)) return null;
+  const url = req.url ?? '/';
+  // ACME HTTP-01 must always pass (Servify's own tokens were answered already; these are the app's).
+  if (url.startsWith('/.well-known/acme-challenge/')) return null;
+  noticeProxy(svc, c, req);
+  return httpGate(svc.id, c, clientIpOf(req), requestPath(url), one(req.headers.authorization) || undefined);
+}
+
+/** The path as the app will see it (dot segments resolved), for basic-auth exemptions; encoded slashes never match. */
+function requestPath(url: string): string {
+  if (/%2f|%5c|\\/i.test(url)) return '\0';
+  try {
+    return new URL(url, 'http://x').pathname;
+  } catch {
+    return '\0';
+  }
+}
+
+function noticeProxy(svc: Service, c: CompiledAccess, req: http.IncomingMessage) {
+  if (!c.byAddress) return;
+  const peer = untrustedForwarder(req);
+  if (peer && noteUntrustedProxy(svc.id, peer)) {
+    console.warn(`[proxy] ${svc.name}: a proxy at ${peer} sends X-Forwarded-For but isn't in SERVIFY_TRUSTED_PROXIES — address rules see every visitor as ${peer}`);
+    const fresh = servicesTable.get(svc.id);
+    if (fresh) bus.publish({ type: 'service.updated', service: fresh });
+  }
+}
+
+function deny(req: http.IncomingMessage, res: http.ServerResponse, d: Denial) {
+  req.resume(); // drain the body so the connection can be reused
+  sendHtml(res, d.status, { 'content-type': 'text/html; charset=utf-8', ...d.headers }, page(d.status, escapeHtml(d.title), escapeHtml(d.message)));
+}
+
+const REASONS: Record<number, string> = { 401: 'Unauthorized', 403: 'Forbidden', 429: 'Too Many Requests' };
+function denyRaw(socket: net.Socket, d: Denial) {
+  const body = `${d.title}: ${d.message}\n`;
+  let head = `HTTP/1.1 ${d.status} ${REASONS[d.status] ?? 'Error'}\r\n`;
+  for (const [k, v] of Object.entries(d.headers)) head += `${k}: ${v}\r\n`;
+  socket.end(`${head}Content-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+}
+
+/** Rules of a TCP/UDP service by id, for connections and datagrams (only the IP lists apply there). */
+function tcpDenied(sid: string, address: string | undefined): boolean {
+  let c = cachedAccess(sid);
+  if (c === undefined) {
+    const svc = servicesTable.get(sid);
+    c = svc ? compiledFor(svc) : null;
+  }
+  return !!c && !!ipGate(c, address ?? null);
+}
+
+// ───────────────────────────── the dashboard on its own domain ─────────────────────────────
+
+let dash: { domain: string | null; allow: IpMatcher | null } | null = null;
+bus.subscribe((ev) => {
+  if (ev.type === 'settings.updated') dash = null;
+});
+function dashboardSite() {
+  if (!dash) {
+    const s = getSettings();
+    let allow: IpMatcher | null = null;
+    try {
+      allow = compileRules(s.dashboardAllow);
+    } catch {
+      allow = new net.BlockList(); // unreadable rules: nobody
+    }
+    // Never without sign-in: a domain stored earlier is not served while SERVIFY_AUTH=none.
+    dash = { domain: config.authMode === 'none' ? null : s.dashboardDomain || null, allow };
+  }
+  return dash;
+}
+const dashboardTarget = () => (config.host === '0.0.0.0' || config.host === '::' || !config.host ? '127.0.0.1' : config.host);
+
+/**
+ * Settings → HTTPS → Dashboard domain: the router serves the dashboard, /api and /mcp for that host over HTTPS (plain
+ * HTTP is redirected), behind its own address allowlist (private networks by default). Requests go to the dashboard
+ * port unchanged — Host included, so the dashboard's host, origin and cookie checks see what the browser sent.
+ */
+function handleDashboard(req: http.IncomingMessage, res: http.ServerResponse, proto: 'http' | 'https', host: string) {
+  if (visitorProto(req, proto) === 'http') {
+    const port = config.httpsPort === 443 ? '' : `:${config.httpsPort}`;
+    res.writeHead(308, { location: `https://${host}${port}${req.url ?? '/'}`, 'content-length': '0' });
+    return res.end();
+  }
+  const d = dashboardDenied(req);
+  if (d) return deny(req, res, d);
+  const headers: http.OutgoingHttpHeaders = {};
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k) && k !== INTERNAL_HEADER) headers[k] = v;
+  const peer = req.socket.remoteAddress ?? '';
+  headers['x-forwarded-for'] = req.headers['x-forwarded-for'] ? `${req.headers['x-forwarded-for']}, ${peer}` : peer;
+  headers['x-forwarded-proto'] = visitorProto(req, proto);
+  let finished = false;
+  const preq = http.request({ host: dashboardTarget(), port: config.port, method: req.method, path: req.url, headers }, (pres) => {
+    const out = { ...pres.headers };
+    for (const k of Object.keys(out)) if (HOP.has(k)) delete out[k];
+    res.writeHead(pres.statusCode ?? 502, out);
+    res.flushHeaders(); // event streams (SSE, MCP) start right away
+    pres.pipe(res);
+    pres.on('end', () => (finished = true));
+  });
+  res.once('close', () => {
+    if (!finished && !preq.destroyed) preq.destroy();
+  });
+  preq.on('error', (err: NodeJS.ErrnoException) => {
+    if (res.destroyed || res.writableEnded) return;
+    if (!res.headersSent) sendHtml(res, 502, { 'content-type': 'text/html; charset=utf-8' }, page(502, 'Bad gateway', `The Servify dashboard did not respond (${escapeHtml(err.code ?? err.message)}).`));
+    else res.destroy();
+  });
+  req.pipe(preq);
+}
+
+function dashboardDenied(req: http.IncomingMessage): Denial | null {
+  const { allow } = dashboardSite();
+  if (!allow) return null;
+  // Behind a proxy Servify doesn't trust every visitor would look like that (private) proxy and pass a private-only
+  // list: refuse instead, and say why in the dashboard (Settings → HTTPS).
+  const peer = untrustedForwarder(req);
+  if (peer) {
+    if (noteUntrustedProxy('dashboard', peer)) console.warn(`[proxy] dashboard domain: a proxy at ${peer} sends X-Forwarded-For but isn't in SERVIFY_TRUSTED_PROXIES — refusing (set SERVIFY_TRUSTED_PROXIES)`);
+    return { status: 403, title: 'Access denied', message: "Servify can't tell where this request comes from: the proxy in front of it isn't in SERVIFY_TRUSTED_PROXIES.", headers: { 'cache-control': 'no-store' } };
+  }
+  if (!matches(allow, clientIpOf(req))) return { status: 403, title: 'Access denied', message: 'The Servify dashboard is not available from your network.', headers: { 'cache-control': 'no-store' } };
+  return null;
+}
+
 /** `/_servify/hooks/…` on any host: git webhooks and deploy hooks (signature-authenticated). */
 function handleHook(req: http.IncomingMessage, res: http.ServerResponse) {
   const reply = (status: number, body: unknown) => {
@@ -248,6 +404,13 @@ function handleHook(req: http.IncomingMessage, res: http.ServerResponse) {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));
   };
+  const ip = clientIpOf(req);
+  const limited = hookGate(ip);
+  if (limited) {
+    req.resume();
+    res.writeHead(429, { 'content-type': 'application/json', ...limited.headers });
+    return res.end(JSON.stringify({ error: limited.message }));
+  }
   if (req.method !== 'POST') return reply(405, { error: 'POST only' });
   const chunks: Buffer[] = [];
   let size = 0;
@@ -269,6 +432,7 @@ function handleHook(req: http.IncomingMessage, res: http.ServerResponse) {
       const path = (req.url ?? '').split('?')[0];
       const m = path.match(/^\/_servify\/hooks\/deploy\/([^/]+)\/([^/]+)$/);
       const r = m ? hooks.handleDeployHook(m[1], m[2]) : path === '/_servify/hooks/git' ? await hooks.handleGitWebhook(req.headers, Buffer.concat(chunks)) : { status: 404, body: { error: 'unknown hook' } };
+      if (r.status === 401 || r.status === 403 || r.status === 404) hookFailed(ip);
       reply(r.status, r.body);
     } catch (e) {
       reply(500, { error: (e as Error).message });
@@ -291,6 +455,8 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
     }
     // Unknown token: it may be the app's own (e.g. its own ACME client) — route it, just never redirect it.
   }
+  const dd = dashboardSite().domain;
+  if (dd && !isChallenge && hostOnly(req.headers.host) === dd) return handleDashboard(req, res, proto, dd);
   // Hosts with a trusted certificate are served over HTTPS only.
   if (visitorProto(req, proto) === 'http' && !isChallenge && getSettings().https.enabled && getSettings().https.redirectHttp && hasPublicCert(hostOnly(req.headers.host))) {
     const port = config.httpsPort === 443 ? '' : `:${config.httpsPort}`;
@@ -301,6 +467,16 @@ function handle(req: http.IncomingMessage, res: http.ServerResponse, proto: 'htt
   const clientIp = req.socket.remoteAddress ?? '';
   if (!svc) return unavailable(res, null, req.headers.host ?? '');
   const access = trackAccess(req, res, svc);
+  // Access rules come before anything else the service does: a refused visitor never wakes it or follows a redirect.
+  const gate = guard(req, svc);
+  if (gate) {
+    if (gate instanceof Promise) {
+      req.pause();
+      void gate.then((d) => (d ? deny(req, res, d) : handle(req, res, proto)));
+      return;
+    }
+    return deny(req, res, gate);
+  }
   if (svc.source.type === 'redirect') {
     count(svc.id, null, 0, false);
     res.writeHead(svc.source.code, { location: redirectLocation(svc, req.url), 'content-length': '0' });
@@ -428,9 +604,24 @@ function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buff
   // Node hands over upgraded sockets without an error listener: a client that resets the connection while we
   // answer (redirect, 503, a service waking up) would otherwise crash the whole process.
   if (!socket.listenerCount('error')) socket.on('error', () => socket.destroy());
+  const dd = dashboardSite().domain;
+  if (dd && hostOnly(req.headers.host) === dd) return socket.destroy(); // the dashboard has no WebSockets
   const svc = lookup(req.headers.host);
   if (!svc) return socket.destroy();
   const access = trackUpgrade(req, socket, svc);
+  const gate = guard(req, svc);
+  if (gate) {
+    const refuse = (d: Denial) => {
+      access?.done(d.status);
+      denyRaw(socket, d);
+    };
+    if (gate instanceof Promise) {
+      socket.pause();
+      void gate.then((d) => (d ? refuse(d) : handleUpgrade(req, socket, head, proto)));
+      return;
+    }
+    return refuse(gate);
+  }
   if (svc.source.type === 'redirect') {
     access?.done(svc.source.code);
     socket.end(`HTTP/1.1 ${svc.source.code} Redirect\r\nLocation: ${redirectLocation(svc, req.url)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
@@ -511,6 +702,9 @@ function syncTcp() {
     const server = net.createServer((client) => {
       const svc = servicesTable.get(sid);
       if (!svc) return client.destroy();
+      // IP allow/deny at accept time (basic auth and rate limits are HTTP-only).
+      const c = compiledFor(svc);
+      if (c && ipGate(c, client.remoteAddress ?? null)) return client.destroy();
       const up = pickUpstream({ ...svc, strategy: svc.strategy === 'ip-hash' ? 'ip-hash' : 'least-conn' }, client.remoteAddress ?? '');
       if (!up) return client.destroy();
       noteConn(up.containerId, 1);
@@ -570,6 +764,7 @@ function syncUdp() {
       const key = `${rinfo.address}:${rinfo.port}`;
       let c = r.clients.get(key);
       if (!c) {
+        if (tcpDenied(sid, rinfo.address)) return; // the route's IP lists apply to UDP clients too
         const up = dgram.createSocket(w.host.includes(':') ? 'udp6' : 'udp4');
         up.on('message', (reply) => {
           const cc = r.clients.get(key);

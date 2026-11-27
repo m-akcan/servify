@@ -1,4 +1,5 @@
 import { secure } from './secure.ts';
+import { trust } from './trust.ts';
 
 /** A Servify the app has signed in to. The token itself lives in the secure store, not here. */
 export type SavedServer = {
@@ -51,8 +52,11 @@ export const servers = {
   },
   async remove(id: string) {
     await secure.remove(`token:${id}`);
+    const gone = servers.list().find((s) => s.id === id);
     const rest = servers.list().filter((s) => s.id !== id);
     write(LIST_KEY, rest);
+    // Its pinned certificate goes with it, unless another saved server uses the same address.
+    if (gone && !rest.some((s) => new URL(s.url).origin === new URL(gone.url).origin)) await trust.unpin(gone.url).catch(() => {});
     if (servers.activeId() === id) servers.setActive(rest[0]?.id ?? null);
   },
   /** Signed out by the server (or by something in front of it): the saved server stays, only its token goes. */

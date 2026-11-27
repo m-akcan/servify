@@ -8,10 +8,11 @@ import { latestCommit } from './builder.ts';
 import { isDeploying } from './deployer.ts';
 import { dockerFor, nodeOf, isOnline } from './nodes.ts';
 import { db } from './db.ts';
-import { copyFileSync, existsSync, readdirSync, statSync, truncateSync, unlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, readdirSync, rmSync, statSync, truncateSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.ts';
 import { backfillDatabaseKinds } from './backups.ts';
+import { diskBlock } from './diskguard.ts';
 
 const AUTOSCALER: Actor = { type: 'system', name: 'autoscaler' };
 const GIT: Actor = { type: 'system', name: 'git-watcher' };
@@ -57,6 +58,8 @@ const checkedHeads = new Map<string, string>();
 async function gitWatch() {
   for (const svc of servicesTable.all()) {
     if (!svc.autoDeploy || svc.source.type !== 'git' || svc.stopped || isDeploying(svc.id)) continue;
+    // Low disk space: no build now (it would fail, and fail again every minute); the new commit deploys once there is room.
+    if (diskBlock('build', svc.nodeId)) continue;
     const deps = deploymentsTable.all('WHERE service_id = ? ORDER BY created_at DESC LIMIT 5', svc.id);
     const latestDep = deps[0];
     if (!latestDep || ['queued', 'building', 'deploying'].includes(latestDep.status)) continue;
@@ -79,7 +82,9 @@ async function gitWatch() {
   }
 }
 
-async function imageGc() {
+/** Returns how many images it removed. */
+export async function imageGc(): Promise<number> {
+  let removed = 0;
   // Keep the built images of the 5 most recent deployments that went live, for instant rollbacks. Failed builds don't
   // count towards the five (a run of failures would push every working image out); the newest failed one stays
   // for a look, and so does anything still in flight.
@@ -95,9 +100,13 @@ async function imageGc() {
     for (const d of deps) {
       if (!d.image || keep.has(d.image) || gone.has(d.image)) continue;
       gone.add(d.image);
-      await dockerFor(nodeOf(svc)).removeImage(d.image);
+      const docker = dockerFor(nodeOf(svc));
+      if (!(await docker.inspectImage(d.image).catch(() => null))) continue; // removed earlier
+      await docker.removeImage(d.image);
+      if (!(await docker.inspectImage(d.image).catch(() => true))) removed++;
     }
   }
+  return removed;
 }
 
 function housekeeping() {
@@ -132,6 +141,32 @@ function rotateOwnLog() {
   } catch (e) {
     console.error('[logs] could not rotate servify.log:', (e as Error).message);
   }
+}
+
+/**
+ * Build checkouts of deployments that are no longer building (a crash or restart mid-build leaves them behind; a
+ * finished build removes its own). Returns the bytes freed.
+ */
+export function removeStaleBuildDirs(): number {
+  let freed = 0;
+  const live = new Set(deploymentsTable.all(`WHERE json_extract(data, '$.status') IN ('queued', 'building')`).map((d) => d.id));
+  for (const f of readdirSync(config.buildsDir)) {
+    if (!/^dep_[a-z0-9]+$/.test(f) || live.has(f)) continue;
+    const p = join(config.buildsDir, f);
+    try {
+      freed += du(p);
+      rmSync(p, { recursive: true, force: true });
+    } catch {}
+  }
+  return freed;
+}
+
+function du(p: string): number {
+  const st = lstatSync(p);
+  if (!st.isDirectory()) return st.size;
+  let n = 0;
+  for (const f of readdirSync(p)) n += du(join(p, f));
+  return n;
 }
 
 /** Timer bodies write to the database: a failure there (a full disk) is logged, never thrown out of the timer. */

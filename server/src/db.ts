@@ -124,9 +124,19 @@ export type TokenRecord = {
   id: string;
   name: string;
   prefix: string;
-  scope: 'read' | 'write';
+  /** read < deploy < write. Tokens from before 0.3.0 are read or write. */
+  scope: 'read' | 'deploy' | 'write';
+  /**
+   * Agent tokens limited to some projects: their ids (base projects; environments and previews come with them).
+   * Missing — every token from before 0.3.0, and new ones for all projects — means all projects. A list whose projects
+   * were all deleted reaches nothing.
+   */
+  projects?: string[];
   /** 'device': a phone signed in with the owner password (acts as the owner). Missing on older tokens = 'agent'. */
   kind?: 'agent' | 'device';
+  /** Device tokens: the app version the phone last reported (X-Servify-App), e.g. "0.2.0" and 200. */
+  lastAppVersion?: string;
+  lastAppVersionCode?: number;
   createdAt: number;
   lastUsedAt: number | null;
 };

@@ -7,7 +7,8 @@ import { Tooltip, openMenuAt, Kbd } from '../components/ui.tsx';
 import { openPalette } from '../components/CommandPalette.tsx';
 import { getThemePref, setThemePref } from '../lib/theme.ts';
 import { api } from '../lib/api.ts';
-import { checkAuth } from '../lib/store.ts';
+import { checkAuth, onServerEvent } from '../lib/store.ts';
+import type { DiskState } from '../../../server/src/types.ts';
 import { useEffect, useState } from 'react';
 import { EnvironmentCrumb } from '../components/Environments.tsx';
 
@@ -34,6 +35,54 @@ function ReconnectBanner({ connected }: { connected: boolean }) {
     <div className="reconnect glass rise-in">
       <span className="spinner" style={{ width: 12, height: 12 }} />
       Reconnecting to Servify…
+    </div>
+  );
+}
+
+const GB = 1024 ** 3;
+const size = (n: number | null) => (n == null ? '?' : n >= 100 * GB ? `${Math.round(n / GB)} GB` : n >= GB ? `${(n / GB).toFixed(1)} GB` : `${Math.round(n / 1024 ** 2)} MB`);
+
+/** Low disk space protection: shown on every page while a disk is protected (what is paused, which disk, what to do). */
+function LowDiskBanner({ connected }: { connected: boolean }) {
+  const [disk, setDisk] = useState<DiskState | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!connected) return;
+    let gone = false;
+    void api
+      .get<{ disk?: DiskState }>('/system')
+      .then((s) => !gone && setDisk(s.disk ?? null))
+      .catch(() => {});
+    const off = onServerEvent((ev) => {
+      if (ev.type === 'disk.updated') setDisk(ev.disk);
+    });
+    return () => {
+      gone = true;
+      off();
+    };
+  }, [connected]);
+  if (!disk || disk.level !== 'protect') return null;
+  const low = disk.disks.filter((d) => d.level === 'protect');
+  return (
+    <div className="lowdisk-banner" role="alert">
+      <Icon name="alert" size={15} />
+      <div className="lowdisk-text">
+        <strong>Low disk space — protecting {low.map((d) => (d.nodeId ? d.name : `the ${d.name}`)).join(' and ')}.</strong>{' '}
+        {low.map((d) => `${size(d.freeBytes)} free of ${size(d.totalBytes)}${d.path ? ` (${d.path})` : ''}, protection below ${size(d.protectBytes)}`).join('; ')}.{' '}
+        {open ? (
+          <>
+            {disk.paused.length > 0 && <>Paused: {disk.paused.join('; ')}. </>}
+            {disk.refused.length > 0 && <>Refused: {disk.refused.join('; ')}. </>}
+            {disk.howToFree}
+            {disk.lastCleanup && disk.lastCleanup.steps.length > 0 && <> Automatic clean-up: {disk.lastCleanup.steps.join('; ')}.</>}
+          </>
+        ) : (
+          <>{disk.refused.length > 0 && <>Refused: {disk.refused.join('; ')}. </>}</>
+        )}
+      </div>
+      <button className="btn btn-ghost btn-sm" onClick={() => setOpen(!open)}>
+        {open ? 'Less' : 'What to do'}
+      </button>
     </div>
   );
 }
@@ -143,6 +192,7 @@ export function Shell({ children }: { children: ReactNode }) {
           )}
         </div>
       </header>
+      <LowDiskBanner connected={connected} />
       <main className="main">
         {children}
         <ReconnectBanner connected={connected} />

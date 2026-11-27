@@ -5,6 +5,7 @@ import { latestMetrics } from './metrics.ts';
 import { listCertificates } from './certs.ts';
 import { localInfo, servifyProcessStats } from './hoststats.ts';
 import { replicasOf } from './engine.ts';
+import { diskState } from './diskguard.ts';
 import type { Overview } from './types.ts';
 
 const DAY = 86_400_000;
@@ -62,6 +63,7 @@ export async function overview(): Promise<Overview> {
   const proc = servifyProcessStats();
   return {
     servers,
+    disk: diskState(),
     servify: {
       version: proc.version,
       uptimeSec: proc.uptimeSec,

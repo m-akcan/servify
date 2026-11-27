@@ -11,6 +11,7 @@ import { services as servicesTable } from './db.ts';
 import { bus, recordActivity } from './events.ts';
 import { queueDeployment } from './deployer.ts';
 import { extractTar } from './tar.ts';
+import { assertDisk } from './diskguard.ts';
 import { HttpError, id } from './util.ts';
 import type { Service, SourceUpload } from './types.ts';
 import type { Actor } from './events.ts';
@@ -22,6 +23,8 @@ export const uploadPath = (serviceId: string, uploadId: string) => join(uploadsR
 export async function receiveUpload(actor: Actor, svc: Service, body: Readable, meta: { label?: string | null; commitSha?: string | null; commitMessage?: string | null; deploy?: boolean }) {
   if (svc.source.type === 'external' || svc.source.type === 'redirect') throw new HttpError(400, `${svc.name} is a route, not something to build`);
   if (svc.cluster) throw new HttpError(400, 'clusters run their database image');
+  // Low disk space: an upload lands on the data disk and is then built.
+  assertDisk(meta.deploy === false ? 'upload' : 'build', svc.nodeId);
   const uploadId = id('upl');
   const dir = uploadPath(svc.id, uploadId);
   let stats;

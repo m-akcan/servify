@@ -4,7 +4,8 @@
  */
 import { z } from 'zod';
 import { join } from 'node:path';
-import { kv } from './db.ts';
+import { kv, services as servicesTable, projects as projectsTable } from './db.ts';
+import { parseRules, PRIVATE, untrustedProxy, untrustedProxyMessage } from './access.ts';
 import { sealJson, openJson, isSealed } from './crypto.ts';
 import { secret, HttpError, id } from './util.ts';
 import { config } from './config.ts';
@@ -87,12 +88,18 @@ const httpsSchema = z.object({
 export type Settings = {
   /** Public URL of the dashboard, used for links in notifications. */
   dashboardUrl: string | null;
+  /** The router serves the dashboard, /api and /mcp for this host over HTTPS (plain HTTP redirects). Owner only. */
+  dashboardDomain: string | null;
+  /** Who may use the dashboard domain: addresses/CIDRs or "private" (the default). Empty = anyone. */
+  dashboardAllow: string[];
   https: z.infer<typeof httpsSchema>;
   notifications: { channels: Channel[] };
   backups: { destinations: Destination[] };
   webhooks: { secret: string };
   /** Notify (event server.usage) when a server's disk, memory or CPU stays above these percentages. */
   alerts: z.infer<typeof alertsSchema>;
+  /** Low disk space protection: lines per level (null: SERVIFY_DISK_* env, else the defaults), automatic clean-up. */
+  disk: z.infer<typeof diskSchema>;
   /** Channels subscribed to failures got server.usage added once, when it was introduced. */
   usageEventAdded?: boolean;
   /** …and servify.update (updates of Servify itself), when that was introduced. */
@@ -104,6 +111,16 @@ const alertsSchema = z.object({
   diskPct: z.number().int().min(50).max(99),
   memPct: z.number().int().min(50).max(99),
   cpuPct: z.number().int().min(50).max(100),
+  /** Scheduled jobs, backups and test restores that keep failing: remind every this many hours (0 = only the first failure and the recovery). */
+  failureRemindHours: z.number().min(0).max(24 * 30),
+});
+
+const diskSchema = z.object({
+  warnPct: z.number().min(0).max(90).nullable(),
+  warnGb: z.number().min(0).max(1_000_000).nullable(),
+  protectPct: z.number().min(0).max(90).nullable(),
+  protectGb: z.number().min(0).max(1_000_000).nullable(),
+  autoClean: z.boolean().nullable(),
 });
 
 export const LOCAL_DESTINATION: Destination = { id: 'local', name: 'This machine', type: 'local', path: join(config.dataDir, 'backups') };
@@ -111,11 +128,14 @@ export const LOCAL_DESTINATION: Destination = { id: 'local', name: 'This machine
 function defaults(): Settings {
   return {
     dashboardUrl: null,
+    dashboardDomain: null,
+    dashboardAllow: [PRIVATE],
     https: { enabled: false, email: '', staging: false, directoryUrl: null, redirectHttp: true },
     notifications: { channels: [] },
     backups: { destinations: [] },
     webhooks: { secret: secret(24) },
-    alerts: { enabled: true, diskPct: 90, memPct: 90, cpuPct: 95 },
+    alerts: { enabled: true, diskPct: 90, memPct: 90, cpuPct: 95, failureRemindHours: 24 },
+    disk: { warnPct: null, warnGb: null, protectPct: null, protectGb: null, autoClean: null },
   };
 }
 
@@ -135,6 +155,7 @@ export function getSettings(): Settings {
     backups: { destinations: stored.backups?.destinations ?? [] },
     webhooks: { secret: stored.webhooks?.secret || base.webhooks.secret },
     alerts: { ...base.alerts, ...(stored.alerts ?? {}) },
+    disk: { ...base.disk, ...(stored.disk ?? {}) },
   };
   if (!raw || !stored.webhooks?.secret) save(cache);
   // server.usage arrived later: channels that already get failure alerts get it once.
@@ -190,6 +211,10 @@ export function publicSettings(reveal: boolean) {
   const s = getSettings();
   return {
     dashboardUrl: s.dashboardUrl,
+    dashboardDomain: s.dashboardDomain,
+    dashboardAllow: s.dashboardAllow,
+    /** A proxy in front that Servify doesn't trust sent requests for the dashboard domain (they are refused). */
+    dashboardWarning: s.dashboardDomain && untrustedProxy('dashboard') ? untrustedProxyMessage(untrustedProxy('dashboard')!.peer) : null,
     https: s.https,
     // Channel and destination credentials are write-only, even for the owner; only the webhook
     // secret is shown (it has to be pasted into the git host).
@@ -197,6 +222,7 @@ export function publicSettings(reveal: boolean) {
     backups: { destinations: [LOCAL_DESTINATION, ...s.backups.destinations.map(maskDestination)] },
     webhooks: { secret: reveal ? s.webhooks.secret : MASK },
     alerts: s.alerts,
+    disk: s.disk,
   };
 }
 
@@ -209,23 +235,64 @@ function unmask<T extends Record<string, any>>(next: T, prev: T | undefined, key
 
 // ───────────────────────────── updates ─────────────────────────────
 
-export function updateGeneral(actor: Actor, patch: { dashboardUrl?: string | null }) {
+const HOST_NAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+/** A dashboard domain: a host name (or an IPv4 address of this machine) that no service routes. */
+function checkDashboardDomain(raw: string | null | undefined): string | null {
+  const v = (raw ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/[/:].*$/, '').replace(/\.$/, '');
+  if (!v) return null;
+  if (config.authMode === 'none') throw new HttpError(400, 'a dashboard domain needs sign-in: Servify runs with SERVIFY_AUTH=none, which would hand the dashboard to anyone who reaches it');
+  if (!HOST_NAME.test(v)) throw new HttpError(400, `not a host name: ${raw}`);
+  if (v === 'localhost') throw new HttpError(400, 'pick a name other than localhost (the dashboard port already answers there)');
+  const projects = new Map(projectsTable.all().map((p) => [p.id, p]));
+  for (const svc of servicesTable.all()) {
+    const p = projects.get(svc.projectId);
+    if (svc.domains.includes(v) || (p && `${svc.slug}.${p.slug}.${config.baseDomain}` === v)) throw new HttpError(409, `${v} is already routed to the service ${svc.name}`);
+  }
+  return v;
+}
+
+export function updateGeneral(actor: Actor, patch: { dashboardUrl?: string | null; dashboardDomain?: string | null; dashboardAllow?: string[] | null }) {
   const s = structuredClone(getSettings());
+  const said: string[] = [];
   if (patch.dashboardUrl !== undefined) {
     const v = patch.dashboardUrl?.trim().replace(/\/+$/, '') || null;
     if (v && !/^https?:\/\//.test(v)) throw new HttpError(400, 'dashboard URL must start with http:// or https://');
     s.dashboardUrl = v;
+    said.push('general settings');
+  }
+  if (patch.dashboardDomain !== undefined) {
+    const v = checkDashboardDomain(patch.dashboardDomain);
+    // A newly chosen domain starts private-only unless the same request says otherwise.
+    if (v && v !== s.dashboardDomain && patch.dashboardAllow === undefined) s.dashboardAllow = [PRIVATE];
+    s.dashboardDomain = v;
+    said.push(v ? `dashboard domain ${v}` : 'no dashboard domain');
+  }
+  if (patch.dashboardAllow !== undefined) {
+    s.dashboardAllow = parseRules(patch.dashboardAllow, 'dashboardAllow');
+    said.push(s.dashboardAllow.length ? `dashboard domain open to ${s.dashboardAllow.join(', ')}` : 'dashboard domain open to anyone');
   }
   save(s);
-  recordActivity(actor, 'settings.updated', 'Updated general settings');
+  recordActivity(actor, 'settings.updated', `Updated ${said.join('; ') || 'general settings'}`);
 }
 
 export function updateAlerts(actor: Actor, patch: Partial<z.infer<typeof alertsSchema>>) {
   const s = structuredClone(getSettings());
   s.alerts = alertsSchema.parse({ ...s.alerts, ...patch });
   save(s);
-  recordActivity(actor, 'settings.updated', `Usage alerts ${s.alerts.enabled ? `at disk ${s.alerts.diskPct}%, memory ${s.alerts.memPct}%, CPU ${s.alerts.cpuPct}%` : 'off'}`);
+  const remind = s.alerts.failureRemindHours ? `every ${s.alerts.failureRemindHours} h` : 'never';
+  recordActivity(actor, 'settings.updated', patch.failureRemindHours !== undefined && Object.keys(patch).length === 1 ? `Reminders for scheduled runs that keep failing: ${remind}` : `Usage alerts ${s.alerts.enabled ? `at disk ${s.alerts.diskPct}%, memory ${s.alerts.memPct}%, CPU ${s.alerts.cpuPct}%` : 'off'}`);
   return s.alerts;
+}
+
+export function updateDisk(actor: Actor, patch: Partial<z.infer<typeof diskSchema>>) {
+  const s = structuredClone(getSettings());
+  s.disk = diskSchema.parse({ ...s.disk, ...patch });
+  save(s);
+  const d = s.disk;
+  const lvl = (pct: number | null, gb: number | null) => [pct != null && `${pct}%`, gb != null && `${gb} GB`].filter(Boolean).join(' / ') || 'default';
+  recordActivity(actor, 'settings.updated', `Low disk space: warn below ${lvl(d.warnPct, d.warnGb)}, protect below ${lvl(d.protectPct, d.protectGb)}, automatic clean-up ${d.autoClean === false ? 'off' : 'on'}`);
+  return s.disk;
 }
 
 export function updateHttps(actor: Actor, patch: Partial<z.infer<typeof httpsSchema>>) {

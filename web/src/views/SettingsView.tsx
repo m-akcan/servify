@@ -42,13 +42,18 @@ type Channel = {
 type Destination = { id?: string; name: string; type: 'local' | 's3'; path?: string; endpoint?: string; region?: string; bucket?: string; prefix?: string; accessKeyId?: string; secretAccessKey?: string; forcePathStyle?: boolean };
 type Settings = {
   dashboardUrl: string | null;
+  dashboardDomain: string | null;
+  dashboardAllow: string[];
+  dashboardWarning: string | null;
   https: { enabled: boolean; email: string; staging: boolean; directoryUrl: string | null; redirectHttp: boolean };
   notifications: { channels: Channel[] };
   backups: { destinations: Destination[] };
   webhooks: { secret: string };
   alerts: Alerts;
+  disk: DiskSettings;
 };
-type Alerts = { enabled: boolean; diskPct: number; memPct: number; cpuPct: number };
+type DiskSettings = { warnPct: number | null; warnGb: number | null; protectPct: number | null; protectGb: number | null; autoClean: boolean | null };
+type Alerts = { enabled: boolean; diskPct: number; memPct: number; cpuPct: number; failureRemindHours?: number };
 type Delivery = { ts: number; channelId: string; event: string; ok: boolean; error?: string };
 type HookDelivery = { ts: number; provider: string; event: string; repo: string | null; ok: boolean; result: string };
 
@@ -254,15 +259,15 @@ function StartAtLogin() {
   );
 }
 
-type Release = { version: string; tag: string; url: string; notes: string; publishedAt: string | null };
+type Release = { version: string; tag: string; url: string; notes: string; publishedAt: string | null; signed?: boolean; unsigned?: boolean };
 type UpdateStatus = {
   version: string;
   installDir: string;
   cannotUpdate: string | null;
-  lastCheck: { at: number; release: Release | null; error?: string } | null;
+  lastCheck: { at: number; release: Release | null; blocked?: string | null; error?: string } | null;
   lastUpdate: { from: string; to: string; state: 'switched' | 'confirmed' | 'rolled-back' | 'failed'; error: string | null; finishedAt: number | null; previousKeptAt: string | null } | null;
 };
-type UpdateCheck = { current: string; latest: Release | null; available: boolean; error?: string };
+type UpdateCheck = { current: string; latest: Release | null; available: boolean; newer?: boolean; blocked?: string | null; error?: string };
 
 /** Updating Servify itself: checks only when asked, installs a release and restarts (rolling back if it can't start). */
 function Updates() {
@@ -284,6 +289,7 @@ function Updates() {
       const r = await api.post<UpdateCheck>('/system/update/check');
       setCheck(r);
       if (r.error) toast({ title: 'Could not check for updates', body: r.error, tone: 'err' });
+      else if (r.blocked) toast({ title: `Not installing ${r.latest?.version ?? 'the new release'}`, body: r.blocked, tone: 'err' });
       else if (!r.available) toast({ title: `${r.current} is the newest version`, tone: 'ok' });
     } catch (e) {
       toastError(e, 'Could not check for updates');
@@ -331,6 +337,7 @@ function Updates() {
   };
   const last = st.lastUpdate;
   const rel = check?.available ? check.latest : null;
+  const blocked = check?.newer && check.blocked && check.latest ? { version: check.latest.version, url: check.latest.url, why: check.blocked } : null;
   return (
     <Card
       title="Updates"
@@ -346,6 +353,8 @@ function Updates() {
         <div className="col" style={{ gap: 10 }}>
           <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
             <Badge tone="ok">{rel.version} available</Badge>
+            {rel.signed && <span className="faint" style={{ fontSize: 12 }}>Signed release</span>}
+            {rel.unsigned && <Badge tone="warn">Not signed — allowed by SERVIFY_UPDATE_ALLOW_UNSIGNED</Badge>}
             {rel.url && (
               <a className="faint" href={rel.url} target="_blank" rel="noreferrer">
                 What’s new
@@ -363,6 +372,21 @@ function Updates() {
               </Button>
             </div>
           )}
+        </div>
+      )}
+      {blocked && (
+        <div className="col" style={{ gap: 6 }}>
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <Badge tone="err">{blocked.version} can’t be installed</Badge>
+            {blocked.url && (
+              <a className="faint" href={blocked.url} target="_blank" rel="noreferrer">
+                Release page
+              </a>
+            )}
+          </div>
+          <div className="faint" style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+            {blocked.why}. Nothing was installed; your version keeps running.
+          </div>
         </div>
       )}
       {last && last.state !== 'switched' && (
@@ -385,6 +409,10 @@ function Https({ settings, reload }: { settings: Settings; reload: () => void })
   const [advanced, setAdvanced] = useState(!!settings.https.directoryUrl);
   const dirty = JSON.stringify(draft) !== JSON.stringify(settings.https);
   const loadCerts = () => api.get<PublicCert[]>('/certs').then(setCerts).catch(() => {});
+  const [ca, setCa] = useState<{ fingerprint256: string } | null>(null);
+  useEffect(() => {
+    void api.get<{ pem: string; fingerprint256: string }>('/certs/local-ca').then(setCa).catch(() => {});
+  }, []);
   useEffect(() => {
     void loadCerts();
     const t = setInterval(loadCerts, 4000);
@@ -531,8 +559,110 @@ function Https({ settings, reload }: { settings: Settings; reload: () => void })
           </div>
           <pre className="no-canvas-wheel">sudo security add-trusted-cert -d -r trustRoot \{'\n'}  -k /Library/Keychains/System.keychain ~/Downloads/servify-local-ca.pem</pre>
         </div>
+        {ca && (
+          <div className="snippet" style={{ marginTop: 12 }}>
+            <div className="snippet-head">
+              <span className="label">SHA-256 fingerprint of the local CA</span>
+              <CopyButton text={ca.fingerprint256} label="Copy" />
+            </div>
+            <pre className="no-canvas-wheel">{fingerprintRows(ca.fingerprint256).join('\n')}</pre>
+          </div>
+        )}
+        {ca && (
+          <div className="faint" style={{ fontSize: 12, marginTop: 8 }}>
+            The Servify phone app shows the fingerprint of the certificate authority it is about to trust. It must match this one exactly; if it doesn’t, something between the phone and this server is answering instead — don’t trust it.
+          </div>
+        )}
       </Card>
+
+      <DashboardDomain settings={settings} reload={reload} httpsPort={httpsPort} />
     </>
+  );
+}
+
+/** "AB:CD:…" in rows of 8 bytes, as the phone app shows it. */
+function fingerprintRows(fp: string): string[] {
+  const parts = fp.split(':');
+  const rows: string[] = [];
+  for (let i = 0; i < parts.length; i += 8) rows.push(parts.slice(i, i + 8).join(':'));
+  return rows;
+}
+
+/** Settings → HTTPS → Dashboard domain: the router serves the dashboard and API over HTTPS for one host name. */
+function DashboardDomain({ settings, reload, httpsPort }: { settings: Settings; reload: () => void; httpsPort: number }) {
+  const [domain, setDomain] = useState(settings.dashboardDomain ?? '');
+  const [allow, setAllow] = useState((settings.dashboardAllow ?? []).join('\n'));
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setDomain(settings.dashboardDomain ?? '');
+    setAllow((settings.dashboardAllow ?? []).join('\n'));
+  }, [settings.dashboardDomain, (settings.dashboardAllow ?? []).join(',')]);
+  const allowList = allow.split('\n').map((l) => l.trim()).filter(Boolean);
+  const dirty = (settings.dashboardDomain ?? '') !== domain.trim().toLowerCase() || allowList.join(',') !== (settings.dashboardAllow ?? []).join(',');
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.patch('/settings/general', { dashboardDomain: domain.trim() || null, dashboardAllow: allowList });
+      toast({ title: domain.trim() ? `The dashboard answers at https://${domain.trim().toLowerCase()}` : 'Dashboard domain removed', tone: 'ok' });
+      reload();
+    } catch (e) {
+      toastError(e, 'Could not save');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const privateOnly = allowList.length === 1 && allowList[0] === 'private';
+  const port = httpsPort === 443 ? '' : `:${httpsPort}`;
+  return (
+    <Card
+      title="Dashboard domain"
+      icon={<Icon name="globe" size={17} />}
+      desc={
+        <>
+          Serve this dashboard, its API and <span className="mono">/mcp</span> over HTTPS through the router under a name of your choice — e.g. <span className="mono">servify.home.arpa</span> for the phone app. Names ending in .lan, .local, .home.arpa, .internal or .localhost use the local CA above; a public domain gets a Let’s Encrypt certificate when automatic HTTPS is on. Plain HTTP for it is redirected to HTTPS.
+        </>
+      }
+    >
+      <div className="col" style={{ gap: 14 }}>
+        {settings.dashboardWarning && (
+          <div className="callout callout-warn">
+            <Icon name="alert" size={15} />
+            <div className="grow">{settings.dashboardWarning} Until then, requests through that proxy are refused.</div>
+          </div>
+        )}
+        <Field label="Domain" hint={settings.dashboardDomain ? <>Open it at <span className="mono">https://{settings.dashboardDomain}{port}</span>. Point the name at this machine (DNS or your router).</> : 'Leave empty to keep the dashboard on its own port only.'}>
+          <input className="input mono" placeholder="servify.home.arpa" value={domain} onChange={(e) => setDomain(e.target.value)} spellCheck={false} />
+        </Field>
+        <Field
+          label="Who can use it"
+          hint={
+            privateOnly
+              ? 'Private networks only (LAN, this machine, Tailscale): setting a domain never puts the dashboard on the internet by accident.'
+              : allowList.length
+                ? 'Only these addresses or networks (one per line; "private" = private networks).'
+                : 'Anyone who reaches the router — only with a strong password, and ideally a public certificate.'
+          }
+          right={
+            <span className="row" style={{ gap: 6 }}>
+              <button type="button" className="link" style={{ fontSize: 12 }} onClick={() => setAllow('private')}>
+                Private networks
+              </button>
+              <button type="button" className="link" style={{ fontSize: 12 }} onClick={() => setAllow('')}>
+                Anyone
+              </button>
+            </span>
+          }
+        >
+          <textarea className="textarea mono" style={{ minHeight: 56 }} value={allow} placeholder="anyone" spellCheck={false} onChange={(e) => setAllow(e.target.value)} />
+        </Field>
+        <div className="row">
+          <div className="spacer" />
+          <Button variant="primary" size="sm" loading={busy} disabled={!dirty} onClick={() => void save()}>
+            Save
+          </Button>
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -634,6 +764,8 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
         )}
       </Card>
       <UsageAlerts alerts={settings.alerts} reload={reload} />
+      <FailureReminders hours={settings.alerts.failureRemindHours ?? 24} reload={reload} />
+      <LowDisk disk={settings.disk} reload={reload} />
       {deliveries.length > 0 && (
         <Card title="Recent deliveries">
           <div className="delivery-list">
@@ -666,7 +798,9 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
   );
 }
 
-function UsageAlerts({ alerts, reload }: { alerts: Alerts; reload: () => void }) {
+function UsageAlerts({ alerts: all, reload }: { alerts: Alerts; reload: () => void }) {
+  // Only the usage figures: the failure reminder interval is saved by its own card.
+  const { failureRemindHours: _remind, ...alerts } = all;
   const [draft, setDraft] = useState(alerts);
   const dirty = JSON.stringify(draft) !== JSON.stringify(alerts);
   const save = async (next = draft) => {
@@ -710,6 +844,114 @@ function UsageAlerts({ alerts, reload }: { alerts: Alerts; reload: () => void })
       {dirty && (
         <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
           <Button size="sm" variant="ghost" onClick={() => setDraft(alerts)}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="primary" onClick={() => void save()}>
+            Save
+          </Button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** Cron jobs, scheduled backups and test restores that keep failing: notified once, then reminded every N hours. */
+function FailureReminders({ hours, reload }: { hours: number; reload: () => void }) {
+  const [draft, setDraft] = useState(String(hours));
+  const dirty = Number(draft) !== hours;
+  const save = async () => {
+    try {
+      await api.patch('/settings/alerts', { failureRemindHours: Math.max(0, Number(draft) || 0) });
+      toast({ title: 'Saved', tone: 'ok', duration: 1600 });
+      reload();
+    } catch (e) {
+      toastError(e, 'Could not save');
+    }
+  };
+  return (
+    <Card
+      title="Jobs and backups that keep failing"
+      desc="A cron job, scheduled backup or test restore notifies on its first failure — not on every failure after it — and once when it works again. While it keeps failing, a reminder goes out this often. Every run is still in its history."
+    >
+      <Field label="Remind every" hint={Number(draft) > 0 ? undefined : '0 = never: only the first failure and the recovery are notified.'}>
+        <div className="row" style={{ gap: 6 }}>
+          <input className="input mono" type="number" min={0} max={720} style={{ width: 80 }} value={draft} onChange={(e) => setDraft(e.target.value)} />
+          <span className="faint">hours</span>
+          {dirty && (
+            <Button size="sm" variant="primary" onClick={() => void save()}>
+              Save
+            </Button>
+          )}
+        </div>
+      </Field>
+    </Card>
+  );
+}
+
+/** Low disk space protection: the two lines per disk (empty = the SERVIFY_DISK_* env value, else the default). */
+function LowDisk({ disk, reload }: { disk: DiskSettings; reload: () => void }) {
+  const [draft, setDraft] = useState(disk);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(disk);
+  const save = async (next = draft) => {
+    try {
+      await api.patch('/settings/disk', next);
+      toast({ title: 'Low disk space settings saved', tone: 'ok' });
+      reload();
+    } catch (e) {
+      toastError(e, 'Could not save');
+    }
+  };
+  const num = (key: 'warnPct' | 'warnGb' | 'protectPct' | 'protectGb', unit: string, placeholder: string) => (
+    <div className="row" style={{ gap: 6 }}>
+      <input
+        className="input mono"
+        type="number"
+        min={0}
+        step="any"
+        style={{ width: 80 }}
+        placeholder={placeholder}
+        value={draft[key] ?? ''}
+        onChange={(e) => setDraft({ ...draft, [key]: e.target.value === '' ? null : Number(e.target.value) })}
+      />
+      <span className="faint">{unit}</span>
+    </div>
+  );
+  return (
+    <Card
+      title="Low disk space"
+      desc="Servify watches its data disk, Docker’s disk and every server’s. Below the warning line it notifies (on “Server disk, memory or CPU high”); below the protection line it stops storing logs, metrics and the access log and refuses builds, image pulls and folder backups — until the disk is back above the warning line. A line is the smaller of its % and GB; fill in only one to use that alone."
+      right={
+        <Switch
+          checked={draft.autoClean !== false}
+          onChange={(v) => {
+            const next = { ...draft, autoClean: v };
+            setDraft(next);
+            void save(next);
+          }}
+          label="Clean up automatically"
+        />
+      }
+    >
+      <div className="alert-thresholds">
+        <Field label="Warn below" hint="Default: 10% or 10 GB, whichever is smaller.">
+          <div className="row" style={{ gap: 10 }}>
+            {num('warnPct', '%', '10')}
+            {num('warnGb', 'GB', '10')}
+          </div>
+        </Field>
+        <Field label="Protect below" hint="Default: 5% or 3 GB, whichever is smaller.">
+          <div className="row" style={{ gap: 10 }}>
+            {num('protectPct', '%', '5')}
+            {num('protectGb', 'GB', '3')}
+          </div>
+        </Field>
+      </div>
+      <p className="faint" style={{ marginTop: 10, fontSize: 12.5 }}>
+        The switch: when a disk enters protection, remove built images beyond the 5 kept per service for rollbacks, leftover build checkouts and log rows past their retention — once. Volumes and backups are never deleted automatically.
+      </p>
+      {dirty && (
+        <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
+          <Button size="sm" variant="ghost" onClick={() => setDraft(disk)}>
             Cancel
           </Button>
           <Button size="sm" variant="primary" onClick={() => void save()}>
@@ -1129,10 +1371,27 @@ function Webhooks({ settings, reload }: { settings: Settings; reload: () => void
 
 // ───────────────────────────── security ─────────────────────────────
 
-type Device = { id: string; name: string; prefix: string; createdAt: number; lastUsedAt: number | null; current?: boolean };
+type Device = { id: string; name: string; prefix: string; createdAt: number; lastUsedAt: number | null; current?: boolean; lastAppVersion?: string; lastAppVersionCode?: number };
+
+/** GET /api/mobile/app: the Android app this Servify mirrored from its signed release, for its phones to update from. */
+type MobileApp = {
+  available: boolean;
+  versionName: string | null;
+  versionCode: number | null;
+  sha256: string | null;
+  size: number | null;
+  signerSha256: string | null;
+  reason?: string;
+  status: string;
+  release: string | null;
+  mirroredAt: number | null;
+  checkedAt: number | null;
+  checking: boolean;
+  mirror: boolean;
+};
 
 /** Phones signed in with the Servify app. Each holds its own token; signing one out ends it at once. */
-function Devices() {
+function Devices({ app }: { app: MobileApp | null }) {
   const [devices, setDevices] = useState<Device[] | null>(null);
   const load = () => api.get<Device[]>('/devices').then(setDevices).catch(() => setDevices([]));
   useEffect(() => {
@@ -1154,22 +1413,94 @@ function Devices() {
         <div className="faint" style={{ fontSize: 13 }}>No phones yet. In the app, enter this Servify's address and your password.</div>
       ) : (
         <div className="token-list">
-          {devices.map((d) => (
-            <div className="token-row" key={d.id}>
-              <div className="token-icon">
-                <Icon name="phone" size={15} />
-              </div>
-              <div className="grow">
-                <b>{d.name}</b>
-                <div className="faint mono" style={{ fontSize: 11, marginTop: 2 }}>
-                  signed in {timeAgo(d.createdAt)}  ·  {d.lastUsedAt ? `used ${timeAgo(d.lastUsedAt)}` : 'never used'}
+          {devices.map((d) => {
+            const outdated = !!(app?.available && app.versionCode && d.lastAppVersionCode && d.lastAppVersionCode < app.versionCode);
+            return (
+              <div className="token-row" key={d.id}>
+                <div className="token-icon">
+                  <Icon name="phone" size={15} />
                 </div>
+                <div className="grow">
+                  <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                    <b>{d.name}</b>
+                    {outdated && <Badge tone="warn">update available: {app!.versionName}</Badge>}
+                  </div>
+                  <div className="faint mono" style={{ fontSize: 11, marginTop: 2 }}>
+                    signed in {timeAgo(d.createdAt)}  ·  {d.lastUsedAt ? `used ${timeAgo(d.lastUsedAt)}` : 'never used'}  ·  {d.lastAppVersion ? `app ${d.lastAppVersion}` : 'app version unknown'}
+                  </div>
+                </div>
+                <Button size="sm" variant="ghost" onClick={() => void signOut(d)}>
+                  Sign out
+                </Button>
               </div>
-              <Button size="sm" variant="ghost" onClick={() => void signOut(d)}>
-                Sign out
-              </Button>
-            </div>
-          ))}
+            );
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** The Android app mirrored from this version's signed release: what phones are offered, and a direct download. */
+function PhoneApp({ app, onChange }: { app: MobileApp | null; onChange: (a: MobileApp) => void }) {
+  const [busy, setBusy] = useState(false);
+  if (!app) return null;
+  const check = async () => {
+    setBusy(true);
+    try {
+      onChange(await api.post<MobileApp>('/mobile/app/check'));
+    } catch (e) {
+      toastError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card
+      title="Phone app"
+      icon={<Icon name="phone" size={17} />}
+      desc="Servify mirrors the Android app from this version's signed release, so phones update from this server over your network or VPN. The app offers the update itself; the file is here for sideloading."
+      right={
+        app.available ? (
+          <a className="btn btn-secondary btn-sm" href="/api/mobile/app.apk">
+            <Icon name="download" size={14} />
+            APK
+          </a>
+        ) : undefined
+      }
+    >
+      <dl className="kv-grid">
+        <dt>Version</dt>
+        <dd>{app.available ? <span className="mono">{app.versionName} (versionCode {app.versionCode})</span> : <Badge tone={app.mirror ? 'warn' : 'idle'}>none served</Badge>}</dd>
+        {app.available && (
+          <>
+            <dt>SHA-256</dt>
+            <dd className="mono" style={{ fontSize: 11, wordBreak: 'break-all' }}>
+              {app.sha256}
+            </dd>
+            <dt>Signed by</dt>
+            <dd className="mono" style={{ fontSize: 11, wordBreak: 'break-all' }}>
+              {app.signerSha256}
+            </dd>
+            <dt>From</dt>
+            <dd>
+              release <span className="mono">{app.release}</span>
+              {app.mirroredAt ? `, mirrored ${timeAgo(app.mirroredAt)}` : ''}
+              {app.size ? ` · ${(app.size / 1024 ** 2).toFixed(1)} MB` : ''}
+            </dd>
+          </>
+        )}
+        <dt>Mirror</dt>
+        <dd>
+          {app.available ? app.status : app.reason}
+          {app.checkedAt ? <span className="faint"> · checked {timeAgo(app.checkedAt)}</span> : null}
+        </dd>
+      </dl>
+      {app.mirror && (
+        <div style={{ marginTop: 12 }}>
+          <Button size="sm" variant="secondary" loading={busy || app.checking} onClick={() => void check()}>
+            Check now
+          </Button>
         </div>
       )}
     </Card>
@@ -1178,6 +1509,10 @@ function Devices() {
 
 function Security() {
   const system = useStore((s) => s.system) as any;
+  const [app, setApp] = useState<MobileApp | null>(null);
+  useEffect(() => {
+    api.get<MobileApp>('/mobile/app').then(setApp, () => setApp(null));
+  }, []);
   const mk = system?.masterKey as { source: 'env' | 'file' | 'created'; path: string | null } | undefined;
   return (
     <>
@@ -1193,7 +1528,8 @@ function Security() {
           </div>
         </div>
       </Card>
-      <Devices />
+      <Devices app={app} />
+      <PhoneApp app={app} onChange={setApp} />
       <Card title="Access" icon={<Icon name="shield" size={17} />} desc="Who can reach this Servify.">
         <ul className="plain-list">
           <li>The dashboard and API listen on <span className="mono">{system?.api.host}</span> — {system?.api.host === '127.0.0.1' ? 'only this machine' : 'reachable from your network'}.</li>

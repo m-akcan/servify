@@ -1,5 +1,8 @@
-# On a version tag (v1.2.3): check that it matches package.json, build the package the updater installs and
-# publish it as a GitHub release with its checksum.
+# On a version tag (v1.2.3): check that it matches package.json, build and test the package the updater installs
+# and create a DRAFT GitHub release with it and its checksum. Nothing is published here and no signing key is used:
+# the maintainer runs scripts/publish-release.mjs on their own machine, which rebuilds the tag, compares the result
+# with this package, signs a manifest with the release key (which never leaves that machine) and publishes the
+# draft. Drafts are invisible to /releases/latest, so no install sees the release before it is signed.
 name: Release
 
 on:
@@ -25,13 +28,15 @@ jobs:
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - name: Release signing checks (throwaway key)
+        run: node --disable-warning=ExperimentalWarning scripts/test-release-signing.mjs
       - run: pnpm build
       - run: node scripts/release.mjs --out dist
       - name: Self-test of the package
         run: |
           mkdir -p /tmp/pkg && tar -xzf dist/servify-${GITHUB_REF_NAME}.tar.gz -C /tmp/pkg --strip-components=1
           node --disable-warning=ExperimentalWarning /tmp/pkg/server/bin/servify.mjs selftest
-      - name: Publish the release
+      - name: Create the draft release (signed and published by scripts/publish-release.mjs)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/servify-${GITHUB_REF_NAME}.tar.gz dist/servify-${GITHUB_REF_NAME}.tar.gz.sha256 --title "Servify ${GITHUB_REF_NAME#v}" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/servify-${GITHUB_REF_NAME}.tar.gz dist/servify-${GITHUB_REF_NAME}.tar.gz.sha256 --draft --verify-tag --title "Servify ${GITHUB_REF_NAME#v}" --generate-notes
