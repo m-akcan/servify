@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useStore, loadProjects } from '../lib/store.ts';
 import { api } from '../lib/api.ts';
 import { navigate, projectPath } from '../lib/router.ts';
@@ -7,7 +7,7 @@ import { Icon, BrandMark, ServiceGlyph } from '../components/Icon.tsx';
 import { serviceTone, timeAgo } from '../lib/format.ts';
 import { ProjectMark } from '../components/ProjectMark.tsx';
 import { OverviewPanel } from '../components/Overview.tsx';
-import type { Project, ProjectListItem } from '../lib/types.ts';
+import type { Project, ProjectListItem, PublicServer } from '../lib/types.ts';
 
 type ProjectsView = 'grid' | 'list';
 const VIEW_KEY = 'servify.projects.view';
@@ -431,7 +431,17 @@ export function Home() {
     } catch {}
   };
   const showTools = bases.length > 6;
-  const servers = [...new Map(bases.flatMap((p) => p.servers ?? []).map((s) => [s.id, s])).values()].sort((a, b) => (a.id === 'local' ? -1 : b.id === 'local' ? 1 : a.name.localeCompare(b.name)));
+  // Every connected machine, not only the ones projects already run on, so the filter is there as soon as a second
+  // server is connected (and shows 0 for a machine with nothing on it yet).
+  const [known, setKnown] = useState<{ id: string; name: string }[]>([]);
+  useEffect(() => {
+    api
+      .get<PublicServer[]>('/servers')
+      .then((list) => setKnown(list.map((s) => ({ id: s.id, name: s.name }))))
+      .catch(() => {});
+  }, []);
+  const servers = [...new Map([...known, ...bases.flatMap((p) => p.servers ?? [])].map((s) => [s.id, s])).values()].sort((a, b) => (a.id === 'local' ? -1 : b.id === 'local' ? 1 : a.name.localeCompare(b.name)));
+  const perServer = (id: string) => bases.filter((p) => (p.servers ?? []).some((s) => s.id === id)).length;
   const q = query.trim().toLowerCase();
   const matchesText = (p: ProjectListItem) => !q || p.name.toLowerCase().includes(q) || p.services.some((s) => s.name.toLowerCase().includes(q));
   const matchesServer = (p: ProjectListItem) => server === 'all' || (p.servers ?? []).some((s) => s.id === server);
@@ -504,7 +514,7 @@ export function Home() {
                 <option value="all">All servers</option>
                 {servers.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.name}
+                    {s.name} ({perServer(s.id)})
                   </option>
                 ))}
               </select>

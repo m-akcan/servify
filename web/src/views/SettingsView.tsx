@@ -503,42 +503,6 @@ function Https({ settings, reload }: { settings: Settings; reload: () => void })
         </div>
       </div>
 
-      <Card title="Certificates" desc="One per custom domain (and per app hostname when the app domain is a real domain).">
-        {certs.length === 0 ? (
-          <Empty icon="certificate" title="No public domains yet" body="Add a custom domain to an HTTP service under Settings → Networking." />
-        ) : (
-          <div className="cert-list">
-            {certs.map((c) => (
-              <div className="cert-row" key={c.host}>
-                <span className="tls-dot" data-tls={settings.https.enabled ? c.status : 'off'} />
-                <div className="grow" style={{ minWidth: 0 }}>
-                  <div className="mono">{c.host}</div>
-                  <div className="faint truncate" style={{ fontSize: 11.5, marginTop: 2 }}>
-                    {!settings.https.enabled
-                      ? 'HTTPS is off'
-                      : c.status === 'issued'
-                        ? `Valid until ${new Date(c.expiresAt!).toLocaleDateString()} · renews automatically`
-                        : c.status === 'failed'
-                          ? `${c.error}${c.nextAttemptAt ? ` · next try ${new Date(c.nextAttemptAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}`
-                          : c.lastAttemptAt
-                            ? 'Requesting…'
-                            : 'Waiting'}
-                  </div>
-                </div>
-                <Badge tone={c.status === 'issued' ? 'ok' : c.status === 'failed' ? 'err' : 'build'} live={c.status === 'pending' && settings.https.enabled}>
-                  {c.status}
-                </Badge>
-                {settings.https.enabled && c.status !== 'pending' && (
-                  <Button size="sm" variant="ghost" icon="refresh" onClick={() => void retry(c.host)}>
-                    {c.status === 'issued' ? 'Renew' : 'Retry'}
-                  </Button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
       <Card
         title="HTTPS on this machine"
         icon={<Icon name="lock" size={17} />}
@@ -578,6 +542,42 @@ function Https({ settings, reload }: { settings: Settings; reload: () => void })
       </Card>
 
       <DashboardDomain settings={settings} reload={reload} httpsPort={httpsPort} />
+
+      <Card title="Certificates" desc="One per custom domain (and per app hostname when the app domain is a real domain).">
+        {certs.length === 0 ? (
+          <Empty icon="certificate" title="No public domains yet" body="Add a custom domain to an HTTP service under Settings → Networking." />
+        ) : (
+          <div className="cert-list">
+            {certs.map((c) => (
+              <div className="cert-row" key={c.host}>
+                <span className="tls-dot" data-tls={settings.https.enabled ? c.status : 'off'} />
+                <div className="grow" style={{ minWidth: 0 }}>
+                  <div className="mono">{c.host}</div>
+                  <div className="faint truncate" style={{ fontSize: 11.5, marginTop: 2 }}>
+                    {!settings.https.enabled
+                      ? 'HTTPS is off'
+                      : c.status === 'issued'
+                        ? `Valid until ${new Date(c.expiresAt!).toLocaleDateString()} · renews automatically`
+                        : c.status === 'failed'
+                          ? `${c.error}${c.nextAttemptAt ? ` · next try ${new Date(c.nextAttemptAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}`
+                          : c.lastAttemptAt
+                            ? 'Requesting…'
+                            : 'Waiting'}
+                  </div>
+                </div>
+                <Badge tone={c.status === 'issued' ? 'ok' : c.status === 'failed' ? 'err' : 'build'} live={c.status === 'pending' && settings.https.enabled}>
+                  {c.status}
+                </Badge>
+                {settings.https.enabled && c.status !== 'pending' && (
+                  <Button size="sm" variant="ghost" icon="refresh" onClick={() => void retry(c.host)}>
+                    {c.status === 'issued' ? 'Renew' : 'Retry'}
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
     </>
   );
 }
