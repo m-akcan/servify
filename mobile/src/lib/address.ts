@@ -21,11 +21,21 @@ function privateIPv4(h: string): boolean {
 
 function privateIPv6(h: string): boolean {
   const v = h.replace(/^\[|\]$/g, '').toLowerCase();
-  return v === '::1' || v.startsWith('fd') || v.startsWith('fc') || v.startsWith('fe80');
+  if (!v.includes(':')) return false; // a name like "fd.example.com" is not an address
+  // IPv4 written as IPv6 (::ffff:192.168.1.5, which URL turns into ::ffff:c0a8:105)
+  const mapped = v.match(/^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/);
+  if (mapped) {
+    if (mapped[1]) return privateIPv4(mapped[1]);
+    const [hi, lo] = [parseInt(mapped[2], 16), parseInt(mapped[3], 16)];
+    return privateIPv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  // loopback, unique local (fc00::/7) and link-local (fe80::/10)
+  return v === '::1' || /^f[cd][0-9a-f]{2}:/.test(v) || /^fe[89ab][0-9a-f]:/.test(v);
 }
 
 /** Hostnames that only resolve inside a home network or VPN. */
 function localName(h: string): boolean {
+  if (h.includes(':') || h.includes('[')) return false; // an IPv6 address has no dot either
   if (!h.includes('.')) return true; // "homeserver", "nas"
   return /\.(local|lan|home|internal|intranet|home\.arpa|ts\.net)$/.test(h) || h === 'localhost' || h.endsWith('.localhost');
 }

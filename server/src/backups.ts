@@ -11,6 +11,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { copyFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { Transform, type Readable, type Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -121,13 +122,42 @@ function cli(svc: Service, args: string[], io: { stdin?: Readable; stdout?: Writ
       if (stderr.length > 20_000) stderr = stderr.slice(-20_000);
     });
     child.on('error', (e) => reject(new Error(`could not run the docker CLI: ${e.message}`)));
-    if (io.stdout) child.stdout!.pipe(io.stdout, { end: false });
+    let exited = false;
+    let outError: Error | null = null;
+    if (io.stdout) {
+      const out = io.stdout;
+      child.stdout!.pipe(out, { end: false });
+      // The file (or gzip) we write to failed, typically a full disk. Without a listener that error would take the
+      // whole process down, and the command would stay blocked on a pipe nobody reads, holding the service's
+      // backup lock forever: stop it, and keep draining until it has gone.
+      const failed = (e?: Error) => {
+        if (exited || outError) return;
+        outError = e ?? new Error('the output closed early');
+        child.stdout!.unpipe(out);
+        child.stdout!.resume();
+        child.kill();
+        setTimeout(() => child.kill('SIGKILL'), 10_000).unref();
+      };
+      out.on('error', failed);
+      out.on('close', () => failed());
+    }
+    let inError: Error | null = null;
     if (io.stdin) {
-      io.stdin.on('error', (e) => child.stdin!.destroy(e));
+      // A failed source (a damaged or cut-off backup) only looks like the end of the input to the command, which
+      // may then exit 0: remember it, so a half-replayed restore is never reported as done.
+      io.stdin.on('error', (e) => {
+        inError ??= e;
+        child.stdin!.destroy(e);
+      });
       io.stdin.pipe(child.stdin!);
       child.stdin!.on('error', () => {});
     }
-    child.on('close', (code) => resolve({ code: code ?? -1, stderr: stderr.trim() }));
+    child.on('close', (code) => {
+      exited = true;
+      if (outError) reject(new Error(`could not write the data: ${outError.message}`));
+      else if (inError) reject(new Error(`could not read the data: ${inError.message}`));
+      else resolve({ code: code ?? -1, stderr: stderr.trim() });
+    });
   });
 }
 
@@ -156,7 +186,21 @@ async function store(d: Destination, key: string, file: string) {
   if (d.type === 'local') {
     const dest = join(d.path!, key);
     mkdirSync(dirname(dest), { recursive: true });
-    renameSync(file, dest);
+    try {
+      renameSync(file, dest);
+    } catch (e) {
+      // A folder on another disk (an external drive, a NAS mount): rename can't cross filesystems, so copy.
+      if ((e as NodeJS.ErrnoException).code !== 'EXDEV') throw e;
+      try {
+        await copyFile(file, `${dest}.part`);
+        renameSync(`${dest}.part`, dest);
+      } catch (err) {
+        rmSync(`${dest}.part`, { force: true });
+        throw err;
+      } finally {
+        rmSync(file, { force: true });
+      }
+    }
     return;
   }
   try {
@@ -259,6 +303,7 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
       const gz = createGzip({ level: 6 });
       const out = createWriteStream(tmp);
       const done = pipeline(gz, out);
+      done.catch(() => {}); // awaited below; a disk-full failure arrives before that
       const r = await cli(svc, ['exec', rep.containerId, 'sh', '-c', DUMP[method]], { stdout: gz });
       gz.end();
       await done;
@@ -401,7 +446,9 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
     await pipeline(await openBackupStream(b), createWriteStream(tmp));
     await ensureHelper(svc);
 
-    // Take the service over from the reconciler, stop it and empty its volumes.
+    // Take the service over from the reconciler, stop it and empty its volumes. A deploy that started during the
+    // safety backup would start replicas on the volumes while they are wiped: nothing is touched yet, so stop here.
+    if (busy.has(svc.id)) throw new Error(`${svc.name} started deploying meanwhile — nothing was changed, restore again when it's done`);
     busy.set(svc.id, new Set(['restore']));
     owned = true;
     const fresh = servicesTable.get(svc.id)!;
@@ -434,7 +481,14 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
     requestReconcile();
     const rep = await waitReady(svc, b.method);
     if (b.method !== 'volume') {
-      const input = b.method === 'pg_dumpall' ? createReadStream(tmp).pipe(createGunzip()).pipe(forceDrops()) : createReadStream(tmp).pipe(createGunzip());
+      // Errors of the file and of gunzip (a damaged backup) are passed down the chain: unhandled, they would crash
+      // the process right after the data was reset.
+      const file = createReadStream(tmp);
+      const gunzip = createGunzip();
+      const input = b.method === 'pg_dumpall' ? gunzip.pipe(forceDrops()) : gunzip;
+      file.on('error', (e) => input.destroy(e));
+      if (input !== gunzip) gunzip.on('error', (e) => input.destroy(e));
+      file.pipe(gunzip);
       const r = await cli(svc, ['exec', '-i', rep.containerId, 'sh', '-c', RESTORE[b.method]], { stdin: input });
       if (r.code !== 0) throw new Error(`replaying the dump failed (exit ${r.code}): ${r.stderr.slice(-400)}`);
     }

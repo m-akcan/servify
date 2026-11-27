@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { uploadPath } from './uploads.ts';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:fs';
-import { join, resolve, relative, isAbsolute } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { join, resolve, relative, isAbsolute, sep } from 'node:path';
 import type { DockerClient } from './docker.ts';
 import { dockerFor, nodeOf, LOCAL } from './nodes.ts';
 import { config } from './config.ts';
@@ -69,7 +69,8 @@ export function normalizeRepo(repo: string): string {
 }
 
 export async function latestCommit(repo: string, branch: string | undefined, token?: string): Promise<string | null> {
-  const r = await run('git', ['ls-remote', authedUrl(repo, token), branch ? `refs/heads/${branch}` : 'HEAD'], {
+  // `--`: a repository that starts with a dash must never be read as a git option (--upload-pack=… runs a command).
+  const r = await run('git', ['ls-remote', '--', authedUrl(repo, token), branch ? `refs/heads/${branch}` : 'HEAD'], {
     env: { GIT_TERMINAL_PROMPT: '0' },
   }).catch(() => null);
   if (!r || r.code !== 0) return null;
@@ -177,7 +178,7 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     log(`▸ Cloning ${url}${src.branch ? ` (${src.branch})` : ''}`);
     const args = ['clone', '--depth', '1', '--single-branch'];
     if (src.branch) args.push('--branch', src.branch);
-    args.push(authedUrl(url, src.token), repoDir);
+    args.push('--', authedUrl(url, src.token), repoDir); // `--`: see latestCommit
     const r = await run('git', args, { env: { GIT_TERMINAL_PROMPT: '0' }, onLine: log, mask: [src.token ?? ''] });
     if (r.code !== 0) throw new Error('git clone failed — check the repository URL, branch and access token');
     cleanup = true;
@@ -208,6 +209,17 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     const ctx = resolve(repoDir, (src as { rootDir?: string }).rootDir ?? '.');
     if (!existsSync(ctx)) throw new Error(`root directory not found in source: ${(src as any).rootDir}`);
     let dockerfile = src.dockerfile ? resolve(ctx, src.dockerfile) : join(ctx, 'Dockerfile');
+    // A clone or an upload is built from its own files only: "../.." (or a symlink in the repository) must not turn
+    // a folder of this machine into the build context or the Dockerfile.
+    if (src.type !== 'local') {
+      const root = realpathSync(repoDir);
+      const within = (p: string) => {
+        const real = realpathSync(p);
+        return real === root || real.startsWith(root + sep);
+      };
+      if (!within(ctx)) throw new Error(`root directory is outside the source: ${(src as any).rootDir}`);
+      if (existsSync(dockerfile) && !within(dockerfile)) throw new Error(`Dockerfile is outside the source: ${src.dockerfile}`);
+    }
     let builder = 'dockerfile';
     if (!existsSync(dockerfile)) {
       if (src.dockerfile) throw new Error(`Dockerfile not found: ${src.dockerfile}`);

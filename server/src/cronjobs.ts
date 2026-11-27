@@ -32,6 +32,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
   if (!deployedSchedule(svc, dep)) throw new HttpError(400, `${svc.name} is not a scheduled job (set a schedule and deploy first)`);
   const project = projectsTable.get(svc.projectId);
   if (!project) throw new HttpError(404, 'project missing');
+  const docker = dockerFor(nodeOf(svc)); // jobs run on the service's server; throws while it is offline, before anything is marked running
   running.add(svc.id);
   const run: JobRun = {
     id: id('run'),
@@ -50,7 +51,6 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
   bus.publish({ type: 'job.run', run });
   bus.publish({ type: 'service.updated', service: svc });
   let cid: string | null = null;
-  const docker = dockerFor(nodeOf(svc)); // jobs run on the service's server
   try {
     const network = networkName(project.id);
     await docker.ensureNetwork(network, { [LABEL.managed]: 'true', [LABEL.instance]: INSTANCE_ID, [LABEL.project]: project.id });

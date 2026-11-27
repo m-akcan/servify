@@ -61,7 +61,10 @@ function flushBucket(t: number) {
     }
     db.exec('COMMIT');
   } catch (e) {
-    db.exec('ROLLBACK');
+    // SQLite has already rolled back on some errors (disk full): a second ROLLBACK throws, and this runs in a timer.
+    try {
+      db.exec('ROLLBACK');
+    } catch {}
     console.error('[metrics] write failed:', (e as Error).message);
   }
   acc.clear();

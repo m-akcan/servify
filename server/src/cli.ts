@@ -108,7 +108,9 @@ async function choose<T>(title: string, items: T[], label: (t: T) => string): Pr
 }
 
 function flag(args: string[], name: string, short?: string): string | true | undefined {
-  const i = args.findIndex((a) => a === `--${name}` || (short && a === `-${short}`) || a.startsWith(`--${name}=`));
+  // Only before a `--`: what follows belongs to the command being run (`servify run -- node -p 1`).
+  const end = args.indexOf('--');
+  const i = args.findIndex((a, at) => (end < 0 || at < end) && (a === `--${name}` || (short && a === `-${short}`) || a.startsWith(`--${name}=`)));
   if (i < 0) return undefined;
   const a = args[i];
   args.splice(i, 1);
@@ -278,8 +280,9 @@ const size = (n: number) => (n > 1024 ** 2 ? `${(n / 1024 ** 2).toFixed(1)} MB` 
 
 async function login(args: string[]) {
   const cfg = readConfig();
+  const givenToken = str(flag(args, 'token')); // first, so `login --token svf_…` doesn't take the flag for the URL
   const url = (args[0] ?? process.env.SERVIFY_URL ?? (await ask(`Servify URL ${c.dim(`(${cfg.url ?? 'http://localhost:7700'})`)}: `)) ?? '') || cfg.url || 'http://localhost:7700';
-  const token = str(flag(args, 'token')) ?? process.env.SERVIFY_TOKEN ?? (await ask('API token (Servify → Agents → API tokens): ', { hidden: true }));
+  const token = givenToken ?? process.env.SERVIFY_TOKEN ?? (await ask('API token (Servify → Agents → API tokens): ', { hidden: true }));
   if (!/^svf_/.test(token)) fail('That does not look like a Servify token (they start with svf_).');
   process.env.SERVIFY_URL = url.replace(/\/$/, '');
   process.env.SERVIFY_TOKEN = token;

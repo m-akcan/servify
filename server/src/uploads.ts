@@ -26,7 +26,11 @@ export async function receiveUpload(actor: Actor, svc: Service, body: Readable, 
   const dir = uploadPath(svc.id, uploadId);
   let stats;
   try {
-    stats = await extractTar(body.pipe(createGunzip()), dir);
+    // An upload cut short (Ctrl-C, a dropped connection) errors the request body: pass that on, or it is an
+    // unhandled stream error that takes the whole process down.
+    const gunzip = createGunzip();
+    body.on('error', (e) => gunzip.destroy(e));
+    stats = await extractTar(body.pipe(gunzip), dir);
   } catch (e) {
     rmSync(dir, { recursive: true, force: true });
     throw new HttpError(400, `could not unpack the upload: ${(e as Error).message}`);

@@ -8,7 +8,7 @@
  */
 import { homedir, platform, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -83,7 +83,9 @@ ${envXml}
 }
 
 export function systemdUnit(s: AutostartSpec) {
-  const q = (v: string) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  // "%" starts a specifier in unit files (%h, %n…): doubled, it stays a literal — a master key may contain one.
+  const pct = (v: string) => String(v).replace(/%/g, '%%');
+  const q = (v: string) => `"${pct(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
   return `[Unit]
 Description=Servify — local-first platform for your services
 After=network-online.target docker.service
@@ -91,15 +93,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${s.cwd}
+WorkingDirectory=${pct(s.cwd)}
 ExecStart=${q(s.node)} --disable-warning=ExperimentalWarning ${q(s.bin)} start
 ${Object.entries(s.env)
   .map(([k, v]) => `Environment=${q(`${k}=${v}`)}`)
   .join('\n')}
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:${s.logFile}
-StandardError=append:${s.logFile}
+StandardOutput=append:${pct(s.logFile)}
+StandardError=append:${pct(s.logFile)}
 
 [Install]
 WantedBy=default.target
@@ -158,7 +160,9 @@ export function enableAutostart(opts: { startNow?: boolean } = {}) {
   if (!t.kind || !t.file || !t.content) throw new Error('starting at login is supported on macOS and Linux');
   mkdirSync(dirname(t.file), { recursive: true });
   mkdirSync(dirname(s.logFile), { recursive: true });
-  writeFileSync(t.file, t.content);
+  // The file carries SERVIFY_MASTER_KEY when that is set in the environment: readable by this user only.
+  writeFileSync(t.file, t.content, { mode: 0o600 });
+  chmodSync(t.file, 0o600);
   if (t.kind === 'launchd') {
     if (opts.startNow) {
       const uid = userInfo().uid;

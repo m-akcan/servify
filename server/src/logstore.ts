@@ -38,7 +38,10 @@ export function flushLogs() {
     for (const l of batch) insert.run(l.serviceId, l.deploymentId, l.cid, l.replica, l.ts, l.stream, l.text);
     db.exec('COMMIT');
   } catch (e) {
-    db.exec('ROLLBACK');
+    // SQLite has already rolled back on some errors (disk full): a second ROLLBACK throws, and this runs in a timer.
+    try {
+      db.exec('ROLLBACK');
+    } catch {}
     console.error('[logs] write failed:', (e as Error).message);
   }
 }

@@ -153,7 +153,10 @@ export function flushAccessLog() {
     for (const r of batch) insert.run(r.serviceId, r.ts, r.host, r.method, r.path, r.status, r.bytes, r.ms, r.referrer, r.refHost, r.userAgent, r.visitor, r.bot, r.replica);
     db.exec('COMMIT');
   } catch (e) {
-    db.exec('ROLLBACK');
+    // SQLite has already rolled back on some errors (disk full): a second ROLLBACK throws, and this runs in a timer.
+    try {
+      db.exec('ROLLBACK');
+    } catch {}
     console.error('[access-log] write failed:', (e as Error).message);
   }
 }

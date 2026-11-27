@@ -3,7 +3,7 @@
  * so every capability is available to humans and agents alike, with the same validation.
  */
 import { z } from 'zod';
-import { cannotSleep, wake } from './sleep.ts';
+import { cannotSleep, wake, touch } from './sleep.ts';
 import { removeUploads, uploadPath } from './uploads.ts';
 import { iconForImage, betterIcon } from './icons.ts';
 export { iconForImage, iconForStack } from './icons.ts';
@@ -769,6 +769,9 @@ function checkMounts(actor: Actor, svc: Service, mounts: NonNullable<UpdateServi
       return had;
     }
     if (m.selinux) throw new HttpError(400, 'SELinux relabelling only applies to host folders');
+    // A volume id only keeps a mount this service already has. Anything else would move another service's volume
+    // here without attach's checks (same project and server, not in use), and its owner would start without its data.
+    if (m.volumeId && !svc.volumes.some((x) => x.volumeId === m.volumeId && !x.borrowed && !x.hostPath)) throw new HttpError(400, `${m.name} is not a volume of ${svc.name} — attach existing volumes with attach_volume (or the volume's menu)`);
     return m;
   });
 }
@@ -1156,6 +1159,7 @@ export function startService(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   svc.stopped = false;
   svc.sleeping = false;
+  touch(svc.id); // starting counts as activity: a sleep-when-idle service must not go back to sleep at the next check
   if (isRoute(svc)) {
     svc.status = svc.source.type === 'redirect' ? 'running' : 'deploying';
     servicesTable.put(svc);
@@ -1599,6 +1603,7 @@ export async function importCompose(actor: Actor, input: { yaml: string; env?: s
 export async function runServiceJob(actor: Actor, serviceId: string) {
   const svc = getServiceOrThrow(serviceId);
   if (isJobRunning(svc.id)) throw new HttpError(409, `${svc.name} is already running — wait for the current run to finish`);
+  dockerFor(nodeOf(svc)); // refuses (503) while the service's server is offline, instead of returning an older run
   // Fire and return the run immediately; completion arrives as a job.run event.
   const p = runJob(svc, actor.type === 'agent' ? 'agent' : 'manual', actor);
   p.catch(() => {});

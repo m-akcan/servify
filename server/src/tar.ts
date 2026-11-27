@@ -83,83 +83,92 @@ export async function extractTar(input: Readable, root: string, limits = { bytes
     return p === base || p.startsWith(base + sep) ? p : null;
   };
 
-  for await (const chunk of input) {
-    buf = buf.length ? Buffer.concat([buf, chunk as Buffer]) : (chunk as Buffer);
-    for (;;) {
-      if (remaining > 0) {
-        if (!buf.length) break;
-        const take = Math.min(remaining, buf.length);
-        const part = buf.subarray(0, take);
-        if (collect) collect.push(Buffer.from(part));
-        else if (fd !== null) writeSync(fd, part);
-        remaining -= take;
-        buf = buf.subarray(take);
-        if (remaining > 0) break;
-        if (fd !== null) {
+  try {
+    return await read();
+  } catch (e) {
+    if (fd !== null) closeSync(fd); // a failed upload must not leak the file it was writing
+    throw e;
+  }
+
+  async function read(): Promise<ExtractStats> {
+    for await (const chunk of input) {
+      buf = buf.length ? Buffer.concat([buf, chunk as Buffer]) : (chunk as Buffer);
+      for (;;) {
+        if (remaining > 0) {
+          if (!buf.length) break;
+          const take = Math.min(remaining, buf.length);
+          const part = buf.subarray(0, take);
+          if (collect) collect.push(Buffer.from(part));
+          else if (fd !== null) writeSync(fd, part);
+          remaining -= take;
+          buf = buf.subarray(take);
+          if (remaining > 0) break;
+          if (fd !== null) {
+            closeSync(fd);
+            fd = null;
+          }
+          if (collect) {
+            const data = Buffer.concat(collect).toString('utf8');
+            if (collectType === 'L') longName = data.replace(/\0.*$/s, '');
+            else {
+              const m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(data);
+              if (m && collectType === 'x') longName = m[1];
+            }
+            collect = null;
+          }
+        }
+        if (padding > 0) {
+          const take = Math.min(padding, buf.length);
+          padding -= take;
+          buf = buf.subarray(take);
+          if (padding > 0) break;
+        }
+        if (buf.length < 512) break;
+        const h = buf.subarray(0, 512);
+        buf = buf.subarray(512);
+        if (h.every((b) => b === 0)) {
+          if (++zeros >= 2) return finish();
+          continue;
+        }
+        zeros = 0;
+        const size = octal(h.subarray(124, 136));
+        const type = String.fromCharCode(h[156] || 48);
+        const prefix = cstr(h.subarray(345, 500));
+        let name = longName ?? (prefix ? `${prefix}/${cstr(h.subarray(0, 100))}` : cstr(h.subarray(0, 100)));
+        if (type !== 'x' && type !== 'L' && type !== 'g') longName = null;
+        remaining = size;
+        padding = (512 - (size % 512)) % 512;
+        if (type === 'x' || type === 'L' || type === 'g') {
+          collect = [];
+          collectType = type;
+          if (size === 0) collect = null;
+          continue;
+        }
+        name = name.replace(/\/+$/, '');
+        const path = safe(name);
+        if (type === '5') {
+          if (path) mkdirSync(path, { recursive: true });
+          continue;
+        }
+        if ((type !== '0' && type !== '7') || !path) {
+          if (name) stats.skipped.push(name);
+          continue; // links, devices, unsafe paths: the data that follows is skipped
+        }
+        stats.files++;
+        stats.bytes += size;
+        if (stats.files > limits.files) throw new Error(`too many files (over ${limits.files.toLocaleString()})`);
+        if (stats.bytes > limits.bytes) throw new Error(`too large (over ${Math.round(limits.bytes / 1024 ** 2)} MB unpacked)`);
+        mkdirSync(dirname(path), { recursive: true });
+        const mode = octal(h.subarray(100, 108)) & 0o111 ? 0o755 : 0o644;
+        fd = openSync(path, 'w', mode);
+        if (size === 0) {
           closeSync(fd);
           fd = null;
         }
-        if (collect) {
-          const data = Buffer.concat(collect).toString('utf8');
-          if (collectType === 'L') longName = data.replace(/\0.*$/s, '');
-          else {
-            const m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(data);
-            if (m && collectType === 'x') longName = m[1];
-          }
-          collect = null;
-        }
-      }
-      if (padding > 0) {
-        const take = Math.min(padding, buf.length);
-        padding -= take;
-        buf = buf.subarray(take);
-        if (padding > 0) break;
-      }
-      if (buf.length < 512) break;
-      const h = buf.subarray(0, 512);
-      buf = buf.subarray(512);
-      if (h.every((b) => b === 0)) {
-        if (++zeros >= 2) return finish();
-        continue;
-      }
-      zeros = 0;
-      const size = octal(h.subarray(124, 136));
-      const type = String.fromCharCode(h[156] || 48);
-      const prefix = cstr(h.subarray(345, 500));
-      let name = longName ?? (prefix ? `${prefix}/${cstr(h.subarray(0, 100))}` : cstr(h.subarray(0, 100)));
-      if (type !== 'x' && type !== 'L' && type !== 'g') longName = null;
-      remaining = size;
-      padding = (512 - (size % 512)) % 512;
-      if (type === 'x' || type === 'L' || type === 'g') {
-        collect = [];
-        collectType = type;
-        if (size === 0) collect = null;
-        continue;
-      }
-      name = name.replace(/\/+$/, '');
-      const path = safe(name);
-      if (type === '5') {
-        if (path) mkdirSync(path, { recursive: true });
-        continue;
-      }
-      if ((type !== '0' && type !== '7') || !path) {
-        if (name) stats.skipped.push(name);
-        continue; // links, devices, unsafe paths: the data that follows is skipped
-      }
-      stats.files++;
-      stats.bytes += size;
-      if (stats.files > limits.files) throw new Error(`too many files (over ${limits.files.toLocaleString()})`);
-      if (stats.bytes > limits.bytes) throw new Error(`too large (over ${Math.round(limits.bytes / 1024 ** 2)} MB unpacked)`);
-      mkdirSync(dirname(path), { recursive: true });
-      const mode = octal(h.subarray(100, 108)) & 0o111 ? 0o755 : 0o644;
-      fd = openSync(path, 'w', mode);
-      if (size === 0) {
-        closeSync(fd);
-        fd = null;
       }
     }
+    return finish();
   }
-  return finish();
 
   function finish() {
     if (fd !== null) closeSync(fd);

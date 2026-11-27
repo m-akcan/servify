@@ -52,7 +52,7 @@ const lock = new KeyedLock();
 function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promise<string | null> {
   return new Promise((resolve) => {
     log(`▸ Retrying pull with the docker CLI (uses your docker login credentials)`);
-    const child = spawn('docker', ['pull', ref], { env: { ...process.env, DOCKER_HOST: d.hostEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('docker', ['pull', '--', ref], { env: { ...process.env, DOCKER_HOST: d.hostEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
     let last = '';
     const onData = (err: boolean) => (b: Buffer) => {
       for (const l of b.toString('utf8').split(/\r?\n/)) {
@@ -133,6 +133,8 @@ function logger(dep: Deployment) {
   let ws = logStreams.get(dep.id);
   if (!ws) {
     ws = createWriteStream(deploymentLogPath(dep.id), { flags: 'a' });
+    // A full disk must not take the whole process down (an unhandled stream error would): the log just stops.
+    ws.on('error', (e) => console.error(`[deploy] log of ${dep.id} can't be written: ${e.message}`));
     logStreams.set(dep.id, ws);
   }
   const stream = ws;
@@ -168,7 +170,8 @@ function sourceLabel(svc: Service): string {
   if (s.type === 'redirect') return `→ ${s.to}`;
   if (s.type === 'image') return s.image;
   if (s.type === 'upload') return `upload${s.label ? ` · ${s.label}` : ''}`;
-  if (s.type === 'git') return `${s.repo.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '')}${s.branch ? `@${s.branch}` : ''}`;
+  // Never credentials someone put into the URL (https://user:token@host/…): the label goes into activity and notifications.
+  if (s.type === 'git') return `${s.repo.replace(/^([a-z+]+:\/\/)[^/@]*@/i, '$1').replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '')}${s.branch ? `@${s.branch}` : ''}`;
   return (s as any).path;
 }
 

@@ -425,6 +425,9 @@ function trackUpgrade(req: http.IncomingMessage, socket: net.Socket, svc: Servic
 }
 
 function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer, proto: 'http' | 'https' = 'http') {
+  // Node hands over upgraded sockets without an error listener: a client that resets the connection while we
+  // answer (redirect, 503, a service waking up) would otherwise crash the whole process.
+  if (!socket.listenerCount('error')) socket.on('error', () => socket.destroy());
   const svc = lookup(req.headers.host);
   if (!svc) return socket.destroy();
   const access = trackUpgrade(req, socket, svc);
