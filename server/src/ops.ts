@@ -11,7 +11,7 @@ import { imageUpdateOf, checkService, checkTarget, isBuild, parseRepo, remoteDig
 import { projects as projectsTable, services as servicesTable, deployments as deploymentsTable, activityTable, db, volumesTable, backupsTable } from './db.ts';
 import type { Project, Service, Deployment, Source, SourceUpload, Replica } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
-import { id, slugify, secret, HttpError, assert } from './util.ts';
+import { id, slugify, secret, HttpError, assert, splitRepoCredentials } from './util.ts';
 import { getTemplate, templates } from './templates.ts';
 import { queueDeployment, readDeploymentLog, isDeploying } from './deployer.ts';
 import { replicasOf, requestReconcile, drainAndRemove, effectiveReplicas, networkName, deployedSchedule } from './engine.ts';
@@ -32,7 +32,7 @@ import { allocateTcpPort, tcpPortInUse, portFree } from './proxy.ts';
 import { normalizeRepo } from './builder.ts';
 import { metricsHistory } from './metrics.ts';
 import { config } from './config.ts';
-import { validateCron, nextRun } from './cron.ts';
+import { validateCron, nextRun, validTimeZone } from './cron.ts';
 import { runJob, listRuns, isJobRunning, killJobs } from './cronjobs.ts';
 
 const PROJECT_COLORS = ['#d4f25a', '#7ce0c3', '#f2a65a', '#9fb4ff', '#f27a9b', '#c9a7ff', '#5ad1f2'];
@@ -68,7 +68,7 @@ export function serializeService(s: Service, view: View = { revealSecrets: true 
   });
   const live = deployedSchedule(s);
   out.deployedSchedule = live;
-  out.nextRunAt = live && !s.stopped ? nextRun(live)?.getTime() ?? null : null;
+  out.nextRunAt = live && !s.stopped ? nextRun(live, new Date(), s.scheduleTz)?.getTime() ?? null : null;
   out.jobRunning = isJobRunning(s.id);
   out.backupMethod = backupMethod(s);
   out.clusterStatus = clusterStatus(s);
@@ -238,7 +238,7 @@ export async function deleteProject(actor: Actor, projectId: string) {
   const p = getProjectOrThrow(projectId);
   // A base project takes its environments (and previews) with it.
   if (!p.parentId) for (const env of projectsTable.all().filter((x) => x.parentId === p.id)) await deleteProject(actor, env.id);
-  for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true });
+  for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true, deleteVolumes: true }); // a project goes with its data
   await deleteProjectVolumes(p.id);
   projectsTable.delete(p.id);
   bus.publish({ type: 'project.deleted', projectId: p.id });
@@ -274,7 +274,8 @@ export const createServiceInput = z.object({
   rootDir: z.string().optional().describe('Subdirectory inside the repo/folder to build from'),
   dockerfile: z.string().optional().describe('Path to a Dockerfile relative to the root dir'),
   token: z.string().optional().describe('Access token for private git repositories'),
-  path: z.string().optional().describe('Absolute path of a local folder to build (local-first!)'),
+  gitUser: z.string().optional().describe('User name sent with the token (default x-access-token)'),
+  path: z.string().optional().describe('Absolute path of a local folder on the server to build. Owner only: an agent token cannot create a path source or change its folder or Dockerfile (it can redeploy one and change its other settings).'),
   upload: z.boolean().optional().describe('Code comes from `servify up` (the service waits for the first upload)'),
   port: z.number().int().min(1).max(65535).optional().describe('Port the app listens on inside the container'),
   protocol: z.enum(['http', 'tcp', 'none']).optional().describe('http = routed by domain, tcp = raw TCP, none = background worker'),
@@ -358,7 +359,8 @@ function placeNew(projectId: string): { x: number; y: number } {
   return { x: svcs.length * 40, y: svcs.length * 40 };
 }
 
-export async function createService(actor: Actor, projectId: string, raw: CreateServiceInput) {
+/** `trustedPath`: the local folder comes from an existing service or from Servify itself (a copy, the demo), not from the caller. */
+export async function createService(actor: Actor, projectId: string, raw: CreateServiceInput, opts: { trustedPath?: boolean } = {}) {
   const input = createServiceInput.parse(raw);
   const project = getProjectOrThrow(projectId);
   const tpl = input.templateId ? getTemplate(input.templateId) : null;
@@ -366,17 +368,25 @@ export async function createService(actor: Actor, projectId: string, raw: Create
   let source: Source;
   if (tpl) source = { type: 'image', image: tpl.image };
   else if (input.image) source = { type: 'image', image: input.image.trim() };
-  else if (input.repo)
+  else if (input.repo) {
+    // Credentials typed into the URL (https://user:token@host/repo) are stored as the sealed token, not in the URL.
+    const cred = splitRepoCredentials(input.repo);
+    const user = input.gitUser ?? (input.token?.trim() ? cred.user || undefined : cred.user);
     source = {
       type: 'git',
-      repo: normalizeRepo(input.repo),
+      repo: normalizeRepo(cred.repo),
       branch: input.branch?.trim() || undefined,
       rootDir: input.rootDir?.trim() || undefined,
       dockerfile: input.dockerfile?.trim() || undefined,
-      token: input.token?.trim() || undefined,
+      token: input.token?.trim() || cred.token || undefined,
+      ...(user !== undefined ? { user } : {}),
     };
-  else if (input.path) source = { type: 'local', path: input.path.trim(), dockerfile: input.dockerfile?.trim() || undefined };
-  else if (input.upload) source = { type: 'upload', uploadId: null, uploadedAt: null, files: 0, bytes: 0 };
+  }
+  else if (input.path) {
+    // Any folder of this machine can be the build context (and so end up in an image): the owner's call, like host folders.
+    if (!opts.trustedPath) requireOwner(actor, LOCAL_PATH);
+    source = { type: 'local', path: input.path.trim(), dockerfile: input.dockerfile?.trim() || undefined };
+  } else if (input.upload) source = { type: 'upload', uploadId: null, uploadedAt: null, files: 0, bytes: 0 };
   else if (input.external) {
     // The router can reach anything this machine can: pointing it somewhere is the owner's call.
     requireOwner(actor, 'External routes');
@@ -568,6 +578,7 @@ export const updateServiceInput = z.object({
     .optional()
     .describe('Database cluster settings: failoverAfterSec (0 = manual only), synchronous replication. Use switchover to change the primary.'),
   schedule: z.string().nullable().optional().describe('Cron expression (e.g. "*/15 * * * *", "@daily"). Turns the service into a scheduled job; null to clear.'),
+  scheduleTz: z.string().max(64).nullable().optional().describe('Time zone the schedule is read in, e.g. "Europe/Berlin" or "UTC". null or empty = the server\'s local time.'),
   x: z.number().optional(),
   y: z.number().optional(),
 });
@@ -577,9 +588,11 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   const patch = updateServiceInput.parse(raw);
   const svc = getServiceOrThrow(serviceId);
   const changes: string[] = [];
+  const touched = new Set<keyof Service>(); // the fields this update writes (see the end)
   const set = <K extends keyof Service>(k: K, v: Service[K], label: string = k) => {
     if (JSON.stringify(svc[k]) !== JSON.stringify(v)) {
       svc[k] = v;
+      touched.add(k);
       changes.push(label);
     }
   };
@@ -606,25 +619,41 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.image !== undefined) set('source', { type: 'image', image: patch.image.trim() }, 'source');
   if (patch.repo !== undefined || (svc.source.type === 'git' && (patch.branch !== undefined || patch.rootDir !== undefined || patch.dockerfile !== undefined || patch.token !== undefined))) {
     const prev = svc.source.type === 'git' ? svc.source : null;
+    // Credentials in a new URL become the sealed token (unless a token is given too); otherwise the old ones stay.
+    const cred = patch.repo ? splitRepoCredentials(patch.repo) : null;
+    const givenToken = patch.token === '••••••••' ? undefined : patch.token;
+    const user = cred?.token && givenToken === undefined ? cred.user : cred?.user || prev?.user;
     set(
       'source',
       {
         type: 'git',
-        repo: patch.repo ? normalizeRepo(patch.repo) : prev?.repo ?? '',
+        repo: cred ? normalizeRepo(cred.repo) : prev?.repo ?? '',
         branch: (patch.branch ?? prev?.branch) || undefined,
         rootDir: (patch.rootDir ?? prev?.rootDir) || undefined,
         dockerfile: (patch.dockerfile ?? prev?.dockerfile) || undefined,
-        token: patch.token === '••••••••' ? prev?.token : (patch.token ?? prev?.token) || undefined,
+        token: (givenToken ?? cred?.token ?? prev?.token) || undefined,
+        ...(user !== undefined ? { user } : {}),
       },
       'source',
     );
   }
-  if (patch.path !== undefined) set('source', { type: 'local', path: patch.path.trim(), dockerfile: patch.dockerfile || undefined }, 'source');
+  if (patch.path !== undefined) {
+    const next: Source = { type: 'local', path: patch.path.trim(), dockerfile: patch.dockerfile || undefined };
+    // Only a new folder or Dockerfile needs the owner: an agent can still update everything else and redeploy.
+    if (JSON.stringify(next) !== JSON.stringify(svc.source)) requireOwner(actor, LOCAL_PATH);
+    set('source', next, 'source');
+  }
   if (patch.port !== undefined) set('port', patch.port, 'port');
   if (patch.protocol !== undefined) {
     set('protocol', patch.protocol, 'protocol');
-    if (patch.protocol === 'tcp' && !svc.publicTcpPort && patch.publicTcpPort === undefined) svc.publicTcpPort = await allocateTcpPort();
-    if (patch.protocol === 'http' && patch.publicHttp === undefined) svc.publicHttp = true;
+    if (patch.protocol === 'tcp' && !svc.publicTcpPort && patch.publicTcpPort === undefined) {
+      svc.publicTcpPort = await allocateTcpPort();
+      touched.add('publicTcpPort');
+    }
+    if (patch.protocol === 'http' && patch.publicHttp === undefined) {
+      svc.publicHttp = true;
+      touched.add('publicHttp');
+    }
   }
   if (patch.volumes !== undefined) {
     patch.volumes = checkMounts(actor, svc, patch.volumes);
@@ -721,6 +750,11 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     }
     set('schedule', sched, 'schedule');
   }
+  if (patch.scheduleTz !== undefined) {
+    const tz = patch.scheduleTz?.trim() || null;
+    if (tz && !validTimeZone(tz)) throw new HttpError(400, `unknown time zone: ${tz} (use a name like Europe/Berlin or UTC)`);
+    set('scheduleTz', tz, 'schedule time zone');
+  }
   if (patch.icon === undefined && (changes.includes('schedule') || changes.includes('source'))) {
     const base = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId)?.baseImage?.ref : null;
     const icon = betterIcon(svc, base);
@@ -730,6 +764,13 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
   if (patch.x !== undefined) svc.x = Math.round(patch.x);
   if (patch.y !== undefined) svc.y = Math.round(patch.y);
   if (!changes.length && !moved) return serializeService(svc);
+  if (moved) touched.add('x').add('y');
+  // The port checks above waited on the network. Whatever changed on the record meanwhile (a deploy going live, a
+  // cluster failover moving the primary, the service falling asleep) must stay: only this update's fields are written.
+  const cur = servicesTable.get(svc.id);
+  if (!cur) throw new HttpError(404, `${svc.name} was deleted meanwhile`);
+  for (const k of new Set([...Object.keys(cur), ...Object.keys(svc)]) as Set<keyof Service>) if (!touched.has(k)) (svc as any)[k] = (cur as any)[k];
+  if (touched.has('cluster') && svc.cluster && cur.cluster) svc.cluster = { ...svc.cluster, primary: cur.cluster.primary }; // settings change; the primary is the cluster's to decide
   svc.updatedAt = Date.now();
   servicesTable.put(svc);
   if (changes.includes('volumes')) syncServiceVolumes(svc);
@@ -744,6 +785,8 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
 function notExternal(svc: Service, what: string) {
   if (isRoute(svc)) throw new HttpError(400, `${svc.name} is ${svc.source.type === 'redirect' ? `a redirect to ${(svc.source as any).to}` : `a route to ${(svc.source as any).url}`} — there's nothing to ${what} here`);
 }
+
+const LOCAL_PATH = 'Building from a folder of this machine';
 
 /** Host folders, published ports and external routes reach outside the container sandbox: the owner decides. */
 export function requireOwner(actor: Actor, what: string) {
@@ -1184,7 +1227,8 @@ export function startService(actor: Actor, serviceId: string) {
   return { service: serializeService(svc), deployment: null };
 }
 
-export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; keepVolumes?: boolean } = {}) {
+/** Deletes the service. Its volumes stay as detached volumes (data intact) unless `deleteVolumes` is set. */
+export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; deleteVolumes?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   assert(isOnline(nodeOf(svc)), 409, `${svc.name} runs on ${nodeName(nodeOf(svc))}, which is offline — bring it back online before deleting`);
   servicesTable.delete(svc.id);
@@ -1199,7 +1243,7 @@ export async function deleteService(actor: Actor, serviceId: string, opts: { qui
     const left = await d.listContainers([`servify.service=${svc.id}`]).catch(() => []); // service ids are globally unique
     await Promise.all(left.map((c) => d.removeContainer(c.Id, true)));
   }
-  await releaseServiceVolumes(svc, !!opts.keepVolumes);
+  await releaseServiceVolumes(svc, !opts.deleteVolumes);
   for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) {
     if (d.image?.startsWith('servify/') && isOnline(nodeOf(svc))) await dockerFor(nodeOf(svc)).removeImage(d.image);
     deploymentsTable.delete(d.id);
@@ -1335,7 +1379,7 @@ export async function seedDemo(actor: Actor, projectId: string) {
   const redis = await createService(actor, project.id, { templateId: 'redis', x: 380, y: 200 });
   created.push(redis.service.id);
   if (existsSync(examples)) {
-    const api = await createService(actor, project.id, { path: examples, name: 'api', replicas: 2, x: 0, y: 200, env: { REDIS_URL: '${{ redis.REDIS_URL }}' } });
+    const api = await createService(actor, project.id, { path: examples, name: 'api', replicas: 2, x: 0, y: 200, env: { REDIS_URL: '${{ redis.REDIS_URL }}' } }, { trustedPath: true });
     created.push(api.service.id);
     await updateService(actor, api.service.id, { healthcheck: { path: '/healthz' } }, { quiet: true });
   }
@@ -1404,14 +1448,14 @@ export async function duplicateService(actor: Actor, serviceId: string) {
     deploy: false,
   };
   if (s.type === 'image') input.image = s.image;
-  else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token });
+  else if (s.type === 'git') Object.assign(input, { repo: s.repo, branch: s.branch, rootDir: s.rootDir, dockerfile: s.dockerfile, token: s.token, gitUser: s.user });
   else if (s.type === 'external') Object.assign(input, { external: s.url, udp: s.udp });
   else if (s.type === 'redirect') Object.assign(input, { redirect: s.to, redirectCode: s.code, keepPath: s.keepPath });
   else if (s.type === 'upload') input.upload = true;
   else Object.assign(input, { path: s.path, dockerfile: s.dockerfile });
-  const r = await createService(actor, src.projectId, input);
+  const r = await createService(actor, src.projectId, input, { trustedPath: true }); // the same folder as the original
   if (s.type === 'upload' && s.uploadId) copyUpload(src.id, r.service.id, s);
-  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, accessLog: src.accessLog !== false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
+  await updateService(actor, r.service.id, { volumes: portableMounts(actor, src.nodeId, structuredClone(src.volumes), []).map(({ volumeId, ...v }) => v), healthcheck: src.healthcheck, strategy: src.strategy, secretKeys: src.secretKeys, resources: src.resources, schedule: src.schedule ?? null, scheduleTz: src.scheduleTz ?? null, cmd: src.cmd ?? null, entrypoint: src.entrypoint ?? null, buildArgs: src.buildArgs ?? null, buildTarget: src.buildTarget ?? null, watchPaths: src.watchPaths ?? null, preDeployCommand: src.preDeployCommand ?? null, imageAutoUpdate: src.imageAutoUpdate ?? false, accessLog: src.accessLog !== false, ...(src.sleepAfterMinutes ? { sleepAfterMinutes: src.sleepAfterMinutes } : {}) }, { quiet: true });
   const svc = servicesTable.get(r.service.id)!;
   if (src.templateId) {
     svc.templateId = src.templateId;
@@ -1433,7 +1477,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'accessLog', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'accessLog', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'scheduleTz', 'backup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1458,8 +1502,10 @@ export function exportProject(projectId: string, opts: { secrets?: boolean } = {
   };
 }
 
-export async function importProject(actor: Actor, spec: ProjectSpec, opts: { deploy?: boolean; name?: string } = {}) {
+export async function importProject(actor: Actor, spec: ProjectSpec, opts: { deploy?: boolean; name?: string; trustedPaths?: boolean } = {}) {
   assert(spec && spec.servify === 1 && Array.isArray(spec.services), 400, 'not a servify project spec (expected {"servify":1, "services":[…]})');
+  // Checked before anything is created (see createService); environment copies of an existing project are trusted.
+  if (!opts.trustedPaths && spec.services.some((s) => s?.source?.type === 'local')) requireOwner(actor, LOCAL_PATH);
   const project = createProject(actor, { name: opts.name ?? spec.name ?? 'imported', color: spec.color });
   const tpls = new Map(templates.map((t) => [t.id, t]));
   const created: Service[] = [];
@@ -1472,7 +1518,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
     const input: CreateServiceInput = { name: raw.name, deploy: false, x: raw.x, y: raw.y };
     if (tpl) input.templateId = tpl.id;
     else if (src.type === 'image') input.image = src.image;
-    else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile, token: src.token });
+    else if (src.type === 'git') Object.assign(input, { repo: src.repo, branch: src.branch, rootDir: src.rootDir, dockerfile: src.dockerfile, token: src.token, gitUser: (src as any).user });
     else if (src.type === 'external') Object.assign(input, { external: src.url, udp: src.udp });
     else if (src.type === 'redirect') Object.assign(input, { redirect: src.to, redirectCode: src.code, keepPath: src.keepPath });
     else if (src.type === 'upload') input.upload = true;
@@ -1482,7 +1528,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
     // Same server as the original when it exists here (environments keep services together); otherwise this machine.
     const server = (raw as any).server as string | undefined;
     if (server && (nodesTable.get(server) || nodesTable.all().some((n) => n.name.toLowerCase() === server.toLowerCase()))) input.server = server;
-    const r = await createService(actor, project.id, input);
+    const r = await createService(actor, project.id, input, { trustedPath: opts.trustedPaths });
     const svc = servicesTable.get(r.service.id)!;
     if (tpl && src.type === 'image' && src.image !== tpl.image) svc.source = { type: 'image', image: src.image };
     // Spec values win, except blanked secrets (exports strip them): keep the freshly generated ones.
@@ -1512,6 +1558,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       resources: { ...svc.resources, ...(raw.resources ?? {}) },
       autoDeploy: def(raw.autoDeploy, svc.autoDeploy),
       schedule: raw.schedule ?? null,
+      scheduleTz: raw.scheduleTz && validTimeZone(raw.scheduleTz) ? raw.scheduleTz : null,
       backup: raw.backup ?? null,
       aliases: (raw.aliases ?? []).filter((a) => /^[a-z0-9]([a-z0-9_.-]*[a-z0-9])?$/.test(a)),
       cmd: raw.cmd ?? null,

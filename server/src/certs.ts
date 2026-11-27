@@ -332,7 +332,28 @@ export function sniCallback(servername: string, cb: (err: Error | null, ctx?: tl
     }
     return cb(null, ctx);
   }
-  localLeaf(host).then((ctx) => cb(null, ctx), (e) => cb(e));
+  // A certificate of the local CA only for names that are routed here (and for localhost and plain addresses):
+  // any other name a client asks for gets the localhost one instead of a freshly signed certificate of its own.
+  const known = host === 'localhost' || /^\d+\.\d+\.\d+\.\d+$/.test(host) || routedHosts().has(host);
+  localLeaf(known ? host : 'localhost').then((ctx) => cb(null, ctx), (e) => cb(e));
+}
+
+let routed: Set<string> | null = null;
+bus.subscribe((ev) => {
+  if (ev.type === 'service.updated' || ev.type === 'service.deleted' || ev.type === 'project.updated' || ev.type === 'project.deleted') routed = null;
+});
+/** Every host name the router answers for (as in proxy.ts): generated names and custom domains of HTTP services. */
+function routedHosts(): Set<string> {
+  if (routed) return routed;
+  const hosts = new Set<string>();
+  const projects = new Map(projectsTable.all().map((p) => [p.id, p]));
+  for (const s of servicesTable.all()) {
+    if (s.protocol !== 'http') continue;
+    for (const d of s.domains) hosts.add(d.toLowerCase());
+    const p = projects.get(s.projectId);
+    if (p && s.publicHttp) hosts.add(`${s.slug}.${p.slug}.${config.baseDomain}`.toLowerCase());
+  }
+  return (routed = hosts);
 }
 
 export async function defaultContextOptions(): Promise<{ key: string; cert: string }> {

@@ -241,6 +241,17 @@ export async function installUpdate(actor: Actor, wanted?: string | null): Promi
   }
 }
 
+/**
+ * A start that failed for a reason the previous version would share (Docker isn't running) is not the new
+ * version's fault: it must not count towards the three attempts after which the update is rolled back.
+ */
+export function uncountUpdateAttempt() {
+  const m = readMarker();
+  if (m?.state !== 'switched' || m.to !== config.version || !(m.attempts > 0)) return;
+  m.attempts--;
+  writeMarker(m);
+}
+
 /** On start: confirm a fresh update once healthy, and report how the last one ended. */
 export function settleUpdate(healthy: { docker: boolean }) {
   const m = readMarker();

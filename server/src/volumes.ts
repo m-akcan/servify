@@ -78,7 +78,7 @@ async function assertRemotePath(d: DockerClient, src: string) {
   } catch (e) {
     throw new HttpError(400, `${src} doesn't exist on that server (${(e as Error).message})`);
   } finally {
-    if (cid) await d.removeContainer(cid, true).catch(() => {});
+    if (cid) await d.removeContainer(cid, true, true).catch(() => {});
   }
 }
 

@@ -8,7 +8,7 @@ import { latestCommit } from './builder.ts';
 import { isDeploying } from './deployer.ts';
 import { dockerFor, nodeOf, isOnline } from './nodes.ts';
 import { db } from './db.ts';
-import { readdirSync, unlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, readdirSync, statSync, truncateSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from './config.ts';
 import { backfillDatabaseKinds } from './backups.ts';
@@ -62,7 +62,7 @@ async function gitWatch() {
     if (!latestDep || ['queued', 'building', 'deploying'].includes(latestDep.status)) continue;
     const lastSha = deps.find((d) => d.commitSha)?.commitSha;
     if (!lastSha) continue;
-    const head = await latestCommit(svc.source.repo, svc.source.branch, svc.source.token);
+    const head = await latestCommit(svc.source.repo, svc.source.branch, svc.source.token, svc.source.user);
     if (!head || head === lastSha) continue;
     if (deps.some((d) => d.commitSha === head && d.status === 'failed')) continue; // don't loop on a broken commit
     if (svc.watchPaths?.length) {
@@ -80,13 +80,23 @@ async function gitWatch() {
 }
 
 async function imageGc() {
-  // Keep the 5 most recent built images per service for instant rollbacks.
+  // Keep the built images of the 5 most recent deployments that went live, for instant rollbacks. Failed builds don't
+  // count towards the five (a run of failures would push every working image out); the newest failed one stays
+  // for a look, and so does anything still in flight.
   for (const svc of servicesTable.all()) {
     const deps = deploymentsTable.all('WHERE service_id = ? ORDER BY created_at DESC', svc.id).filter((d) => d.image?.startsWith('servify/'));
-    const keep = new Set(deps.slice(0, 5).map((d) => d.image));
+    const live = deps.filter((d) => d.status === 'active' || d.status === 'superseded');
+    const keep = new Set<string | null | undefined>(live.slice(0, 5).map((d) => d.image));
     if (svc.activeDeploymentId) keep.add(deploymentsTable.get(svc.activeDeploymentId)?.image ?? null);
+    for (const d of deps) if (d.status === 'queued' || d.status === 'building' || d.status === 'deploying') keep.add(d.image);
+    keep.add(deps.find((d) => d.status === 'failed')?.image);
     if (!isOnline(nodeOf(svc))) continue;
-    for (const d of deps.slice(5)) if (d.image && !keep.has(d.image)) await dockerFor(nodeOf(svc)).removeImage(d.image);
+    const gone = new Set<string>();
+    for (const d of deps) {
+      if (!d.image || keep.has(d.image) || gone.has(d.image)) continue;
+      gone.add(d.image);
+      await dockerFor(nodeOf(svc)).removeImage(d.image);
+    }
   }
 }
 
@@ -105,10 +115,40 @@ function housekeeping() {
   }
 }
 
+const OWN_LOG_MAX = (Number(process.env.SERVIFY_OWN_LOG_MAX_MB) || 20) * 1024 * 1024;
+/**
+ * Servify's own log, written by the login service (launchd / systemd append our output to it): once it passes
+ * 20 MB, keep it as servify.log.1 and start over. The file stays open on our side, so it is copied and emptied
+ * rather than renamed.
+ */
+function rotateOwnLog() {
+  if (process.env.SERVIFY_SUPERVISED !== '1') return; // run by hand: the output goes to the terminal
+  const file = join(config.logsDir, 'servify.log');
+  try {
+    if (!existsSync(file) || statSync(file).size < OWN_LOG_MAX) return;
+    copyFileSync(file, `${file}.1`);
+    truncateSync(file, 0);
+    console.log(`[logs] servify.log passed ${Math.round(OWN_LOG_MAX / 1024 / 1024)} MB: the older part is in servify.log.1`);
+  } catch (e) {
+    console.error('[logs] could not rotate servify.log:', (e as Error).message);
+  }
+}
+
+/** Timer bodies write to the database: a failure there (a full disk) is logged, never thrown out of the timer. */
+function safely(fn: () => void) {
+  try {
+    fn();
+  } catch (e) {
+    console.error('[housekeeping]', (e as Error).message);
+  }
+}
+
 export function startBackgroundJobs() {
-  setTimeout(() => housekeeping(), 30_000);
+  setTimeout(() => safely(rotateOwnLog), 20_000);
+  setInterval(() => safely(rotateOwnLog), 60 * 60_000);
+  setTimeout(() => safely(housekeeping), 30_000);
   setTimeout(() => void backfillDatabaseKinds().catch(() => {}), 5_000);
-  setInterval(() => housekeeping(), 60 * 60_000);
+  setInterval(() => safely(housekeeping), 60 * 60_000);
   setInterval(() => void autoscale().catch(() => {}), 10_000);
   setInterval(() => void gitWatch().catch(() => {}), 60_000);
   setInterval(() => void imageGc().catch(() => {}), 30 * 60_000);

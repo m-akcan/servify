@@ -214,11 +214,16 @@ export function buildMcpServer(principal: Principal): McpServer {
 
   server.registerTool(
     'delete_service',
-    { description: 'Delete a service, its containers, images and volumes. Irreversible.', inputSchema: { service: svcRef, keepVolumes: z.boolean().optional() }, annotations: { destructiveHint: true } },
-    wrap(async ({ service, keepVolumes }: { service: string; keepVolumes?: boolean }) => {
+    {
+      description: 'Delete a service, its containers and built images. Its volumes stay as detached volumes with their data, unless deleteVolumes is true (then the data is gone for good).',
+      inputSchema: { service: svcRef, deleteVolumes: z.boolean().optional().describe('Also delete the data in its volumes (default false)'), keepVolumes: z.boolean().optional().describe('Older name for the default; true always keeps the volumes') },
+      annotations: { destructiveHint: true },
+    },
+    wrap(async ({ service, deleteVolumes, keepVolumes }: { service: string; deleteVolumes?: boolean; keepVolumes?: boolean }) => {
       guard();
-      await ops.deleteService(actor, service, { keepVolumes });
-      return 'deleted';
+      const wipe = deleteVolumes === true && keepVolumes !== true;
+      await ops.deleteService(actor, service, { deleteVolumes: wipe });
+      return wipe ? 'deleted, with its volumes' : 'deleted (its volumes, if any, are kept as detached volumes)';
     }),
   );
 
@@ -447,7 +452,7 @@ export function buildMcpServer(principal: Principal): McpServer {
   server.registerTool(
     'import_compose',
     {
-      description: 'Create a project from a docker-compose.yml. Use dry_run first: it returns the mapped services and warnings (privileged, host networking, the Docker socket… are never honoured; host folders and taking over existing volumes need the owner in the dashboard).',
+      description: 'Create a project from a docker-compose.yml. Use dry_run first: it returns the mapped services and warnings (privileged, host networking, the Docker socket… are never honoured; host folders, build: contexts (folders of the server) and taking over existing volumes need the owner in the dashboard).',
       inputSchema: {
         yaml: z.string().describe('Contents of docker-compose.yml'),
         env: z.string().optional().describe('Contents of the .env file used for ${VAR} interpolation'),

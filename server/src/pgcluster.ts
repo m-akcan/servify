@@ -90,11 +90,16 @@ async function probeMember(r: Replica): Promise<Omit<MemberStatus, 'index' | 'co
   return { role: rec === 't' ? 'standby' : 'primary', lsn: lsn || null, streaming: Number(n) || 0 };
 }
 
-async function fence(svc: Service, index: number, why: string) {
+/**
+ * `graceful`: stop the member first and give Postgres time to shut down cleanly (its stop signal is a fast shutdown,
+ * which sends all outstanding WAL to the standbys before it exits). Without it the container is killed.
+ */
+async function fence(svc: Service, index: number, why: string, opts: { graceful?: boolean } = {}) {
   const set = holds.get(svc.id) ?? new Set<number>();
   set.add(index);
   holds.set(svc.id, set);
   const cids = replicasOf(svc.id).filter((r) => r.index === index).map((r) => r.containerId);
+  if (opts.graceful) for (const cid of cids) await Promise.resolve().then(() => dockerForContainer(cid).stopContainer(cid, 60)).catch(() => {});
   for (const cid of cids) await Promise.resolve().then(() => dockerForContainer(cid).removeContainer(cid, true)).catch(() => {});
   await drainAndRemove(cids, 0).catch(() => {});
   stateOf(svc.id).members.set(index, { index, role: 'fenced', lsn: null, lagBytes: null, streaming: null, syncState: null, containerId: null });
@@ -129,7 +134,7 @@ async function wipeMember(svc: Service, index: number) {
     const code = await d.waitContainer(cid);
     if (code !== 0) throw new Error(`wipe exited ${code}`);
   } finally {
-    await d.removeContainer(cid, true).catch(() => {});
+    await d.removeContainer(cid, true, true).catch(() => {});
   }
 }
 
@@ -164,13 +169,17 @@ async function repoint(svc: Service, primary: number) {
   }
 }
 
-async function applySyncPolicy(svc: Service, primaryCid: string, streamingStandbys: number) {
+/** `quiet`: during a deploy a standby is expected to be away for a moment: switch, but don't raise the alert. */
+async function applySyncPolicy(svc: Service, primaryCid: string, streamingStandbys: number, quiet = false) {
   const st = stateOf(svc.id);
   const want = svc.cluster!.synchronous && streamingStandbys > 0 ? 'ANY 1 (*)' : '';
-  const have = (await sql(primaryCid, 'show synchronous_standby_names')) ?? '';
-  if (have === want) return;
-  await sql(primaryCid, `alter system set synchronous_standby_names = '${want}'`);
-  await sql(primaryCid, 'select pg_reload_conf()');
+  const have = await sql(primaryCid, 'show synchronous_standby_names');
+  if (have === null) return; // couldn't ask: change nothing
+  if (have !== want) {
+    await sql(primaryCid, `alter system set synchronous_standby_names = '${want}'`);
+    await sql(primaryCid, 'select pg_reload_conf()');
+  }
+  if (quiet) return;
   const degraded = svc.cluster!.synchronous && !want;
   if (degraded && !st.degradedAsync) {
     notify({ event: 'service.crashed', level: 'error', title: `${svc.name}: no standby streaming`, message: 'Synchronous replication is paused so writes keep working. A failover now could lose the most recent commits.', projectId: svc.projectId, serviceId: svc.id });
@@ -238,9 +247,13 @@ async function bestStandby(svc: Service, exclude: number[]): Promise<Replica | n
   return best?.r ?? null;
 }
 
-async function failover(svc: Service) {
-  const st = stateOf(svc.id);
-  const old = svc.cluster!.primary;
+async function failover(stale: Service) {
+  const st = stateOf(stale.id);
+  // Decided on a probe taken a moment ago: look again before anything is fenced. A switchover or a deploy may have
+  // started (or finished) meanwhile, and the primary of record may have moved.
+  const svc = servicesTable.get(stale.id);
+  if (!svc?.cluster || svc.stopped || st.operation || busy.has(svc.id) || isRestoring(svc.id) || svc.cluster.primary !== stale.cluster!.primary) return;
+  const old = svc.cluster.primary;
   st.operation = 'failover';
   try {
     const target = await bestStandby(svc, [old]);
@@ -251,6 +264,7 @@ async function failover(svc: Service) {
       }
       return;
     }
+    if (busy.has(svc.id)) return; // a deploy started while the standbys were probed: it owns the containers
     // Fence first: the old primary must never come back writable.
     await fence(svc, old, 'primary unreachable — fencing before promotion');
     const fresh = await promote(svc, target, `primary #${old} unreachable for ${svc.cluster!.failoverAfterSec}s`, old);
@@ -282,14 +296,29 @@ export async function switchover(actor: Actor, serviceId: string, to?: number) {
     if (primary) {
       await sql(primary.containerId, 'checkpoint', 30_000);
       finalLsn = lsnToBig(await sql(primary.containerId, 'select pg_current_wal_lsn()'));
+      // Without the primary's position there is nothing to wait for: stop here, nothing has been touched yet.
+      if (finalLsn < 0n) throw new HttpError(409, `could not read the position of primary #${old} — nothing was changed, try again`);
     }
-    // A clean shutdown streams everything to the standbys before the primary exits; then fence it.
-    await fence(svc, old, 'switchover');
-    const end = Date.now() + 30_000;
+    // Stop the primary cleanly (that streams everything it has to the standbys), then remove it. It is held, so
+    // the reconciler doesn't start it again.
+    await fence(svc, old, 'switchover', { graceful: true });
+    // The target must have replayed everything it received, and at least what the primary had before it stopped.
+    let caughtUp = false;
+    const end = Date.now() + 60_000;
     while (Date.now() < end) {
-      const lsn = lsnToBig(await sql(target.containerId, 'select pg_last_wal_replay_lsn()'));
-      if (lsn >= finalLsn) break;
+      const [recv, replay] = ((await sql(target.containerId, "select coalesce(pg_last_wal_receive_lsn()::text, ''), coalesce(pg_last_wal_replay_lsn()::text, '')")) ?? '|').split('|');
+      const done = lsnToBig(replay);
+      if (done >= 0n && done >= finalLsn && done >= lsnToBig(recv)) {
+        caughtUp = true;
+        break;
+      }
       await sleep(300);
+    }
+    if (!caughtUp) {
+      // Promoting now could lose commits. The old primary's data is untouched: let it start again and stay primary.
+      release(svc, old);
+      recordActivity(SYSTEM_ACTOR, 'cluster.switchover', `${svc.name}: #${target.index} did not catch up — switchover cancelled, #${old} stays the primary`, svc.projectId, svc.id);
+      throw new HttpError(409, `#${target.index} did not catch up with the primary in time — the switchover was cancelled and #${old} starts again as the primary (no data was changed)`);
     }
     const fresh = await promote(svc, target, 'switchover', old);
     await rebuild(fresh, old);
@@ -322,8 +351,16 @@ async function tick() {
   if (running) return;
   running = true;
   try {
-    for (const svc of servicesTable.all()) {
-      if (!svc.cluster || svc.stopped || !svc.activeDeploymentId) continue;
+    for (const listed of servicesTable.all()) {
+      if (!listed.cluster) continue;
+      // Read again: managing the clusters before this one can take a while (probe timeouts, a failover), and this
+      // one's primary may have changed since the list was read.
+      const svc = servicesTable.get(listed.id);
+      if (!svc?.cluster) continue;
+      if (svc.stopped || !svc.activeDeploymentId) {
+        stateOf(svc.id).primaryDownSince = null; // stopped: the failover clock starts fresh when it runs again
+        continue;
+      }
       await manage(svc).catch((e) => console.error(`[cluster] ${svc.name}:`, (e as Error).message));
     }
   } finally {
@@ -333,14 +370,23 @@ async function tick() {
 
 async function manage(svc: Service) {
   const st = stateOf(svc.id);
-  if (st.operation) return;
+  // While something else owns the containers the primary is expected to be away: never let that time count
+  // towards a failover once it is over.
+  if (st.operation || isRestoring(svc.id)) {
+    st.primaryDownSince = null;
+    return;
+  }
   if (!isOnline(nodeOf(svc))) return; // can't see it: never fail over or fence blind
-  if (isRestoring(svc.id)) return; // a restore wipes and re-initialises every member
   const deploying = busy.has(svc.id);
   const reps = runningOf(svc);
   const held = holds.get(svc.id) ?? new Set<number>();
   const probes = new Map<number, Awaited<ReturnType<typeof probeMember>>>();
   await Promise.all(reps.map(async (r) => probes.set(r.index, await probeMember(r))));
+
+  // The probes took a moment (up to 3 s each): if an operation started or the primary of record moved meanwhile,
+  // what was just measured describes the old situation. Look again on the next tick.
+  const now = servicesTable.get(svc.id);
+  if (st.operation || !now?.cluster || now.stopped || now.cluster.primary !== svc.cluster!.primary) return;
 
   const primaryIdx = svc.cluster!.primary;
   const primaryRep = reps.find((r) => r.index === primaryIdx);
@@ -377,7 +423,10 @@ async function manage(svc: Service) {
   }
   for (const k of [...st.members.keys()]) if (k >= want && !held.has(k)) st.members.delete(k);
 
-  if (deploying) {
+  if (deploying || busy.has(svc.id)) {
+    st.primaryDownSince = null; // the roll restarts the primary: its downtime is not a failure
+    // A standby being rolled is not streaming: don't leave the primary waiting for it on every commit.
+    if (primaryOk && primaryRep) await applySyncPolicy(svc, primaryRep.containerId, repl.size, true).catch(() => {});
     if (!primaryOk && !st.alerted.has('down-while-deploying')) {
       st.alerted.add('down-while-deploying');
       console.log(`[cluster] ${svc.name}: primary #${primaryIdx} unreachable during a deploy — failover waits for the deploy`);
@@ -404,6 +453,12 @@ async function manage(svc: Service) {
     await applySyncPolicy(svc, primaryRep!.containerId, streaming);
     return;
   }
+
+  // A primary that only just started (after a deploy, a restart, a crash) may still be replaying its WAL: that is
+  // not "down". Give it the health check's grace period before the failover clock starts.
+  const startedAt = primaryRep?.startedAt ?? 0;
+  // Only before the clock runs: a primary that keeps crashing and restarting must still reach the failover.
+  if (!st.primaryDownSince && primaryRep && startedAt && Date.now() - startedAt < Math.max(30, svc.healthcheck?.graceSec ?? 0) * 1000) return;
 
   // Primary unreachable. A crash restart usually brings it back within seconds; fail over only if it doesn't.
   if (!st.primaryDownSince) console.log(`[cluster] ${svc.name}: primary #${primaryIdx} unreachable`);

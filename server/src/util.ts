@@ -73,3 +73,26 @@ export function pick<T extends object, K extends keyof T>(obj: T, keys: K[]): Pi
   for (const k of keys) if (k in obj) out[k] = obj[k];
   return out;
 }
+
+/**
+ * Credentials written into a repository URL (https://user:token@host/repo) taken out of it, so the URL can be
+ * shown and logged and the secret is stored sealed. `user` is the name that goes with the token; '' means the
+ * token itself was the user name (https://token@host/repo), which is sent that way again.
+ */
+export function splitRepoCredentials(repo: string): { repo: string; user?: string; token?: string } {
+  const m = /^(https?:\/\/)([^/@\s]+)@(.+)$/i.exec(repo.trim());
+  if (!m) return { repo };
+  const dec = (v: string) => {
+    try {
+      return decodeURIComponent(v);
+    } catch {
+      return v;
+    }
+  };
+  const at = m[2].indexOf(':');
+  const name = dec(at < 0 ? m[2] : m[2].slice(0, at));
+  const pass = at < 0 ? '' : dec(m[2].slice(at + 1));
+  const clean = `${m[1]}${m[3]}`;
+  if (pass) return { repo: clean, user: name, token: pass };
+  return name ? { repo: clean, user: '', token: name } : { repo: clean };
+}

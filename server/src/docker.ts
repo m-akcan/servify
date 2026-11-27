@@ -265,8 +265,9 @@ export function createDockerClient(target: DockerTarget) {
     stopContainer: (id: string, t = 10) => call('POST', `/containers/${id}/stop`, { query: { t }, timeout: (t + 15) * 1000 }),
     restartContainer: (id: string, t = 5) => call('POST', `/containers/${id}/restart`, { query: { t } }),
     killContainer: (id: string) => call('POST', `/containers/${id}/kill`),
-    removeContainer: (id: string, force = true) =>
-      call('DELETE', `/containers/${id}`, { query: { force, v: false } }).catch((e) => {
+    /** `volumes`: also remove the container's anonymous volumes (never named ones). For throwaway containers. */
+    removeContainer: (id: string, force = true, volumes = false) =>
+      call('DELETE', `/containers/${id}`, { query: { force, v: volumes } }).catch((e) => {
         if (e instanceof DockerError && (e.status === 404 || e.status === 409)) return;
         throw e;
       }),
@@ -363,7 +364,25 @@ export function createDockerClient(target: DockerTarget) {
 
     createVolume: (name: string, labels: Record<string, string>) =>
       call('POST', '/volumes/create', { body: { Name: name, Labels: labels } }),
-    removeVolume: (name: string) => call('DELETE', `/volumes/${name}`).catch(() => {}),
+    /**
+     * Docker can still report a volume as in use for a moment after its container was removed: try a few times
+     * before giving up, or a deleted service's data stays behind as a volume nothing points at.
+     */
+    async removeVolume(name: string) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await call('DELETE', `/volumes/${name}`);
+          return;
+        } catch (e) {
+          if (e instanceof DockerError && e.status === 404) return;
+          if (!(e instanceof DockerError && e.status === 409) || attempt >= 5) {
+            console.warn(`[docker] volume ${name} could not be removed: ${(e as Error).message}`);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+    },
 
     /** Block until the container exits; returns its exit code. */
     async waitContainer(id: string): Promise<number> {

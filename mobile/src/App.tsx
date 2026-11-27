@@ -60,9 +60,13 @@ export function App() {
           onAddServer={() => setBoot({ phase: 'connect', canCancel: true })}
           onSignedOut={async (reason) => {
             const id = boot.server.id;
-            await servers.remove(id).catch(() => {});
+            // A reason means the token stopped working (a 401, which a proxy in front of Servify can send too):
+            // only the token is forgotten, the server stays in the list and asks for the password again. Signing
+            // out by hand removes the server from this phone.
+            if (reason !== undefined) await servers.forgetToken(id).catch(() => {});
+            else await servers.remove(id).catch(() => {});
             // Keep the address so signing back in is one step.
-            setBoot({ phase: 'connect', prefill: boot.server, reason, canCancel: servers.list().length > 0 });
+            setBoot({ phase: 'connect', prefill: boot.server, reason, canCancel: servers.list().some((s) => s.id !== id) });
           }}
         />
       )}

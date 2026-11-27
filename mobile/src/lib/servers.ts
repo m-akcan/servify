@@ -55,6 +55,10 @@ export const servers = {
     write(LIST_KEY, rest);
     if (servers.activeId() === id) servers.setActive(rest[0]?.id ?? null);
   },
+  /** Signed out by the server (or by something in front of it): the saved server stays, only its token goes. */
+  async forgetToken(id: string) {
+    await secure.remove(`token:${id}`);
+  },
   token(id: string): Promise<string | null> {
     return secure.get(`token:${id}`);
   },

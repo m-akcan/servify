@@ -156,8 +156,9 @@ api.post('/auth/logout', (c) => {
 
 function bearer(c: Context): string | undefined {
   const h = c.req.header('authorization');
+  // Only the header: a token in the URL would end up in proxy logs and browser history.
   if (h?.startsWith('Bearer ')) return h.slice(7).trim();
-  return c.req.query('token') || undefined;
+  return undefined;
 }
 
 // Everything below requires a principal.
@@ -294,7 +295,9 @@ api.post('/projects/:id/services', async (c) => c.json(await ops.createService(a
 api.get('/services/:id', (c) => c.json(ops.serializeService(ops.getServiceOrThrow(c.req.param('id')), view(c))));
 api.patch('/services/:id', async (c) => c.json(await ops.updateService(actor(c), c.req.param('id'), await jsonBody(c))));
 api.delete('/services/:id', async (c) => {
-  await ops.deleteService(actor(c), c.req.param('id'), { keepVolumes: c.req.query('keepVolumes') === '1' });
+  // Volumes stay (as detached volumes) unless the caller asks for their data to go: ?deleteVolumes=1.
+  // ?keepVolumes=1 from older clients still means keep, and wins if both are sent.
+  await ops.deleteService(actor(c), c.req.param('id'), { deleteVolumes: c.req.query('deleteVolumes') === '1' && c.req.query('keepVolumes') !== '1' });
   return c.json({ ok: true });
 });
 api.post('/services/:id/duplicate', async (c) => c.json(await ops.duplicateService(actor(c), c.req.param('id')), 201));
@@ -412,17 +415,28 @@ api.get('/backups/:id/download', async (c) => {
 // ─── servers ───
 api.get('/servers', (c) => c.json(listServers()));
 api.get('/overview', async (c) => c.json(await overview()));
+// Adding, re-keying, upgrading and removing servers hands out (or takes away) control over machines: owner only.
+const serverOwner = (c: Context<Env>) => ops.requireOwner(actor(c), 'Managing servers');
 api.post('/servers', async (c) => {
+  serverOwner(c);
   const { name } = await jsonBody<{ name: string }>(c);
   return c.json(await addServer(actor(c), name ?? ''), 201);
 });
 api.patch('/servers/:id', async (c) => {
+  serverOwner(c);
   const { name } = await jsonBody<{ name: string }>(c);
   return c.json(renameServer(actor(c), c.req.param('id'), name ?? ''));
 });
-api.post('/servers/:id/token', async (c) => c.json(await rotateServerToken(actor(c), c.req.param('id'))));
-api.post('/servers/:id/agent/upgrade', async (c) => c.json(await upgradeAgent(actor(c), c.req.param('id'))));
+api.post('/servers/:id/token', async (c) => {
+  serverOwner(c);
+  return c.json(await rotateServerToken(actor(c), c.req.param('id')));
+});
+api.post('/servers/:id/agent/upgrade', async (c) => {
+  serverOwner(c);
+  return c.json(await upgradeAgent(actor(c), c.req.param('id')));
+});
 api.delete('/servers/:id', async (c) => {
+  serverOwner(c);
   await removeServer(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
@@ -661,7 +675,10 @@ api.post('/settings/notifications/channels/:id/test', async (c) => {
   ownerOnly(c);
   return c.json(await testChannel(c.req.param('id')));
 });
-api.get('/settings/notifications/deliveries', (c) => c.json(recentDeliveries(c.req.query('channel') || undefined)));
+api.get('/settings/notifications/deliveries', (c) => {
+  ownerOnly(c); // answers of the notification services, which can quote what was sent to them
+  return c.json(recentDeliveries(c.req.query('channel') || undefined));
+});
 api.post('/settings/backups/destinations', async (c) => {
   ownerOnly(c);
   return c.json(settings.upsertDestination(actor(c), await jsonBody(c)), 201);
@@ -689,7 +706,10 @@ api.delete('/settings/backups/destinations/:id', (c) => {
   settings.deleteDestination(actor(c), c.req.param('id'));
   return c.json({ ok: true });
 });
-api.get('/settings/webhooks/deliveries', (c) => c.json(recentHookDeliveries()));
+api.get('/settings/webhooks/deliveries', (c) => {
+  ownerOnly(c);
+  return c.json(recentHookDeliveries());
+});
 api.get('/services/:id/deploy-hook', (c) => {
   if (!view(c).revealSecrets) throw new HttpError(403, 'read-only tokens cannot view deploy hooks');
   const svc = ops.getServiceOrThrow(c.req.param('id'));

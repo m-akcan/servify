@@ -133,6 +133,11 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
           </button>
         )}
       </div>
+      {s.schedule && (
+        <Field label="Time zone" hint={s.scheduleTz ? `The schedule is read in ${s.scheduleTz} time. Takes effect right away.` : 'Empty = the server’s local time. A name like Europe/Berlin or UTC.'}>
+          <CommitInput mono value={s.scheduleTz ?? ''} placeholder="server time" onCommit={(v) => void patch(id(s), { scheduleTz: v.trim() || null })} />
+        </Field>
+      )}
     </>
   );
 }

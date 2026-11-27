@@ -13,10 +13,13 @@ import { deployments as deploymentsTable, services as servicesTable, projects as
 import type { Deployment, DeployTrigger, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { config } from './config.ts';
-import { id, KeyedLock } from './util.ts';
+import { id, KeyedLock, sleep } from './util.ts';
+import { isRestoring } from './backups.ts';
 import { resolveEnv } from './vars.ts';
 import {
   busy,
+  holds,
+  isHeld,
   createReplica,
   drainAndRemove,
   effectiveReplicas,
@@ -215,7 +218,7 @@ async function runPreDeploy(svc: Service, dep: Deployment, env: Record<string, s
     if (exitCode !== 0) throw new Error(`pre-deploy command failed (exit ${exitCode}) — the running version is untouched`);
     log('✓ Pre-deploy finished');
   } finally {
-    await d.removeContainer(cid, true).catch(() => {});
+    await d.removeContainer(cid, true, true).catch(() => {});
   }
 }
 
@@ -295,6 +298,13 @@ export function queueDeployment(
 }
 
 async function runDeployment(depId: string, actor: Actor) {
+  // A restore owns the service's data until it is done (it wipes the volumes): the deploy stays queued meanwhile,
+  // and can still be cancelled.
+  while (isRestoring(deploymentsTable.get(depId)?.serviceId ?? '')) await sleep(1000);
+  // A cluster failover, switchover or rebuild holds members back while it works on them: let it finish first (the
+  // deploy isn't marked as running yet, so the cluster keeps looking after itself meanwhile).
+  const clusterId = deploymentsTable.get(depId)?.serviceId ?? '';
+  if (servicesTable.get(clusterId)?.cluster) for (let i = 0; holds.get(clusterId)?.size && i < 300; i++) await sleep(1000);
   const dep = deploymentsTable.get(depId);
   if (!dep || dep.status !== 'queued') return;
   let svc = servicesTable.get(dep.serviceId);
@@ -305,6 +315,8 @@ async function runDeployment(depId: string, actor: Actor) {
   inflight.add(dep.id);
   dep.startedAt = Date.now();
   let newContainers: string[] = [];
+  // Stateful and one-at-a-time deploys stop the old version first: a failure then is an outage until it is back.
+  let stoppedOld = false;
 
   try {
     // ─── build / pull ───
@@ -446,8 +458,8 @@ async function runDeployment(depId: string, actor: Actor) {
         }
       }
       setServiceStatus(svc.id, 'running', { activeDeploymentId: dep.id, stopped: false, detectedPort: dep.port });
-      const next = nextRun(schedule);
-      log(`✓ Cron job armed — schedule "${schedule}"${next ? `, next run ${next.toLocaleString()}` : ''}`);
+      const next = nextRun(schedule, new Date(), svc.scheduleTz);
+      log(`✓ Cron job armed — schedule "${schedule}"${svc.scheduleTz ? ` (${svc.scheduleTz})` : ''}${next ? `, next run ${next.toLocaleString()}` : ''}`);
       const old = replicasOf(svc.id).map((r) => r.containerId);
       if (old.length) await drainAndRemove(old, 2000);
       recordActivity(actor, 'deployment.active', `${svc.name} armed on schedule ${schedule}`, svc.projectId, svc.id);
@@ -463,6 +475,11 @@ async function runDeployment(depId: string, actor: Actor) {
     // Shared volume → one replica, recreated. Per-replica volumes → rolled one index at a time (replica i's
     // data is never mounted by two containers). Stateless → surge.
     // Fixed host ports can't be held by two containers at once: one replica, old one stopped first.
+    if (svc.cluster) {
+      // Still (or again) held after the wait at the start: don't roll over a fenced member.
+      if (holds.get(svc.id)?.size) throw new Error('a cluster member is still fenced or being rebuilt — deploy again when the cluster is healthy');
+      svc = servicesTable.get(svc.id)!; // roll with the primary the cluster decided on
+    }
     const shared = hasSharedVolume(dep.config.volumes) || hasSharedVolume(svc.volumes) || !!dep.config.ports?.length;
     const rolling = !shared && dep.config.volumes.some((v) => v.perReplica);
     const want = shared ? 1 : Math.max(1, svc.replicas);
@@ -472,15 +489,18 @@ async function runDeployment(depId: string, actor: Actor) {
     const recreate = shared;
     if (recreate && oldContainers.length) {
       log(`▸ Stateful service: stopping ${oldContainers.length} old replica(s) before starting the new one`);
+      stoppedOld = true;
       await drainAndRemove(oldContainers, 3000);
     }
     const grace = (svc.healthcheck.graceSec || 60) * 1000;
     if (rolling) {
       log(`▸ Rolling ${want} replica${want > 1 ? 's' : ''} one at a time (each has its own volume)`);
       for (const i of rollingOrder(svc, want)) {
+        if (isHeld(svc.id, i)) throw new Error(`replica ${i} was fenced by a cluster failover during this deploy — deploy again when the cluster is healthy`);
         const old = replicasOf(svc.id).filter((r) => r.deploymentId !== dep.id && r.index === i).map((r) => r.containerId);
         if (old.length) {
           log(`▸ Replica ${i}: stopping the old version`);
+          stoppedOld = true;
           await drainAndRemove(old, 3000);
         }
         const cid = await createReplica(svc!, dep, i);
@@ -556,6 +576,7 @@ async function runDeployment(depId: string, actor: Actor) {
   } catch (e) {
     const msg = (e as Error).message || String(e);
     log(`✗ ${msg}`);
+    if (stoppedOld) log('! The previous version had been stopped for this deploy: Servify starts it again now (on data the new version may already have changed)');
     dep.status = 'failed';
     dep.error = msg;
     dep.finishedAt = Date.now();
@@ -571,7 +592,7 @@ async function runDeployment(depId: string, actor: Actor) {
       event: 'deploy.failed',
       level: 'error',
       title: `Deploy of ${svc?.name ?? 'a service'} failed`,
-      message: `${projectsTable.get(dep.projectId)?.name ?? ''}: ${msg.slice(0, 300)}${s?.activeDeploymentId ? '\nThe previous version is still serving traffic.' : ''}\n\n${tail}`.trim(),
+      message: `${projectsTable.get(dep.projectId)?.name ?? ''}: ${msg.slice(0, 300)}${!s?.activeDeploymentId ? '' : stoppedOld ? '\nThe previous version had been stopped for this deploy and is being started again — check that it came back (the new version may already have changed its data).' : '\nThe previous version is still serving traffic.'}\n\n${tail}`.trim(),
       projectId: dep.projectId,
       serviceId: dep.serviceId,
       deploymentId: dep.id,

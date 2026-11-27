@@ -43,15 +43,17 @@ function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.Pro
   });
 }
 
-function authedUrl(repo: string, token?: string): string {
+function authedUrl(repo: string, token?: string, user?: string): string {
   let url = repo.trim();
   if (/^[\w.-]+\/[\w.-]+$/.test(url)) url = `https://github.com/${url}`; // owner/repo shorthand
   if (!token) return url;
   try {
     const u = new URL(url);
-    if (u.protocol === 'https:') {
-      u.username = 'x-access-token';
-      u.password = token;
+    // http too when the credentials came out of an http:// URL (a git server on the home network).
+    if (u.protocol === 'https:' || (u.protocol === 'http:' && user !== undefined)) {
+      // '' = the token was written as the user name (https://token@host/repo): sent the same way.
+      u.username = user === '' ? token : user || 'x-access-token';
+      u.password = user === '' ? '' : token;
       return u.toString();
     }
   } catch {}
@@ -68,9 +70,9 @@ export function normalizeRepo(repo: string): string {
   return url;
 }
 
-export async function latestCommit(repo: string, branch: string | undefined, token?: string): Promise<string | null> {
+export async function latestCommit(repo: string, branch: string | undefined, token?: string, user?: string): Promise<string | null> {
   // `--`: a repository that starts with a dash must never be read as a git option (--upload-pack=… runs a command).
-  const r = await run('git', ['ls-remote', '--', authedUrl(repo, token), branch ? `refs/heads/${branch}` : 'HEAD'], {
+  const r = await run('git', ['ls-remote', '--', authedUrl(repo, token, user), branch ? `refs/heads/${branch}` : 'HEAD'], {
     env: { GIT_TERMINAL_PROMPT: '0' },
   }).catch(() => null);
   if (!r || r.code !== 0) return null;
@@ -178,7 +180,7 @@ export async function buildSource(svc: Service, project: Project, dep: Deploymen
     log(`▸ Cloning ${url}${src.branch ? ` (${src.branch})` : ''}`);
     const args = ['clone', '--depth', '1', '--single-branch'];
     if (src.branch) args.push('--branch', src.branch);
-    args.push('--', authedUrl(url, src.token), repoDir); // `--`: see latestCommit
+    args.push('--', authedUrl(url, src.token, src.user), repoDir); // `--`: see latestCommit
     const r = await run('git', args, { env: { GIT_TERMINAL_PROMPT: '0' }, onLine: log, mask: [src.token ?? ''] });
     if (r.code !== 0) throw new Error('git clone failed — check the repository URL, branch and access token');
     cleanup = true;

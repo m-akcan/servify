@@ -1,4 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
+import { splitRepoCredentials } from './util.ts';
 import { config } from './config.ts';
 import { sealJson, openJson, isSealed, open as openSealed } from './crypto.ts';
 
@@ -191,6 +193,64 @@ export function migrateAccessLog(): number {
   return n;
 }
 
+/**
+ * Boot migration: credentials written into a git URL (https://user:token@host/repo) move into the sealed token,
+ * for services and for the deployment snapshots that rollbacks rebuild from. Builds keep signing in exactly as
+ * before (same user name, same secret). Labels and activity lines that quoted such a URL are cleaned too.
+ */
+export function migrateRepoCredentials(): number {
+  let n = 0;
+  const fix = (source: any): boolean => {
+    if (source?.type !== 'git' || typeof source.repo !== 'string') return false;
+    const c = splitRepoCredentials(source.repo);
+    if (c.repo === source.repo) return false;
+    source.repo = c.repo;
+    // A separate token already replaced the URL's credentials for https (git got x-access-token:<token>), so it
+    // stays as it is. Plain http URLs were passed to git untouched: there the URL's own credentials were in use.
+    if (c.token && (!source.token || /^http:/i.test(c.repo))) {
+      source.token = c.token;
+      source.user = c.user;
+    }
+    return true;
+  };
+  const scrub = (v: string) => v.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@"\\]+@/gi, '$1');
+  const like = 'http%://%@%';
+  for (const { id } of db.prepare(`SELECT id FROM services WHERE json_extract(data, '$.source.repo') LIKE ?`).all(like) as { id: string }[]) {
+    const s = services.get(id);
+    if (s && fix(s.source)) {
+      services.put(s);
+      n++;
+    }
+  }
+  for (const { id } of db.prepare(`SELECT id FROM deployments WHERE json_extract(data, '$.config.source.repo') LIKE ? OR json_extract(data, '$.sourceLabel') LIKE ?`).all(like, '%://%@%') as { id: string }[]) {
+    const d = deployments.get(id) as any;
+    if (!d) continue;
+    const moved = fix(d.config?.source);
+    const label = typeof d.sourceLabel === 'string' ? scrub(d.sourceLabel) : d.sourceLabel;
+    if (!moved && label === d.sourceLabel) continue;
+    d.sourceLabel = label;
+    deployments.put(d);
+    n++;
+  }
+  for (const r of db.prepare(`SELECT id, data FROM activity WHERE data LIKE '%://%:%@%'`).all() as { id: string; data: string }[]) {
+    const clean = scrub(r.data);
+    if (clean === r.data) continue;
+    db.prepare('UPDATE activity SET data = ? WHERE id = ?').run(clean, r.id);
+    n++;
+  }
+  if (n) {
+    // Don't leave the old plaintext pages (and the WAL) around. Rewriting the file is only done while that is quick:
+    // this runs before the dashboard answers, and a freshly updated Servify has two minutes to come up.
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const size = (db.prepare('SELECT page_count * page_size AS b FROM pragma_page_count(), pragma_page_size()').get() as { b: number }).b;
+    if (size < 256 * 1024 * 1024) {
+      db.exec('VACUUM');
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } else console.log('  [secrets] the database is large, so its file was not rewritten: unused pages may still hold the old URLs until they are reused. Change those git tokens if that matters.');
+  }
+  return n;
+}
+
 export const tokensTable = {
   insert(rec: TokenRecord, hash: string) {
     db.prepare('INSERT INTO tokens (id, hash, data, created_at) VALUES (?, ?, ?, ?)').run(rec.id, hash, JSON.stringify(rec), rec.createdAt);
@@ -223,18 +283,28 @@ export const kv = {
   },
 };
 
+/** Session ids are stored hashed ("h:<sha256>"): reading the database must not be enough to sign in. */
+const sessionKey = (id: string) => `h:${createHash('sha256').update(id).digest('hex')}`;
+
 export const sessionsTable = {
   create(id: string, expiresAt: number) {
-    db.prepare('INSERT INTO sessions (id, expires_at) VALUES (?, ?)').run(id, expiresAt);
+    db.prepare('INSERT INTO sessions (id, expires_at) VALUES (?, ?)').run(sessionKey(id), expiresAt);
   },
   valid(id: string): boolean {
-    const r = db.prepare('SELECT expires_at FROM sessions WHERE id = ?').get(id) as { expires_at: number } | undefined;
+    const r = db.prepare('SELECT expires_at FROM sessions WHERE id = ?').get(sessionKey(id)) as { expires_at: number } | undefined;
     return !!r && r.expires_at > Date.now();
   },
   delete(id: string) {
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+    db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionKey(id));
   },
   prune() {
     db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
   },
 };
+
+/** Boot migration: sessions stored before ids were hashed keep working (the browser's cookie doesn't change). */
+export function migrateSessions(): number {
+  const rows = db.prepare(`SELECT id FROM sessions WHERE id NOT LIKE 'h:%'`).all() as { id: string }[];
+  for (const r of rows) db.prepare('UPDATE OR REPLACE sessions SET id = ? WHERE id = ?').run(sessionKey(r.id), r.id);
+  return rows.length;
+}

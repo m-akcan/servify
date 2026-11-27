@@ -7,7 +7,7 @@
  * service manager starts it again; after three failed attempts the previous folder and the database snapshot taken
  * before the switch are put back, and the old version starts instead.
  */
-import { existsSync, readFileSync, writeFileSync, renameSync, rmSync, copyFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, rmSync, copyFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -29,6 +29,16 @@ export function guardStart(here) {
     version = JSON.parse(readFileSync(join(here, '../../package.json'), 'utf8')).version;
   } catch {}
   if (version !== m.to) return; // not the version being tried (already rolled back, or started from elsewhere)
+  // Only the install that was updated is guarded: another copy of the same version started against this data
+  // directory must never count attempts or move that install's folders.
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  if (m.installDir && real(resolve(here, '../..')) !== real(m.installDir)) return;
   const save = () => writeFileSync(file, JSON.stringify(m, null, 2));
   m.attempts = (m.attempts ?? 0) + 1;
   if (m.attempts > ATTEMPTS) {
@@ -61,15 +71,33 @@ export function guardStart(here) {
 
 function rollBack(m, dataDir) {
   if (!existsSync(m.prevDir)) throw new Error(`the previous version isn't at ${m.prevDir} any more`);
+  // The database copy first, next to the database: if it can't be written (a full disk) nothing has been touched
+  // yet, and putting it in place afterwards is a rename, so the database is never left half-written.
+  const db = join(dataDir, 'servify.db');
+  const staged = `${db}.restore`;
+  const restoreDb = !!m.dbBackup && existsSync(m.dbBackup);
+  if (restoreDb) {
+    rmSync(staged, { force: true });
+    copyFileSync(m.dbBackup, staged);
+  }
   const failed = `${m.installDir}.failed`;
-  rmSync(failed, { recursive: true, force: true });
-  renameSync(m.installDir, failed);
-  renameSync(m.prevDir, m.installDir);
+  try {
+    rmSync(failed, { recursive: true, force: true });
+    renameSync(m.installDir, failed);
+    try {
+      renameSync(m.prevDir, m.installDir);
+    } catch (e) {
+      renameSync(failed, m.installDir); // keep an install in place rather than none
+      throw e;
+    }
+  } catch (e) {
+    rmSync(staged, { force: true });
+    throw e;
+  }
   m.failedDir = failed;
-  if (m.dbBackup && existsSync(m.dbBackup)) {
-    const db = join(dataDir, 'servify.db');
+  if (restoreDb) {
     for (const f of [`${db}-wal`, `${db}-shm`]) rmSync(f, { force: true });
-    copyFileSync(m.dbBackup, db);
+    renameSync(staged, db);
     m.dbRestored = true;
   }
 }

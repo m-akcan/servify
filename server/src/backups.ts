@@ -27,10 +27,14 @@ import { destinationById, type Destination } from './settings.ts';
 import { s3Delete, s3Get, s3Put } from './s3.ts';
 import { config } from './config.ts';
 import { HttpError, id, KeyedLock, sleep } from './util.ts';
-import { parseCron, cronMatches } from './cron.ts';
+import { parseCron, cronDue } from './cron.ts';
 import type { BackupMethod, BackupRecord, DatabaseKind, Service } from './types.ts';
 
 const HELPER_IMAGE = 'alpine:3.20';
+// Docker's default log driver keeps a copy of everything a container prints. For a helper that prints the archive
+// itself that is a second copy of the whole volume under /var/lib/docker until it exits. We read the output over
+// the attached stream, which doesn't need the log.
+const NO_LOG = ['--log-driver', 'none'];
 const lock = new KeyedLock();
 const tmpDir = join(config.dataDir, 'tmp');
 const SCHEDULER: Actor = { type: 'system', name: 'backup-scheduler' };
@@ -294,7 +298,7 @@ async function runBackup(svc: Service, trigger: Trigger, actor: Actor, destinati
         return src ? ['-v', `${src}:/backup/${v.name}:ro`] : [];
       });
       const out = createWriteStream(tmp);
-      const r = await cli(svc, ['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'czf', '-', '-C', '/backup', '.'], { stdout: out });
+      const r = await cli(svc, ['run', '--rm', ...NO_LOG, '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'czf', '-', '-C', '/backup', '.'], { stdout: out });
       await new Promise<void>((res) => out.end(res));
       if (r.code !== 0) throw new Error(`tar exited with ${r.code}: ${r.stderr.slice(-400)}`);
     } else {
@@ -468,11 +472,11 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
     });
     // No volumes (a database keeping its data in the container): removing the container already reset it.
     if (mounts.length) {
-      const wipe = await cli(svc, ['run', '--rm', '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
+      const wipe = await cli(svc, ['run', '--rm', ...NO_LOG, '--network', 'none', ...mounts, HELPER_IMAGE, 'sh', '-c', 'for d in /backup/*/; do find "$d" -mindepth 1 -delete; done']);
       if (wipe.code !== 0) throw new Error(`could not clear the volumes: ${wipe.stderr.slice(-300)}`);
     }
     if (b.method === 'volume') {
-      const r = await cli(svc, ['run', '--rm', '-i', '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'xzf', '-', '-C', '/backup'], { stdin: createReadStream(tmp) });
+      const r = await cli(svc, ['run', '--rm', '-i', ...NO_LOG, '--network', 'none', ...mounts, HELPER_IMAGE, 'tar', 'xzf', '-', '-C', '/backup'], { stdin: createReadStream(tmp) });
       if (r.code !== 0) throw new Error(`extracting the archive failed: ${r.stderr.slice(-400)}`);
     }
     busy.delete(svc.id);
@@ -522,6 +526,8 @@ async function runRestore(actor: Actor, svc: Service, b: BackupRecord) {
 // ───────────────────────────── schedule ─────────────────────────────
 
 let lastMinute = -1;
+/** As for cron jobs: the wall-clock minute a scheduled backup last started at (clock changes). */
+const lastFired = new Map<string, string>();
 function tick() {
   const now = new Date();
   const minute = Math.floor(now.getTime() / 60_000);
@@ -531,7 +537,10 @@ function tick() {
     const cfg = svc.backup;
     if (!cfg?.enabled || svc.stopped || !svc.activeDeploymentId) continue;
     try {
-      if (cronMatches(parseCron(cfg.schedule), now) && !isBackingUp(svc.id)) void backupService(svc, 'schedule', SCHEDULER).catch(() => {});
+      const due = cronDue(parseCron(cfg.schedule), now, null, lastFired.get(svc.id));
+      if (!due) continue;
+      lastFired.set(svc.id, due);
+      if (!isBackingUp(svc.id)) void backupService(svc, 'schedule', SCHEDULER).catch(() => {});
     } catch {}
   }
 }

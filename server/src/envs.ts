@@ -75,7 +75,7 @@ export async function createEnvironment(
     s.volumes = (s.volumes ?? []).filter((m) => !m.hostPath && !m.borrowed);
     if (branch && s.source?.type === 'git' && (!repo || repoKey(s.source.repo) === repo)) s.source = { ...s.source, branch };
   }
-  const r = await importProject(actor, spec, { deploy: false, name: base.name });
+  const r = await importProject(actor, spec, { deploy: false, name: base.name, trustedPaths: true }); // a copy of what already runs here
   const env = projectsTable.get(r.project.id)!;
   Object.assign(env, {
     parentId: base.id,

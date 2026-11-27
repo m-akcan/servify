@@ -1,7 +1,8 @@
 /** Shared domain types. Imported (type-only) by the web app too. */
 
 export type SourceImage = { type: 'image'; image: string };
-export type SourceGit = { type: 'git'; repo: string; branch?: string; rootDir?: string; dockerfile?: string; token?: string };
+/** `user`: the name sent with the token (default x-access-token); '' = the token is sent as the user name. */
+export type SourceGit = { type: 'git'; repo: string; branch?: string; rootDir?: string; dockerfile?: string; token?: string; user?: string };
 export type SourceLocal = { type: 'local'; path: string; dockerfile?: string };
 /** An address on another machine: nothing is deployed, the router just sends traffic there. */
 export type SourceExternal = {
@@ -116,6 +117,8 @@ export interface Service {
   port: number | null;
   /** Cron expression: the service runs as a scheduled one-off job instead of long-lived replicas. */
   schedule?: string | null;
+  /** IANA time zone the schedule is read in (e.g. Europe/Berlin). Empty = the server's local time. */
+  scheduleTz?: string | null;
   /** Port detected from the image on the last successful deploy (used when `port` is auto). */
   detectedPort?: number | null;
   replicas: number;

@@ -169,14 +169,16 @@ export function destinationById(id: string): Destination | null {
 
 const mask = (v: string | undefined | null) => (v ? MASK : v);
 
-function maskChannel(c: Channel): Channel {
+/** `owner`: false also hides where a channel points (an ntfy topic is all it takes to read or fake the alerts). */
+function maskChannel(c: Channel, owner = true): Channel {
   return {
     ...c,
+    ...(owner ? {} : { topic: mask(c.topic) ?? undefined, chatId: mask(c.chatId) ?? undefined }),
     // Slack/Discord/webhook URLs embed their credentials.
-    url: c.type === 'ntfy' ? c.url : mask(c.url) ?? undefined,
+    url: c.type === 'ntfy' && owner ? c.url : mask(c.url) ?? undefined,
     secret: mask(c.secret) ?? undefined,
     botToken: mask(c.botToken) ?? undefined,
-    smtp: c.smtp ? { ...c.smtp, pass: mask(c.smtp.pass) ?? undefined } : undefined,
+    smtp: c.smtp ? { ...c.smtp, pass: mask(c.smtp.pass) ?? undefined, ...(owner ? {} : { user: mask(c.smtp.user) ?? undefined }) } : undefined,
   };
 }
 
@@ -191,7 +193,7 @@ export function publicSettings(reveal: boolean) {
     https: s.https,
     // Channel and destination credentials are write-only, even for the owner; only the webhook
     // secret is shown (it has to be pasted into the git host).
-    notifications: { channels: s.notifications.channels.map(maskChannel) },
+    notifications: { channels: s.notifications.channels.map((c) => maskChannel(c, reveal)) },
     backups: { destinations: [LOCAL_DESTINATION, ...s.backups.destinations.map(maskDestination)] },
     webhooks: { secret: reveal ? s.webhooks.secret : MASK },
     alerts: s.alerts,

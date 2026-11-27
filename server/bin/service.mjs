@@ -7,12 +7,25 @@
  *         start at boot without a login.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+/** The end of a file (the log can be large): the last 8 KB are plenty for a few lines. */
+function tail(file, bytes = 8192) {
+  const fd = openSync(file, 'r');
+  try {
+    const size = fstatSync(fd).size;
+    const buf = Buffer.alloc(Math.min(bytes, size));
+    readSync(fd, buf, 0, buf.length, size - buf.length);
+    return buf.toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export async function serviceCommand(action) {
   const { autostartSpec, autostartTarget, autostartStatus, enableAutostart, disableAutostart, serviceState } = await import(pathToFileURL(join(here, '../src/autostart.ts')).href);
@@ -57,7 +70,7 @@ export async function serviceCommand(action) {
       return;
     }
     console.log(`Installed: ${st.file}\nState: ${serviceState()}${st.stale ? '\nNote: written with different settings than this shell has — run install again to update it.' : ''}\nLogs: ${st.logFile}`);
-    if (existsSync(st.logFile)) console.log(`\n${readFileSync(st.logFile, 'utf8').split('\n').slice(-6).join('\n')}`);
+    if (existsSync(st.logFile)) console.log(`\n${tail(st.logFile).split('\n').slice(-6).join('\n')}`);
     return;
   }
   console.log('usage: servify service [install | uninstall | status | print]');

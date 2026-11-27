@@ -9,7 +9,7 @@ import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from '.
 
 /** A run that outlives this is killed (a long-lived server image armed as a job by mistake, a hang…). */
 const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
-import { parseCron, cronMatches } from './cron.ts';
+import { parseCron, cronDue } from './cron.ts';
 import { notify } from './notify.ts';
 import { mountsFor, hostMountsFor } from './volumes.ts';
 
@@ -101,7 +101,7 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
     save(run);
     const latest = servicesTable.get(svc.id);
     if (latest) bus.publish({ type: 'service.updated', service: latest });
-    if (cid) await docker.removeContainer(cid, true).catch(() => {});
+    if (cid) await docker.removeContainer(cid, true, true).catch(() => {});
   }
   if (run.status === 'failed') {
     recordActivity(actor, 'job.failed', `${svc.name} run failed (exit ${run.exitCode ?? '?'})`, svc.projectId, svc.id);
@@ -126,6 +126,8 @@ export function listRuns(serviceId: string, limit = 30): JobRun[] {
 }
 
 let lastMinute = -1;
+/** The wall-clock minute each job last started at: when clocks go back, the repeated hour doesn't run it again. */
+const lastFired = new Map<string, string>();
 function tick() {
   const now = new Date();
   const minute = Math.floor(now.getTime() / 60_000);
@@ -135,7 +137,10 @@ function tick() {
     const schedule = deployedSchedule(svc);
     if (!schedule || svc.stopped || running.has(svc.id)) continue;
     try {
-      if (cronMatches(parseCron(schedule), now)) void runJob(svc, 'schedule', SCHEDULER).catch(() => {});
+      const due = cronDue(parseCron(schedule), now, svc.scheduleTz, lastFired.get(svc.id));
+      if (!due) continue;
+      lastFired.set(svc.id, due);
+      void runJob(svc, 'schedule', SCHEDULER).catch(() => {});
     } catch {}
   }
 }
@@ -145,7 +150,7 @@ export async function killJobs(serviceId: string) {
   for (const n of onlineNodes()) {
     const d = dockerFor(n);
     const list = await d.listContainers([`servify.job=true`, `${LABEL.service}=${serviceId}`]).catch(() => []);
-    await Promise.allSettled(list.map((c) => d.removeContainer(c.Id, true)));
+    await Promise.allSettled(list.map((c) => d.removeContainer(c.Id, true, true)));
   }
 }
 
@@ -154,7 +159,7 @@ export function startScheduler() {
   const local = dockerFor(null);
   void local
     .listContainers([`servify.job=true`, `${LABEL.instance}=${INSTANCE_ID}`])
-    .then((list) => Promise.allSettled(list.map((c) => local.removeContainer(c.Id, true))))
+    .then((list) => Promise.allSettled(list.map((c) => local.removeContainer(c.Id, true, true))))
     .catch(() => {});
   // Mark runs interrupted by a restart, then check the clock every few seconds.
   for (const r of runsTable.all(`WHERE json_extract(data, '$.status') = 'running'`)) {

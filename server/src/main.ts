@@ -17,7 +17,7 @@ import { startEngine } from './engine.ts';
 import { startProxy } from './proxy.ts';
 import { startMetrics } from './metrics.ts';
 import { startBackgroundJobs } from './jobs.ts';
-import { sessionsTable, migrateSealing, migrateAccessLog } from './db.ts';
+import { sessionsTable, migrateSealing, migrateAccessLog, migrateSessions, migrateRepoCredentials } from './db.ts';
 import { SealError, keySource, keyPath } from './crypto.ts';
 import { recoverInterrupted } from './deployer.ts';
 import { startScheduler } from './cronjobs.ts';
@@ -28,7 +28,7 @@ import { startLogCollector, flushLogs } from './logstore.ts';
 import { startAccessLog, flushAccessLog } from './accesslog.ts';
 import { startEnvironments } from './envs.ts';
 import { acquireLock } from './lock.ts';
-import { settleUpdate } from './updater.ts';
+import { settleUpdate, uncountUpdateAttempt } from './updater.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -57,6 +57,7 @@ async function main() {
   } catch (e) {
     const where = 'socketPath' in dockerTarget ? dockerTarget.socketPath : `${dockerTarget.host}:${dockerTarget.port}`;
     console.error(`\n  ✗ Cannot reach Docker at ${where}\n    ${(e as Error).message}\n    Start Docker (Docker Desktop, OrbStack, Colima…) or set DOCKER_HOST.\n`);
+    uncountUpdateAttempt(); // right after an update: not a reason to roll it back
     process.exit(1);
   }
 
@@ -64,6 +65,9 @@ async function main() {
     const sealed = migrateSealing();
     (await import('./volumes.ts')).migrateVolumes();
     migrateAccessLog();
+    migrateSessions();
+    const moved = migrateRepoCredentials();
+    if (moved) console.log(`  [secrets] moved credentials out of ${moved} git URL record(s) into the encrypted token`);
     if (sealed) console.log(`  [secrets] encrypted ${sealed} stored record(s) at rest`);
     if (keySource === 'created') console.log(`  [secrets] created master key ${keyPath} — back it up; secrets can't be recovered without it`);
   } catch (e) {
@@ -170,6 +174,29 @@ async function main() {
 }
 
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
+
+// A connection that a visitor, an app or an agent drops at the wrong moment surfaces as an 'error' on a socket; where
+// no listener was attached, Node turns that into an uncaught exception. That must never take the router (and every
+// site behind it) down: log it and carry on. Anything else is a real bug in an unknown state: log it clearly and
+// exit, so the service manager starts a clean process.
+const SOCKET_ERRORS = new Set(['ECONNRESET', 'EPIPE', 'ECONNABORTED', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTCONN', 'ERR_SOCKET_CLOSED']);
+function isSocketError(e: unknown): boolean {
+  const code = String((e as NodeJS.ErrnoException | null)?.code ?? '');
+  // TLS: a broken handshake or record sent by a client.
+  return SOCKET_ERRORS.has(code) || code.startsWith('ERR_SSL_') || code.startsWith('ERR_TLS_');
+}
+process.on('uncaughtException', (e, origin) => {
+  if (isSocketError(e)) {
+    console.error(`[socket] ignored a dropped connection that nothing was listening for: ${(e as NodeJS.ErrnoException).code} ${(e as Error).message}`);
+    return;
+  }
+  console.error(`\n  ✗ Servify hit an unexpected error (${origin}) and is exiting so it can be restarted cleanly:\n`, e);
+  try {
+    flushLogs();
+    flushAccessLog();
+  } catch {}
+  process.exit(1);
+});
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
     try {
