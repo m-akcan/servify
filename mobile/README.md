@@ -10,6 +10,11 @@ native Android shell.
 1. Enter the address you open the dashboard with, such as `192.168.1.20:7700` at home or your VPN
    address away from home. The app checks that it's a Servify and shows its version.
 2. Enter the owner password and a name for the phone.
+3. Or tap **Approve from dashboard** (Servify 0.3.1+, the only option when password sign-in is off
+   or limited to private networks for this phone, and offered automatically when the password is
+   refused): the app shows an 8-character code and waits up to five minutes; open Servify on a
+   signed-in device → **Settings → Security** (or the toast), compare the code and approve. The app
+   then receives its device token (`POST /api/auth/pair/start`, polling `GET /api/auth/pair/<id>`).
 
 The phone gets its own **device token** (`POST /api/auth/device`), which acts as the owner. You
 can sign it out from the app, or from the dashboard under **Settings → Security → Signed-in devices**.
@@ -169,7 +174,7 @@ npm run apk          # → android/app/build/outputs/apk/release/app-release.apk
 
 `npm run sync` builds the web part and copies it into the Android project (then
 `cd android && ./gradlew assembleDebug` for a debug build). The version comes from
-`package.json` (`0.2.0` → versionName `0.2.0`, versionCode `200`: major·10000 + minor·100 + patch). Raise it for every app release
+`package.json` (`0.2.1` → versionName `0.2.1`, versionCode `201`: major·10000 + minor·100 + patch). Raise it for every app release
 so phones accept the update (and `publish-release` accepts the APK).
 
 ### Release signing

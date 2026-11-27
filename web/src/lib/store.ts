@@ -1,4 +1,5 @@
 import { useSyncExternalStore, useRef, useEffect, useState } from 'react';
+import type { AuthStatus, PasswordSignIn, PasskeySignIn } from './signin.ts';
 import { api, sse } from './api.ts';
 import type { ActivityEntry, Deployment, ProjectListItem, Replica, ServerEvent, ServiceView, SystemInfo, Template, Project, VolumeRecord } from './types.ts';
 
@@ -33,7 +34,7 @@ export type ProjectState = {
 };
 
 type AppState = {
-  auth: { checked: boolean; setUp: boolean; authenticated: boolean; authMode: 'password' | 'none' };
+  auth: { checked: boolean; setUp: boolean; authenticated: boolean; authMode: 'password' | 'none'; passwordSignIn?: PasswordSignIn; passkeySignIn?: PasskeySignIn };
   system: SystemInfo | null;
   projects: ProjectListItem[];
   projectsLoaded: boolean;
@@ -118,7 +119,7 @@ export function useTraffic(serviceId: string | null | undefined): Traffic | null
 // ───────────────────────────── loaders ─────────────────────────────
 
 export async function checkAuth() {
-  const s = await api.get<{ setUp: boolean; authenticated: boolean; authMode: 'password' | 'none' }>('/auth/status');
+  const s = await api.get<AuthStatus>('/auth/status');
   store.set({ auth: { checked: true, ...s } });
   return s;
 }

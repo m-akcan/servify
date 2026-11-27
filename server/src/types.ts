@@ -549,7 +549,9 @@ export type ServerEvent =
   | { type: 'disk.updated'; disk: DiskState }
   | { type: 'volume.updated'; volume: VolumeRecord }
   | { type: 'volume.deleted'; volumeId: string; projectId: string }
-  | { type: 'hello'; version: string };
+  | { type: 'hello'; version: string }
+  /** A phone's sign-in request arrived or was decided: the owner's dashboard reloads the list (no payload). */
+  | { type: 'auth.pairing' };
 
 /** Another machine whose Docker runs services for this Servify (connected through `servify agent`). */
 export interface ServerNode {

@@ -10,6 +10,10 @@
  *   servify agent --join <url> --token <t> --fingerprint <fp>   let a Servify run services on this machine
  *   servify cert import <host> <fullchain.pem> <privkey.pem>   take over an existing certificate
  *   servify selftest           load the server without starting it (the updater runs this on a new release)
+ *   servify auth reset [--keep-password] [--password-stdin] [--remove-passkeys] [--sign-out-devices]
+ *                              locked out? On the Servify machine (needs the data folder): set a new owner password,
+ *                              allow password sign-in everywhere again and end every dashboard session
+ *   servify auth status        the password policy, passkeys, sessions and signed-in phones (local)
  *
  * From your own machine, against a Servify here or on a server (SERVIFY_URL + SERVIFY_TOKEN, or `servify login`):
  *   servify login [url] [--token t] · logout      save (or forget) the URL and an API token
@@ -146,6 +150,8 @@ if (CLIENT.includes(cmd) || (cmd === 'help' && CLIENT.includes(rest[0]))) {
     console.error(`${host}: ${e.message}`);
     process.exit(1);
   }
+} else if (cmd === 'auth') {
+  await authCommand(rest);
 } else if (cmd === 'agent') {
   await import(pathToFileURL(join(here, 'agent.mjs')).href);
 } else if (cmd === 'service') {
@@ -154,4 +160,95 @@ if (CLIENT.includes(cmd) || (cmd === 'help' && CLIENT.includes(rest[0]))) {
 } else {
   console.log('usage: servify <command> — run `servify help` for the list');
   process.exit(cmd === 'help' || cmd === '--help' ? 0 : 1);
+}
+
+/**
+ * `servify auth reset|status`: recovery on the Servify machine itself. Whoever can run this can read the data folder
+ * (and the master key), so it needs no password. It writes the database directly, which a running Servify reads on
+ * every sign-in, so no restart is needed.
+ */
+async function authCommand(args) {
+  const sub = args[0];
+  const flags = new Set(args.slice(1));
+  const known = ['--keep-password', '--password-stdin', '--remove-passkeys', '--sign-out-devices'];
+  const usage = 'usage: servify auth reset [--keep-password] [--password-stdin] [--remove-passkeys] [--sign-out-devices] · servify auth status';
+  if ((sub !== 'reset' && sub !== 'status') || [...flags].some((f) => !known.includes(f)) || (sub === 'status' && flags.size)) {
+    console.error(usage);
+    process.exit(1);
+  }
+  const { existsSync } = await import('node:fs');
+  const { config } = await import(pathToFileURL(join(here, '../src/config.ts')).href);
+  if (!existsSync(config.dbPath)) {
+    console.error(`No Servify data in ${config.dataDir} (set SERVIFY_DATA_DIR to the folder Servify runs with).`);
+    process.exit(1);
+  }
+  const { kv, sessionsTable, tokensTable, passkeysTable } = await import(pathToFileURL(join(here, '../src/db.ts')).href);
+  const { setPassword, PASSWORD_POLICY_KEY } = await import(pathToFileURL(join(here, '../src/auth.ts')).href);
+  const devices = () => tokensTable.list().filter((t) => t.kind === 'device');
+  if (sub === 'status') {
+    const policy = kv.get(PASSWORD_POLICY_KEY) ?? 'everywhere';
+    const keys = passkeysTable.all();
+    console.log(`data          ${config.dataDir}`);
+    console.log(`password      ${kv.get('password_hash') ? 'set' : 'not set yet'}; sign-in ${policy === 'private' ? 'from private networks only' : policy === 'off' ? 'off (passkeys only)' : 'allowed everywhere'}`);
+    console.log(`passkeys      ${keys.length ? keys.map((k) => `${k.name} (${k.rpId})`).join(', ') : 'none'}`);
+    console.log(`sessions      ${sessionsTable.count()} dashboard session(s), ${devices().length} signed-in phone(s)`);
+    return;
+  }
+  if (config.authMode === 'none') console.log('Note: SERVIFY_AUTH=none is set in this shell; the reset still applies to the data folder.');
+  if (!flags.has('--keep-password')) {
+    let pw;
+    if (flags.has('--password-stdin')) {
+      const chunks = [];
+      for await (const c of process.stdin) chunks.push(c);
+      pw = Buffer.concat(chunks).toString('utf8').split(/\r?\n/)[0];
+    } else {
+      if (!process.stdin.isTTY) {
+        console.error('No terminal to ask for the new password: use --password-stdin (or --keep-password).');
+        process.exit(1);
+      }
+      pw = await askHidden('New owner password: ');
+      const again = await askHidden('Again: ');
+      if (pw !== again) {
+        console.error('The passwords don’t match. Nothing changed.');
+        process.exit(1);
+      }
+    }
+    try {
+      setPassword(pw);
+    } catch (e) {
+      console.error(`${e.message}. Nothing changed.`);
+      process.exit(1);
+    }
+  }
+  kv.set(PASSWORD_POLICY_KEY, 'everywhere');
+  const ended = sessionsTable.deleteAll();
+  let removedKeys = 0;
+  if (flags.has('--remove-passkeys')) for (const k of passkeysTable.all()) passkeysTable.delete(k.id), removedKeys++;
+  let removedDevices = 0;
+  if (flags.has('--sign-out-devices')) for (const d of devices()) tokensTable.delete(d.id), removedDevices++;
+  const { recordActivity } = await import(pathToFileURL(join(here, '../src/events.ts')).href);
+  const what = [
+    !flags.has('--keep-password') && 'new owner password',
+    'password sign-in allowed everywhere',
+    `${ended} dashboard session(s) ended`,
+    removedKeys && `${removedKeys} passkey(s) removed`,
+    removedDevices && `${removedDevices} phone(s) signed out`,
+  ].filter(Boolean);
+  recordActivity({ type: 'user', name: 'you' }, 'auth.reset', `Sign-in reset on the Servify machine: ${what.join(', ')}`);
+  console.log(`Done: ${what.join(', ')}.`);
+  console.log('Sign in again in the dashboard. If your address was locked out after failed attempts, that lasts at most 15 minutes (restarting Servify clears it at once).');
+}
+
+function askHidden(question) {
+  return new Promise(async (done) => {
+    const { createInterface } = await import('node:readline');
+    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    const write = rl._writeToOutput?.bind(rl);
+    rl._writeToOutput = (s) => (s.includes(question) ? write?.(s) : write?.(''));
+    rl.question(question, (a) => {
+      rl.close();
+      process.stdout.write('\n');
+      done(a);
+    });
+  });
 }

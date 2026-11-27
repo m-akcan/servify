@@ -15,7 +15,7 @@ import { config } from './config.ts';
 import { docker, dockerTarget } from './docker.ts';
 import { api } from './api.ts';
 import { handleMcp } from './mcp.ts';
-import { principalFor, hostAllowed, originOk, SESSION_COOKIE } from './auth.ts';
+import { principalFor, hostAllowed, originOk, SESSION_COOKIE, SESSION_IDLE } from './auth.ts';
 import { startEngine } from './engine.ts';
 import { startProxy, clientIpOf } from './proxy.ts';
 import { hookGate, hookFailed } from './access.ts';
@@ -198,7 +198,7 @@ async function main() {
   (await import('./pgcluster.ts')).startClusters();
   (await import('./nodes.ts')).startServers();
   (await import('./external.ts')).startExternal();
-  setInterval(() => sessionsTable.prune(), 3600_000);
+  setInterval(() => sessionsTable.prune(SESSION_IDLE), 3600_000);
 
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
     void docker.ping().then((ok) => settleUpdate({ docker: !!ok }), () => settleUpdate({ docker: false }));

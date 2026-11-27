@@ -3,9 +3,15 @@ import { appHeaders, noteFeatures } from './appversion.ts';
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** The server's machine-readable reason, when it gave one (e.g. 'password_off', 'throttled'). */
+  code?: string;
+  /** Seconds to wait, for 429 answers that say so. */
+  retryAfter?: number;
+  constructor(status: number, message: string, code?: string, retryAfter?: number) {
     super(message);
     this.status = status;
+    if (code) this.code = code;
+    if (retryAfter !== undefined) this.retryAfter = retryAfter;
   }
 }
 
@@ -76,7 +82,9 @@ export async function call<T>(base: string, token: string | null, method: string
   if (!res.ok) {
     const msg = humanize(res.status, data?.error, new URL(base).host);
     if (res.status === 401 && token && !path.startsWith('/auth/device')) throw new SignedOutError(401, 'This phone was signed out of Servify. Sign in again.');
-    throw new ApiError(res.status, msg);
+    const code = typeof data?.code === 'string' ? data.code : undefined;
+    const retryAfter = typeof data?.retryAfter === 'number' && data.retryAfter > 0 ? data.retryAfter : undefined;
+    throw new ApiError(res.status, msg, code, retryAfter);
   }
   return data as T;
 }

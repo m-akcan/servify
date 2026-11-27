@@ -34,6 +34,7 @@ export type Policy = {
 const SETTINGS = 'only the owner can change instance settings';
 const TOKENS = 'only the owner can manage tokens';
 const DEVICES = 'only the owner can manage devices';
+const SIGNIN = 'only the owner can manage sign-in';
 const SERVERS = 'Managing servers can only be set by the owner in the dashboard, not with an agent token';
 
 const P = { id: 'project' } as const;
@@ -50,6 +51,12 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   'POST /auth/login': { level: 'public' },
   'POST /auth/device': { level: 'public' },
   'POST /auth/logout': { level: 'public' },
+  // Passkey sign-in (throttled per address: challenges by a token bucket, failures by the sign-in throttle).
+  'POST /auth/passkey/options': { level: 'public' },
+  'POST /auth/passkey/login': { level: 'public' },
+  // Phone pairing (pairing.ts): starts limited per address and in total, polls rate-limited per address.
+  'POST /auth/pair/start': { level: 'public' },
+  'GET /auth/pair/:pairingId': { level: 'public' },
   // A signed-in phone signs itself out (device tokens act as the owner and have write scope).
   'DELETE /auth/device': { level: 'write' },
 
@@ -198,6 +205,20 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   'POST /tokens': { level: 'owner', ownerMessage: TOKENS },
   'DELETE /tokens/:id': { level: 'owner', ownerMessage: TOKENS },
   'GET /devices': { level: 'owner', ownerMessage: DEVICES },
+  // Sign-in methods and sessions (Settings → Security). Passkeys and the password policy also need a fresh dashboard
+  // session (the handlers check); approving phones and signing out everywhere work from a signed-in phone too.
+  'GET /auth/security': { level: 'owner', ownerMessage: SIGNIN },
+  'POST /auth/reauth': { level: 'owner', ownerMessage: SIGNIN },
+  'POST /auth/passkeys/options': { level: 'owner', ownerMessage: SIGNIN },
+  'POST /auth/passkeys': { level: 'owner', ownerMessage: SIGNIN },
+  'PATCH /auth/passkeys/:id': { level: 'owner', ownerMessage: SIGNIN },
+  'DELETE /auth/passkeys/:id': { level: 'owner', ownerMessage: SIGNIN },
+  'PUT /auth/password-policy': { level: 'owner', ownerMessage: SIGNIN },
+  'POST /auth/signout-all': { level: 'owner', ownerMessage: SIGNIN },
+  'GET /auth/pairings': { level: 'owner', ownerMessage: DEVICES },
+  'POST /auth/pairings/deny-all': { level: 'owner', ownerMessage: DEVICES },
+  'POST /auth/pairings/:id/approve': { level: 'owner', ownerMessage: DEVICES },
+  'POST /auth/pairings/:id/deny': { level: 'owner', ownerMessage: DEVICES },
   'DELETE /devices/:id': { level: 'owner', ownerMessage: DEVICES },
 };
 

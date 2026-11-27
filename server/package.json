@@ -15,6 +15,7 @@
     "@hono/node-server": "^2.1.9",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@peculiar/x509": "^3.1.0",
+    "@simplewebauthn/server": "14.1.0",
     "acme-client": "^5.4.0",
     "hono": "^4.13.19",
     "nodemailer": "^10.6.0",

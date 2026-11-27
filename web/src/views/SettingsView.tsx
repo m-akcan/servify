@@ -6,6 +6,7 @@ import type { PublicCert } from '../lib/types.ts';
 import { Button, Switch, Badge, Empty, Modal, CopyButton, Field, confirmDialog, toast, toastError, Tooltip } from '../components/ui.tsx';
 import { Icon, BrandMark, type IconName } from '../components/Icon.tsx';
 import { timeAgo } from '../lib/format.ts';
+import { SignInCards } from './SecuritySignIn.tsx';
 
 // ───────────────────────────── types ─────────────────────────────
 
@@ -22,6 +23,7 @@ const EVENTS = [
   ['server.usage', 'Server disk, memory or CPU high'],
   ['image.update', 'Image update available'],
   ['servify.update', 'Servify updated (or an update failed)'],
+  ['auth.failed', 'Repeated failed sign-ins'],
 ] as const;
 type EventKey = (typeof EVENTS)[number][0];
 
@@ -1516,6 +1518,7 @@ function Security() {
   const mk = system?.masterKey as { source: 'env' | 'file' | 'created'; path: string | null } | undefined;
   return (
     <>
+      <SignInCards />
       <Card title="Secrets encryption" icon={<Icon name="lock" size={17} />} desc="Service variables, git tokens, notification credentials, storage keys and certificate keys are encrypted at rest with AES-256-GCM.">
         <dl className="kv-grid">
           <dt>Master key</dt>
@@ -1533,7 +1536,7 @@ function Security() {
       <Card title="Access" icon={<Icon name="shield" size={17} />} desc="Who can reach this Servify.">
         <ul className="plain-list">
           <li>The dashboard and API listen on <span className="mono">{system?.api.host}</span> — {system?.api.host === '127.0.0.1' ? 'only this machine' : 'reachable from your network'}.</li>
-          <li>{system?.authMode === 'none' ? 'Password login is turned off (SERVIFY_AUTH=none).' : 'An owner password protects the dashboard; sessions expire after 30 days.'}</li>
+          <li>{system?.authMode === 'none' ? 'Password login is turned off (SERVIFY_AUTH=none).' : 'The owner password and your passkeys protect the dashboard; sessions end after 7 days unused (30 days at most).'}</li>
           <li>
             Agents use API tokens — manage them on the <button className="link" onClick={() => navigate('/agents')}>Agents page</button>. Only the owner can change these settings.
           </li>

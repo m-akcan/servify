@@ -879,3 +879,23 @@ button.item:active {
   flex: none;
   margin-top: 1px;
 }
+
+/* Approve-from-dashboard sign-in: the code to compare, big and easy to read. */
+.pair-code {
+  margin-top: var(--s-5);
+  padding: 20px 14px;
+  text-align: center;
+}
+.pair-code .mono {
+  font-size: min(40px, 10.5vw);
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
+}
+.pair-wait {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: var(--s-5);
+  font-size: var(--fs-13, 13px);
+}

@@ -1,4 +1,4 @@
-import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+import { scryptSync, scrypt, randomBytes, timingSafeEqual } from 'node:crypto';
 import { kv, sessionsTable, tokensTable, projects as projectsTable, type TokenRecord } from './db.ts';
 import { id, sha256, HttpError } from './util.ts';
 import { config } from './config.ts';
@@ -7,7 +7,14 @@ import type { Actor } from './events.ts';
 import type { TokenScope } from './policy.ts';
 
 export const SESSION_COOKIE = 'servify_session';
-const SESSION_TTL = 1000 * 60 * 60 * 24 * 30;
+/** A dashboard session ends 30 days after sign-in at the latest (as it always did)… */
+export const SESSION_TTL = 1000 * 60 * 60 * 24 * 30;
+/** …and after 7 days without being used. */
+export const SESSION_IDLE = 1000 * 60 * 60 * 24 * 7;
+/** Adding or removing a passkey and changing the password policy need a sign-in or confirmation this recent. */
+export const REAUTH_WINDOW = 5 * 60_000;
+/** kv key of the password policy (signin.ts); `servify auth reset` writes it directly. */
+export const PASSWORD_POLICY_KEY = 'password_policy';
 
 export function isSetUp(): boolean {
   return config.authMode === 'none' || !!kv.get('password_hash');
@@ -35,14 +42,71 @@ export function checkPassword(pw: string): boolean {
   return !!stored && verifyPassword(pw, stored);
 }
 
+// scrypt off the main thread, a few at a time: the router shares this process, so a flood of sign-in attempts must
+// not stall every hosted site (the per-address throttle in signin.ts runs before any of this).
+const MAX_HASHING = 2;
+let hashing = 0;
+const hashQueue: (() => void)[] = [];
+async function hashSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (hashing >= MAX_HASHING) await new Promise<void>((r) => hashQueue.push(r));
+  hashing++;
+  try {
+    return await fn();
+  } finally {
+    hashing--;
+    hashQueue.shift()?.();
+  }
+}
+
+/** checkPassword without blocking the event loop. */
+export async function checkPasswordAsync(pw: string): Promise<boolean> {
+  const stored = kv.get('password_hash');
+  if (!stored || typeof pw !== 'string') return false;
+  const [saltHex, hashHex] = stored.split(':');
+  const hash = await hashSlot(
+    () => new Promise<Buffer>((resolve, reject) => scrypt(pw, Buffer.from(saltHex, 'hex'), 32, (err, key) => (err ? reject(err) : resolve(key)))),
+  );
+  return timingSafeEqual(hash, Buffer.from(hashHex, 'hex'));
+}
+
 export function createSession(): { id: string; maxAge: number } {
   const sid = randomBytes(32).toString('base64url');
   sessionsTable.create(sid, Date.now() + SESSION_TTL);
   return { id: sid, maxAge: SESSION_TTL / 1000 };
 }
 
+/**
+ * Valid: within its absolute lifetime and used in the last SESSION_IDLE. Sessions from before the idle timeout existed
+ * (no last-use time) start counting now. Use is noted at most once a minute.
+ */
 export function validSession(sid: string | undefined): boolean {
-  return !!sid && sessionsTable.valid(sid);
+  if (!sid) return false;
+  const r = sessionsTable.get(sid);
+  if (!r) return false;
+  const now = Date.now();
+  if (r.expiresAt <= now || (r.seenAt !== null && now - r.seenAt > SESSION_IDLE)) {
+    sessionsTable.delete(sid);
+    return false;
+  }
+  if (r.seenAt === null || now - r.seenAt > 60_000) sessionsTable.touch(sid, now);
+  return true;
+}
+
+/** Signed in or confirmed (password or passkey) within REAUTH_WINDOW. */
+export function sessionFresh(sid: string | undefined): boolean {
+  if (!sid || !validSession(sid)) return false;
+  const r = sessionsTable.get(sid);
+  return !!r?.reauthAt && Date.now() - r.reauthAt < REAUTH_WINDOW;
+}
+
+/** Until when the session counts as freshly confirmed (ms), or null. */
+export function sessionFreshUntil(sid: string | undefined): number | null {
+  const r = sid ? sessionsTable.get(sid) : null;
+  return r?.reauthAt ? r.reauthAt + REAUTH_WINDOW : null;
+}
+
+export function markReauthenticated(sid: string) {
+  sessionsTable.reauthed(sid);
 }
 
 export function destroySession(sid: string | undefined) {
@@ -154,15 +218,6 @@ export function principalFor(opts: { cookie?: string; bearer?: string; app?: str
   if (config.authMode === 'none') return { actor: { type: 'user', name: 'you' }, scope: 'write' };
   if (validSession(opts.cookie)) return { actor: { type: 'user', name: 'you' }, scope: 'write' };
   return null;
-}
-
-const loginAttempts: number[] = [];
-/** One limit for every way of signing in with the owner password (dashboard and app). */
-export function throttleLogin() {
-  const now = Date.now();
-  while (loginAttempts.length && now - loginAttempts[0] > 60_000) loginAttempts.shift();
-  if (loginAttempts.length > 10) throw new HttpError(429, 'too many attempts, wait a minute');
-  loginAttempts.push(now);
 }
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);

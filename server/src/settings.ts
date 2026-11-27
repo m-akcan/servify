@@ -26,6 +26,7 @@ export const NOTIFY_EVENTS = [
   'server.usage',
   'image.update',
   'servify.update',
+  'auth.failed',
 ] as const;
 export type NotifyEvent = (typeof NOTIFY_EVENTS)[number];
 
@@ -34,7 +35,7 @@ const channelSchema = z.object({
   name: z.string().min(1).max(60),
   type: z.enum(['webhook', 'slack', 'discord', 'telegram', 'ntfy', 'email']),
   enabled: z.boolean().default(true),
-  events: z.array(z.enum(NOTIFY_EVENTS)).default(['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed', 'server.usage']),
+  events: z.array(z.enum(NOTIFY_EVENTS)).default(['deploy.failed', 'service.crashed', 'job.failed', 'backup.failed', 'cert.failed', 'server.usage', 'auth.failed']),
   /** webhook / slack / discord: endpoint URL. ntfy: server URL (default https://ntfy.sh). */
   url: z.string().optional(),
   /** webhook: HMAC-SHA256 signing secret (X-Servify-Signature). ntfy: access token. */
@@ -104,6 +105,8 @@ export type Settings = {
   usageEventAdded?: boolean;
   /** …and servify.update (updates of Servify itself), when that was introduced. */
   updateEventAdded?: boolean;
+  /** …and auth.failed (bursts of failed sign-ins), when that was introduced. */
+  authEventAdded?: boolean;
 };
 
 const alertsSchema = z.object({
@@ -162,6 +165,11 @@ export function getSettings(): Settings {
   if (!cache.usageEventAdded) {
     for (const ch of cache.notifications.channels) if (ch.events.includes('service.crashed') && !ch.events.includes('server.usage')) ch.events.push('server.usage');
     cache.usageEventAdded = true;
+    save(cache);
+  }
+  if (!cache.authEventAdded) {
+    for (const ch of cache.notifications.channels) if (ch.events.includes('service.crashed') && !ch.events.includes('auth.failed')) ch.events.push('auth.failed');
+    cache.authEventAdded = true;
     save(cache);
   }
   if (!cache.updateEventAdded) {

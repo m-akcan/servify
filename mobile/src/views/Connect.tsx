@@ -4,8 +4,18 @@ import { call, answers, ApiError } from '../lib/client.ts';
 import { servers, type SavedServer } from '../lib/servers.ts';
 import { trust, fingerprintRows, commonName, type Inspection } from '../lib/trust.ts';
 import { Icon, Spinner } from '../ui/kit.tsx';
+import { PairStep } from './Pair.tsx';
 
-type Status = { app?: string; setUp: boolean; authMode: 'password' | 'none'; version: string };
+type Status = {
+  app?: string;
+  setUp: boolean;
+  authMode: 'password' | 'none';
+  version: string;
+  features?: string[];
+  /** Servify 0.3.1+: whether the password may be used from this phone's address. */
+  passwordSignIn?: { allowed: boolean; code?: string; reason?: string };
+};
+const PASSWORD_REFUSED = new Set(['password_off', 'password_private_only']);
 
 /** "Servify on Pixel 7" reads better in the dashboard's device list than "Android phone". */
 function defaultDeviceName(): string {
@@ -30,7 +40,9 @@ export function Mark({ size = 40 }: { size?: number }) {
 }
 
 export function Connect({ prefill, reason, onDone, onCancel }: { prefill?: SavedServer; reason?: string; onDone: (id: string) => void; onCancel?: () => void }) {
-  const [step, setStep] = useState<'address' | 'trust' | 'password'>('address');
+  const [step, setStep] = useState<'address' | 'trust' | 'password' | 'pair'>('address');
+  const [pairNote, setPairNote] = useState<string | null>(null);
+  const [pairKey, setPairKey] = useState(0);
   const [cert, setCert] = useState<{ url: string; host: string; hostname: string; ins: Inspection } | null>(null);
   const [address, setAddress] = useState(prefill?.url ?? '');
   const [url, setUrl] = useState('');
@@ -119,20 +131,37 @@ export function Connect({ prefill, reason, onDone, onCancel }: { prefill?: Saved
     await check();
   };
 
+  const canPair = !!status?.features?.includes('pairing');
+  const passwordAllowed = status?.passwordSignIn?.allowed !== false;
+
+  /** Store a device token (from the password or from an approval) and go on into the app. */
+  const finish = async (token: string, device: { id: string; name: string }) => {
+    const id = prefill && prefill.url === url ? prefill.id : `srv_${Date.now().toString(36)}`;
+    await servers.add({ id, url, label: new URL(url).host, version: status?.version ?? '', deviceName: device.name, deviceId: device.id, addedAt: Date.now() }, token);
+    setPassword('');
+    onDone(id);
+  };
+
+  const pair = (note: string | null) => {
+    setError(null);
+    setPassword('');
+    setPairNote(note);
+    setPairKey((k) => k + 1);
+    setStep('pair');
+  };
+
   const signIn = async () => {
     setError(null);
     if (!password) return setError('Enter your Servify password.');
     setBusy(true);
     try {
       const r = await call<{ token: string; device: { id: string; name: string } }>(url, null, 'POST', '/auth/device', { password, name: deviceName.trim() || 'Android phone' });
-      const id = prefill && prefill.url === url ? prefill.id : `srv_${Date.now().toString(36)}`;
-      await servers.add(
-        { id, url, label: new URL(url).host, version: status?.version ?? '', deviceName: r.device.name, deviceId: r.device.id, addedAt: Date.now() },
-        r.token,
-      );
-      setPassword('');
-      onDone(id);
+      await finish(r.token, r.device);
     } catch (e) {
+      if (e instanceof ApiError && e.status === 403 && e.code && PASSWORD_REFUSED.has(e.code)) {
+        setStatus((s) => (s ? { ...s, passwordSignIn: { allowed: false, code: e.code, reason: e.message } } : s));
+        if (canPair) return pair(e.message);
+      }
       setError((e as Error).message);
     } finally {
       setBusy(false);
@@ -203,11 +232,24 @@ export function Connect({ prefill, reason, onDone, onCancel }: { prefill?: Saved
               {busy ? <Spinner /> : 'Continue'}
             </button>
           </form>
+        ) : step === 'pair' ? (
+          <PairStep
+            key={pairKey}
+            url={url}
+            name={deviceName}
+            note={pairNote}
+            onApproved={finish}
+            onCancel={() => {
+              setStep('password');
+              setPairNote(null);
+            }}
+          />
         ) : (
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              void signIn();
+              if (passwordAllowed || !canPair) void signIn();
+              else pair(null);
             }}
           >
             <h2>Sign in</h2>
@@ -234,17 +276,28 @@ export function Connect({ prefill, reason, onDone, onCancel }: { prefill?: Saved
                 Change
               </button>
             </div>
-            <label className="field">
-              <span className="label">Owner password</span>
-              <input
-                ref={pwRef}
-                className="input"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="current-password"
-              />
-            </label>
+            {!passwordAllowed && (
+              <div className="note" role="status" style={{ marginTop: 16 }}>
+                <Icon name="alert" size={16} />
+                <div>
+                  {status?.passwordSignIn?.reason ?? 'Password sign-in is limited on this Servify.'}
+                  {canPair && ' Approve this phone from the dashboard instead.'}
+                </div>
+              </div>
+            )}
+            {(passwordAllowed || !canPair) && (
+              <label className="field">
+                <span className="label">Owner password</span>
+                <input
+                  ref={pwRef}
+                  className="input"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
+                />
+              </label>
+            )}
             <label className="field">
               <span className="label">Name this phone</span>
               <input className="input" value={deviceName} onChange={(e) => setDeviceName(e.target.value)} maxLength={60} />
@@ -257,8 +310,13 @@ export function Connect({ prefill, reason, onDone, onCancel }: { prefill?: Saved
               </div>
             )}
             <button className="btn btn-primary btn-block" style={{ marginTop: 24 }} disabled={busy} type="submit">
-              {busy ? <Spinner /> : 'Sign in'}
+              {busy ? <Spinner /> : passwordAllowed || !canPair ? 'Sign in' : 'Approve from dashboard'}
             </button>
+            {canPair && passwordAllowed && (
+              <button className="btn btn-block" style={{ marginTop: 10 }} type="button" disabled={busy} onClick={() => pair(null)}>
+                Approve from dashboard instead
+              </button>
+            )}
           </form>
         )}
       </div>

@@ -22,10 +22,23 @@ import {
   normalizeTokenProjects,
   hostAllowed,
   originOk,
-  throttleLogin,
+  checkPasswordAsync,
+  sessionFresh,
+  sessionFreshUntil,
+  markReauthenticated,
+  SESSION_TTL,
+  SESSION_IDLE,
+  REAUTH_WINDOW,
   APP_ORIGINS,
   type Principal,
 } from './auth.ts';
+import type { IncomingMessage } from 'node:http';
+import { dashboardClient } from './proxy.ts';
+import { passwordPolicy, passwordRefusal, setPasswordPolicy, usablePasskeys, relyingParty, rpAllowed, beforeAttempt, attemptFailed, attemptSucceeded, describePolicy, type Refusal, type FailureWhat } from './signin.ts';
+import { loginOptions, verifyLogin, registrationOptions, verifyRegistration, listPasskeys, publicPasskey, cleanName, PasskeyError } from './passkeys.ts';
+import { startPairing, pollPairing, listPairings, decidePairing, denyAllPairings } from './pairing.ts';
+import { ipKey, Limiter } from './access.ts';
+import { passkeysTable, sessionsTable } from './db.ts';
 import { tokensTable, deployments as deploymentsTable, services as servicesTable } from './db.ts';
 import { HttpError } from './util.ts';
 import { config } from './config.ts';
@@ -57,6 +70,9 @@ import { checkCall, isScoped, inReach, reachIds, eventFor, isUploadService } fro
 
 type Env = { Variables: { principal: Principal } };
 
+/** Passkey challenges handed out per address (unauthenticated): 30 at once, one more every 2 s. */
+const optionsLimiter = new Limiter(20_000);
+
 /** Parse a JSON body; an empty or invalid body becomes a clean 400 (or {} when optional). */
 async function jsonBody<T = any>(c: Context): Promise<T> {
   const text = await c.req.text();
@@ -86,6 +102,9 @@ function abortSignal(stream: { onAbort: (fn: () => void) => void }) {
 export const api = new Hono<Env>();
 
 api.onError((err, c) => {
+  // Throttled sign-ins and pairing requests: 429 with Retry-After (seconds).
+  const retryAfter = (err as { retryAfter?: unknown }).retryAfter;
+  if (typeof retryAfter === 'number') return c.json({ error: err.message, code: 'throttled', retryAfter }, 429, { 'retry-after': String(retryAfter), 'cache-control': 'no-store' });
   if (err instanceof HttpError) return c.json({ error: err.message, ...(err.code ? { code: err.code } : {}) }, err.status as any);
   if (err instanceof ZodError) {
     const msg = err.issues.map((i) => `${i.path.join('.') || 'input'}: ${i.message}`).join('; ');
@@ -115,7 +134,7 @@ api.use('*', async (c, next) => {
   if (!hostAllowed(c.req.header('host'))) return c.json({ error: 'host not allowed' }, 403);
   const origin = c.req.header('origin');
   // Signing in from the app carries a password, not a cookie, so there is nothing to forge.
-  const appSignIn = c.req.path === '/api/auth/device' && c.req.method === 'POST' && !!origin && APP_ORIGINS.has(origin);
+  const appSignIn = (c.req.path === '/api/auth/device' || c.req.path === '/api/auth/pair/start') && c.req.method === 'POST' && !!origin && APP_ORIGINS.has(origin);
   if (!appSignIn && !originOk(origin, c.req.header('host'), c.req.method, c.req.header('authorization'))) return c.json({ error: 'origin not allowed' }, 403);
   await next();
 });
@@ -123,28 +142,85 @@ api.use('*', async (c, next) => {
 // ───────────────────────────── auth ─────────────────────────────
 
 /** What the phone app may use on this Servify (it checks before relying on it). */
-const APP_FEATURES = ['app-version-header', 'mobile-app'];
+const APP_FEATURES = ['app-version-header', 'mobile-app', 'pairing', 'password-policy', 'passkeys'];
+
+/** The visitor as the dashboard port sees it (through the router or directly; see proxy.ts dashboardClient). */
+const clientOf = (c: Context) => dashboardClient((c.env as { incoming?: IncomingMessage } | undefined)?.incoming);
+const rpOf = (c: Context) => relyingParty(c.req.header('host'), clientOf(c));
+
+/** The session cookie: HttpOnly, SameSite=Strict, and Secure whenever the visitor came over HTTPS. */
+function setSessionCookie(c: Context, s: { id: string; maxAge: number }) {
+  setCookie(c, SESSION_COOKIE, s.id, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: s.maxAge, secure: clientOf(c).proto === 'https' });
+}
+
+function refuse(r: Refusal): never {
+  throw new HttpError(r.status, r.message, r.code);
+}
+
+/**
+ * One password attempt (dashboard, phone, confirming in Settings): the policy for this client first, then this
+ * address's lock, then the global slow-down, then the hash. Failures and successes feed the per-address throttle.
+ */
+async function passwordAttempt(c: Context, password: unknown, what: FailureWhat): Promise<void> {
+  const client = clientOf(c);
+  const refusal = passwordRefusal(client);
+  if (refusal) refuse(refusal);
+  await beforeAttempt('password', client);
+  if (typeof password !== 'string' || !password || !(await checkPasswordAsync(password))) {
+    attemptFailed('password', what, client);
+    throw new HttpError(401, 'wrong password');
+  }
+  attemptSucceeded('password', client);
+}
+
+/** One passkey assertion (sign-in or confirmation); passkey failures are throttled per address on their own. */
+async function passkeyAttempt(c: Context, body: any) {
+  const client = clientOf(c);
+  const rp = rpOf(c);
+  if (!rp.ok) throw new HttpError(400, rp.reason, 'passkeys_unavailable');
+  await beforeAttempt('passkey', client);
+  try {
+    const rec = await verifyLogin(rp, body);
+    attemptSucceeded('passkey', client);
+    return rec;
+  } catch (e) {
+    // Unknown passkeys, bad signatures, wrong origins or hosts, replayed or expired challenges, counters going back.
+    if (e instanceof PasskeyError) attemptFailed('passkey', 'passkey', client);
+    throw e;
+  }
+}
 
 api.get('/auth/status', (c) => {
   const p = principalFor({ cookie: getCookie(c, SESSION_COOKIE), bearer: bearer(c), app: c.req.header('x-servify-app') });
-  return c.json({ app: 'servify', setUp: isSetUp(), authenticated: !!p, authMode: config.authMode, version: config.version, features: APP_FEATURES });
+  const rp = rpOf(c);
+  const refusal = config.authMode === 'none' ? null : passwordRefusal(clientOf(c));
+  return c.json({
+    app: 'servify',
+    setUp: isSetUp(),
+    authenticated: !!p,
+    authMode: config.authMode,
+    version: config.version,
+    features: APP_FEATURES,
+    /** May this client sign in with the owner password (the password policy, for its address)? */
+    passwordSignIn: refusal ? { allowed: false, code: refusal.code, reason: refusal.message } : { allowed: true },
+    /** Can passkeys be used on the host this was asked on (HTTPS or localhost, a host name Servify answers on)? */
+    passkeySignIn: config.authMode === 'none' ? { available: false, reason: 'sign-in is turned off (SERVIFY_AUTH=none)' } : rp.ok ? { available: true, rpId: rp.rpId } : { available: false, reason: rp.reason },
+  });
 });
 
 api.post('/auth/setup', async (c) => {
   if (isSetUp()) throw new HttpError(409, 'already set up');
   const { password } = await jsonBody<{ password: string }>(c);
   setPassword(password);
-  const s = createSession();
-  setCookie(c, SESSION_COOKIE, s.id, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: s.maxAge });
+  setSessionCookie(c, createSession());
   return c.json({ ok: true });
 });
 
 api.post('/auth/login', async (c) => {
-  throttleLogin();
+  if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none)');
   const { password } = await jsonBody<{ password: string }>(c);
-  if (!checkPassword(password ?? '')) throw new HttpError(401, 'wrong password');
-  const s = createSession();
-  setCookie(c, SESSION_COOKIE, s.id, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: s.maxAge });
+  await passwordAttempt(c, password, 'password');
+  setSessionCookie(c, createSession());
   return c.json({ ok: true });
 });
 
@@ -152,18 +228,51 @@ api.post('/auth/login', async (c) => {
 api.post('/auth/device', async (c) => {
   if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none); the app needs an owner password');
   if (!isSetUp()) throw new HttpError(409, 'this Servify has no owner password yet: open the dashboard once to set it');
-  throttleLogin();
   const { password, name } = await jsonBody<{ password: string; name?: string }>(c);
-  if (!checkPassword(password ?? '')) throw new HttpError(401, 'wrong password');
-  const { token, record } = createToken(name || 'Phone', 'write', 'device');
+  await passwordAttempt(c, password, 'phone');
+  const { token, record } = createToken(cleanName(name) || 'Phone', 'write', 'device');
   recordActivity({ type: 'user', name: 'you' }, 'device.signin', `Signed in on ${record.name}`);
   return c.json({ token, device: record }, 201);
 });
 
+/** A challenge for signing in (or confirming in Settings) with a passkey on this host. */
+api.post('/auth/passkey/options', async (c) => {
+  if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none)');
+  const rp = rpOf(c);
+  if (!rp.ok) throw new HttpError(400, rp.reason, 'passkeys_unavailable');
+  const wait = optionsLimiter.take(ipKey(clientOf(c).ip), 30, 0.5);
+  if (wait) return c.json({ error: 'too many passkey requests, slow down', code: 'throttled', retryAfter: wait }, 429, { 'retry-after': String(wait) });
+  return c.json(await loginOptions(rp));
+});
+
+api.post('/auth/passkey/login', async (c) => {
+  if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none)');
+  const rec = await passkeyAttempt(c, await jsonBody(c));
+  setSessionCookie(c, createSession());
+  return c.json({ ok: true, passkey: publicPasskey(rec) });
+});
+
 api.post('/auth/logout', (c) => {
   destroySession(getCookie(c, SESSION_COOKIE));
-  deleteCookie(c, SESSION_COOKIE, { path: '/' });
+  deleteCookie(c, SESSION_COOKIE, { path: '/', secure: clientOf(c).proto === 'https' });
   return c.json({ ok: true });
+});
+
+/**
+ * Pairing a phone without the password: the app starts a request and shows the code, the owner approves it in the
+ * dashboard (Settings → Security), the app's poll then receives a device token once. See pairing.ts and the README.
+ */
+api.post('/auth/pair/start', async (c) => {
+  if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none)');
+  if (!isSetUp()) throw new HttpError(409, 'this Servify has no owner password yet: open the dashboard once to set it');
+  const { name } = await jsonBody<{ name?: string }>(c);
+  return c.json(startPairing(clientOf(c).ip, name), 201);
+});
+
+api.get('/auth/pair/:pairingId', (c) => {
+  const r = pollPairing(clientOf(c).ip, c.req.param('pairingId'));
+  c.header('cache-control', 'no-store');
+  return c.json(r.body, r.status as 200 | 404);
 });
 
 function bearer(c: Context): string | undefined {
@@ -241,6 +350,119 @@ api.delete('/auth/device', (c) => {
   recordActivity({ type: 'user', name: 'you' }, 'device.signout', `Signed out on ${rec.name}`);
   return c.json({ ok: true });
 });
+
+// ───────────────────────────── sign-in methods (Settings → Security) ─────────────────────────────
+
+/** Passkeys and the password policy are managed from a dashboard session — never an API token or the phone app. */
+function ownerSession(c: Context<Env>): string {
+  if (config.authMode === 'none') throw new HttpError(400, 'sign-in is turned off on this Servify (SERVIFY_AUTH=none)');
+  const sid = getCookie(c, SESSION_COOKIE);
+  if (bearer(c) || !sid || c.get('principal').actor.type !== 'user') throw new HttpError(403, 'sign-in methods can only be changed from the dashboard (signed in in a browser)');
+  return sid;
+}
+/** …and only within a few minutes of signing in or confirming with the password or a passkey. */
+function freshSession(c: Context<Env>): string {
+  const sid = ownerSession(c);
+  if (!sessionFresh(sid)) throw new HttpError(403, 'confirm it is you first: enter your password or use a passkey', 'reauth_required');
+  return sid;
+}
+const you = { type: 'user', name: 'you' } as const;
+
+api.get('/auth/security', (c) => {
+  const sid = getCookie(c, SESSION_COOKIE);
+  const rp = rpOf(c);
+  const refusal = passwordRefusal(clientOf(c));
+  return c.json({
+    authMode: config.authMode,
+    passwordPolicy: passwordPolicy(),
+    passkeys: listPasskeys(),
+    usablePasskeys: usablePasskeys().length,
+    passkeySignIn: rp.ok ? { available: true, rpId: rp.rpId } : { available: false, reason: rp.reason },
+    passwordSignIn: refusal ? { allowed: false, code: refusal.code, reason: refusal.message } : { allowed: true },
+    session: { browser: !!sid && !bearer(c), freshUntil: sid && !bearer(c) ? sessionFreshUntil(sid) : null, reauthMinutes: REAUTH_WINDOW / 60_000, idleDays: SESSION_IDLE / 86_400_000, maxDays: SESSION_TTL / 86_400_000 },
+    sessions: sessionsTable.count(),
+    devices: tokensTable.list().filter((t) => t.kind === 'device').length,
+    pendingPairings: listPairings().length,
+  });
+});
+
+/** Confirm it is you (password or passkey): adding or removing passkeys and changing the policy for the next few minutes. */
+api.post('/auth/reauth', async (c) => {
+  const sid = ownerSession(c);
+  const body = await jsonBody<{ password?: string; challengeId?: string; response?: unknown }>(c);
+  if (body.response !== undefined) await passkeyAttempt(c, body);
+  else await passwordAttempt(c, body.password, 'confirm');
+  markReauthenticated(sid);
+  return c.json({ ok: true, freshUntil: sessionFreshUntil(sid) });
+});
+
+api.post('/auth/passkeys/options', async (c) => {
+  const sid = freshSession(c);
+  const rp = rpOf(c);
+  if (!rp.ok) throw new HttpError(400, rp.reason, 'passkeys_unavailable');
+  return c.json(await registrationOptions(rp, sid));
+});
+
+api.post('/auth/passkeys', async (c) => {
+  const sid = freshSession(c);
+  const rp = rpOf(c);
+  if (!rp.ok) throw new HttpError(400, rp.reason, 'passkeys_unavailable');
+  const first = passkeysTable.all().length === 0;
+  const rec = await verifyRegistration(rp, sid, await jsonBody(c));
+  recordActivity(you, 'auth.passkey', `Added passkey ${rec.name} for ${rec.rpId}`);
+  // The first passkey: the dashboard offers (pre-selected) to limit password sign-in to private networks. Nothing
+  // changes until the owner says so.
+  return c.json({ passkey: publicPasskey(rec), suggestPolicy: first && passwordPolicy() === 'everywhere' ? 'private' : null }, 201);
+});
+
+api.patch('/auth/passkeys/:id', async (c) => {
+  ownerSession(c);
+  const rec = passkeysTable.get(c.req.param('id'));
+  if (!rec) throw new HttpError(404, 'passkey not found');
+  const name = cleanName((await jsonBody<{ name?: string }>(c)).name);
+  if (!name) throw new HttpError(400, 'name the passkey');
+  passkeysTable.put({ ...rec, name });
+  if (name !== rec.name) recordActivity(you, 'auth.passkey', `Renamed passkey ${rec.name} to ${name}`);
+  return c.json(publicPasskey({ ...rec, name }));
+});
+
+api.delete('/auth/passkeys/:id', (c) => {
+  freshSession(c);
+  const rec = passkeysTable.get(c.req.param('id'));
+  if (!rec) throw new HttpError(404, 'passkey not found');
+  if (passwordPolicy() === 'off' && !usablePasskeys().some((p) => p.id !== rec.id)) throw new HttpError(409, 'this is your last passkey and password sign-in is off: turn password sign-in back on first, or add another passkey');
+  passkeysTable.delete(rec.id);
+  recordActivity(you, 'auth.passkey', `Removed passkey ${rec.name} (${rec.rpId})`);
+  return c.json({ ok: true });
+});
+
+api.put('/auth/password-policy', async (c) => {
+  freshSession(c);
+  const { policy } = await jsonBody<{ policy?: string }>(c);
+  const p = setPasswordPolicy(you, policy);
+  return c.json({ passwordPolicy: p, description: describePolicy(p) });
+});
+
+/** End every dashboard session (this one too) and, with devices: true, sign out every phone. */
+api.post('/auth/signout-all', async (c) => {
+  const { devices } = await jsonBody<{ devices?: boolean }>(c);
+  const n = sessionsTable.deleteAll();
+  let d = 0;
+  if (devices === true) {
+    for (const t of tokensTable.list().filter((t) => t.kind === 'device')) {
+      tokensTable.delete(t.id);
+      d++;
+    }
+  }
+  deleteCookie(c, SESSION_COOKIE, { path: '/', secure: clientOf(c).proto === 'https' });
+  recordActivity(you, 'auth.signout', `Signed out everywhere: ${n} dashboard session${n === 1 ? '' : 's'}${devices === true ? ` and ${d} phone${d === 1 ? '' : 's'}` : ''}`);
+  return c.json({ ok: true, sessions: n, devices: d });
+});
+
+api.get('/auth/pairings', (c) => c.json(listPairings()));
+api.post('/auth/pairings/deny-all', (c) => c.json({ denied: denyAllPairings() }));
+api.post('/auth/pairings/:id/approve', (c) => c.json(decidePairing(c.req.param('id'), true)));
+api.post('/auth/pairings/:id/deny', (c) => c.json(decidePairing(c.req.param('id'), false)));
 
 const actor = (c: Context<Env>) => c.get('principal').actor;
 const view = (c: Context<Env>) => ({ revealSecrets: c.get('principal').scope === 'write' });
@@ -715,6 +937,8 @@ api.get('/events', (c) => {
       // Tokens limited to some projects get those projects' events only.
       const ev = eventFor(p, raw);
       if (!ev) return;
+      // Phone sign-in requests: the owner's dashboard only (tokens never hear of them).
+      if (ev.type === 'auth.pairing' && p.actor.type !== 'user') return;
       if (projectId) {
         if (ev.type === 'service.updated' && ev.service.projectId !== projectId) return;
         if (ev.type === 'deployment.updated' && ev.deployment.projectId !== projectId) return;
@@ -775,7 +999,15 @@ api.put('/settings/autostart', async (c) => {
 });
 api.patch('/settings/general', async (c) => {
   ownerOnly(c);
-  settings.updateGeneral(actor(c), await jsonBody(c));
+  const body = await jsonBody<{ dashboardDomain?: string | null }>(c);
+  // With password sign-in off, passkeys are the only way in: don't move the domain out from under the last of them.
+  if (body.dashboardDomain !== undefined && passwordPolicy() === 'off') {
+    const next = String(body.dashboardDomain ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/[/:].*$/, '').replace(/\.$/, '') || null;
+    const current = settings.getSettings().dashboardDomain;
+    const left = usablePasskeys().filter((p) => p.rpId !== current || p.rpId === next);
+    if (next !== current && !left.length) throw new HttpError(409, `password sign-in is off and every passkey belongs to ${current}: add a passkey for another host (e.g. localhost) or turn password sign-in back on first`);
+  }
+  settings.updateGeneral(actor(c), body);
   return c.json(settings.publicSettings(true));
 });
 api.patch('/settings/alerts', async (c) => {

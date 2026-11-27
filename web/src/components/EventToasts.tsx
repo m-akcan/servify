@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { onServerEvent, store } from '../lib/store.ts';
 import { toast } from './ui.tsx';
+import { api } from '../lib/api.ts';
 import { navigate, projectPath } from '../lib/router.ts';
 
 /** Surface what happens in the background — especially what agents do — as toasts. */
@@ -32,6 +33,16 @@ export function EventToasts() {
         const name = svc.name;
         if (ev.run.status === 'failed') toast({ title: `${name} run failed`, body: `exit ${ev.run.exitCode ?? '?'} · ${ev.run.output.split('\n').filter(Boolean).pop()?.slice(0, 100) ?? ''}`, tone: 'err', duration: 7000 });
         else if (ev.run.trigger !== 'schedule') toast({ title: `${name} finished`, body: `exit 0 in ${Math.round(((ev.run.finishedAt ?? Date.now()) - ev.run.startedAt) / 100) / 10}s`, tone: 'ok' });
+        return;
+      }
+      if (ev.type === 'auth.pairing') {
+        // A phone asks to be let in: point the owner at the list (the code is compared there, never in a toast).
+        void api.get<{ id: string; name: string }[]>('/auth/pairings').then((list) => {
+          const fresh = list.filter((p) => !seen.has(`pair:${p.id}`));
+          for (const p of list) seen.add(`pair:${p.id}`);
+          if (!fresh.length) return;
+          toast({ title: `${fresh[0].name} asks to sign in`, body: 'Compare the code on the phone before approving.', tone: 'warn', duration: 15000, action: { label: 'Review', onClick: () => navigate('/settings/security') } });
+        }, () => {});
         return;
       }
       if (ev.type === 'activity') {

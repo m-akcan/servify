@@ -1510,3 +1510,44 @@
 .run-row.run-skipped:hover {
   background: none;
 }
+
+/* ───────────── sign-in: password policy and phone approvals ───────────── */
+.policy-options {
+  display: grid;
+  gap: 8px;
+}
+.policy-option {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.policy-option.on {
+  border-color: var(--signal-line);
+  background: var(--bg-3);
+}
+.policy-option.disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.policy-option input {
+  margin-top: 3px;
+}
+.pair-code {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--line-2);
+  white-space: nowrap;
+}
+@media (max-width: 560px) {
+  .token-row:has(.pair-code) {
+    flex-wrap: wrap;
+  }
+}

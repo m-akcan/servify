@@ -34,6 +34,17 @@ CREATE INDEX IF NOT EXISTS access_log_service_ts ON access_log(service_id, ts);
 CREATE TABLE IF NOT EXISTS metrics (service_id TEXT NOT NULL, t INTEGER NOT NULL, rps REAL, p50 REAL, p95 REAL, errors REAL, cpu REAL, mem REAL, replicas INTEGER, PRIMARY KEY (service_id, t));
 `);
 
+// Sessions: when each started, was last used and last confirmed with the password or a passkey (idle timeout and
+// re-authentication). Added later: rows from before have NULLs, read as "now" (see sessionsTable).
+for (const col of ['created_at', 'seen_at', 'reauth_at']) {
+  try {
+    db.exec(`ALTER TABLE sessions ADD COLUMN ${col} INTEGER`);
+  } catch {
+    // already there
+  }
+}
+db.exec(`CREATE TABLE IF NOT EXISTS passkeys (id TEXT PRIMARY KEY, credential_id TEXT NOT NULL UNIQUE, data TEXT NOT NULL, created_at INTEGER NOT NULL);`);
+
 type Row = { data: string };
 
 type Codec<T> = { encode: (v: T) => unknown; decode: (stored: any) => T };
@@ -154,6 +165,28 @@ export const certsTable = table<CertRecord>('certs');
 export const backupsTable = table<BackupRecord>('backups', { service_id: (b) => b.serviceId });
 export const volumesTable = table<VolumeRecord>('volumes', { project_id: (v) => v.projectId });
 export const nodesTable = table<ServerNode>('nodes');
+
+/** A passkey (WebAuthn credential) of the owner. Public keys only: nothing here signs anyone in on its own. */
+export type PasskeyRecord = {
+  id: string;
+  /** The credential id the authenticator reports (base64url). */
+  credentialId: string;
+  /** COSE public key (base64url). */
+  publicKey: string;
+  /** Signature counter (synced passkeys always report 0). */
+  counter: number;
+  transports: string[];
+  /** The host name it is bound to (WebAuthn relying-party id): it only works on that host. */
+  rpId: string;
+  name: string;
+  aaguid: string;
+  /** 'multiDevice': synced (a password manager, iCloud, Google); 'singleDevice': a security key or one device. */
+  deviceType: string;
+  backedUp: boolean;
+  createdAt: number;
+  lastUsedAt: number | null;
+};
+export const passkeysTable = table<PasskeyRecord>('passkeys', { credential_id: (p) => p.credentialId });
 
 /**
  * Boot migration: seal rows written before encryption existed, then compact the file so the old
@@ -296,19 +329,43 @@ export const kv = {
 /** Session ids are stored hashed ("h:<sha256>"): reading the database must not be enough to sign in. */
 const sessionKey = (id: string) => `h:${createHash('sha256').update(id).digest('hex')}`;
 
+export type SessionRow = { expiresAt: number; createdAt: number | null; seenAt: number | null; reauthAt: number | null };
+
 export const sessionsTable = {
   create(id: string, expiresAt: number) {
-    db.prepare('INSERT INTO sessions (id, expires_at) VALUES (?, ?)').run(sessionKey(id), expiresAt);
+    const now = Date.now();
+    db.prepare('INSERT INTO sessions (id, expires_at, created_at, seen_at, reauth_at) VALUES (?, ?, ?, ?, ?)').run(sessionKey(id), expiresAt, now, now, now);
+  },
+  get(id: string): SessionRow | null {
+    const r = db.prepare('SELECT expires_at, created_at, seen_at, reauth_at FROM sessions WHERE id = ?').get(sessionKey(id)) as
+      | { expires_at: number; created_at: number | null; seen_at: number | null; reauth_at: number | null }
+      | undefined;
+    return r ? { expiresAt: r.expires_at, createdAt: r.created_at, seenAt: r.seen_at, reauthAt: r.reauth_at } : null;
   },
   valid(id: string): boolean {
-    const r = db.prepare('SELECT expires_at FROM sessions WHERE id = ?').get(sessionKey(id)) as { expires_at: number } | undefined;
-    return !!r && r.expires_at > Date.now();
+    const r = sessionsTable.get(id);
+    return !!r && r.expiresAt > Date.now();
+  },
+  touch(id: string, at = Date.now()) {
+    db.prepare('UPDATE sessions SET seen_at = ? WHERE id = ?').run(at, sessionKey(id));
+  },
+  reauthed(id: string, at = Date.now()) {
+    db.prepare('UPDATE sessions SET reauth_at = ?, seen_at = ? WHERE id = ?').run(at, at, sessionKey(id));
   },
   delete(id: string) {
     db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionKey(id));
   },
-  prune() {
+  /** Every dashboard session (sign out everywhere). Returns how many there were. */
+  deleteAll(): number {
+    return Number(db.prepare('DELETE FROM sessions').run().changes);
+  },
+  count(): number {
+    return (db.prepare('SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?').get(Date.now()) as { n: number }).n;
+  },
+  /** Expired, and (idleMs) unused for longer than that. */
+  prune(idleMs?: number) {
     db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+    if (idleMs) db.prepare('DELETE FROM sessions WHERE seen_at IS NOT NULL AND seen_at < ?').run(Date.now() - idleMs);
   },
 };
 

@@ -2,7 +2,7 @@
   "name": "@servify/mobile",
   "private": true,
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Servify for Android: sign in to your own Servify and watch and control your services.",
   "scripts": {
     "dev": "vite",

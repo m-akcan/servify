@@ -316,9 +316,38 @@ The agent (`server/bin/agent.mjs`, no dependencies) connects **out** to this Ser
 
 The agent endpoint listens on `0.0.0.0:7701` only once you add a server (`SERVIFY_AGENT_HOST`, `SERVIFY_AGENT_PORT`). The join command uses your first LAN address; set `SERVIFY_AGENT_PUBLIC_HOST` if servers reach this machine under another name (a VPN or public address). Treat an agent token like a password: whoever holds it can pose as that server.
 
+### Signing in from the internet: passkeys, password policy, throttling
+
+To reach the dashboard from the internet, set a public dashboard domain, open its address list to everyone, and protect sign-in with **passkeys** (Settings → Security):
+
+- **Passkeys** (WebAuthn, discoverable — no user name to type) can live in your password manager (Bitwarden/Vaultwarden, 1Password …) or on a device. User verification is required when a passkey is added and when it signs in. A passkey belongs to the exact host name it was added on — `localhost`, the dashboard domain or a name in `SERVIFY_ALLOWED_HOSTS`; never an IP address or a plain-HTTP address (the login page hides the button there and says why). Add one per host you use. Adding or removing passkeys and changing the policy need a sign-in or confirmation (password or passkey) from the last 5 minutes, in a browser session — not with an API token or the phone app.
+- **Password sign-in policy:** *everywhere* (the default, as before), *private networks only* (home, office, VPN and this machine; the visitor's real address is used — through the dashboard domain the router passes it on, and `X-Forwarded-For` counts only from `SERVIFY_TRUSTED_PROXIES`; behind an untrusted proxy the password is refused), or *off* (passkeys only; needs a passkey on a host Servify answers on). After your first passkey the dashboard offers *private networks only*; nothing changes until you choose. The policy applies to the phone app's password sign-in too.
+- **Throttling:** per client address (IPv6 by /64), five failed password attempts in a row are free, then the address is locked for 1 s, 2 s, 4 s … up to 15 minutes, and at most 50 failures a day; a success resets it. Locked addresses get 429 before any password is checked. Above 30 failures a minute across all addresses each password check is slowed (up to 5 s) but never refused, so you can always get in from a fresh address — and passkey sign-in is counted separately and never slowed. Failures land in the activity log in batches, with one notification per burst (event *Repeated failed sign-ins*).
+- **Sessions:** HttpOnly, SameSite=Strict, and `Secure` when the request came over HTTPS (directly or through the dashboard domain). They end after 7 days unused and 30 days at most. **Sign out everywhere** (Settings → Security) ends every dashboard session, optionally every signed-in phone too.
+
+**Locked out?** On the Servify machine (it needs access to the data folder):
+
+```sh
+servify auth reset                    # asks for a new owner password, allows the password everywhere again, ends all sessions
+servify auth reset --keep-password    # only allow the password everywhere again (and end all sessions)
+servify auth reset --password-stdin   # read the new password from stdin (scripts); add --remove-passkeys / --sign-out-devices if needed
+servify auth status                   # policy, passkeys, sessions and phones
+```
+
+It takes effect at once, also while Servify runs. An address locked out after failed attempts stays locked for at most 15 minutes (a restart clears it).
+
+### Approving a phone from the dashboard (pairing API)
+
+When the password is limited or off, the app can ask to be approved instead. No credentials; per client address.
+
+- `POST /api/auth/pair/start` with `{"name": "Pixel 9"}` (optional, at most 60 characters) → **201** `{"pairingId": "<43-character secret>", "code": "K7QFM2XD", "expiresAt": <ms epoch>}`. The code is 8 characters from `ABCDEFGHJKMNPQRSTUVWXYZ23456789`; show it as `K7QF M2XD`. A pairing lasts 5 minutes. Limits: 5 starts per address per 10 minutes, 2 waiting per address, 10 waiting in all → **429** `{"error", "code": "throttled", "retryAfter": <s>}` with `Retry-After`. Allowed from the app's WebView origins.
+- `GET /api/auth/pair/<pairingId>` (poll every 2–3 s; at most 120 a minute per address) → **200** `{"status": "pending", "expiresAt"}` · `{"status": "approved", "token": "svf_…", "device": {…}}` — **exactly once**, then the pairing is gone · `{"status": "denied"}` · `{"status": "expired"}`; unknown or already-claimed ids → **404** `{"status": "expired"}`.
+- The owner sees waiting requests under Settings → Security (code, device name, address, time, plus a toast), and approves after comparing the code, or denies (or denies all). The token is a normal device token: listed under signed-in devices, sent as `Authorization: Bearer`, revocable, `DELETE /api/auth/device` signs it out.
+- `GET /api/auth/status` lists the features `pairing`, `password-policy` and `passkeys`, and says `passwordSignIn: {allowed, code?, reason?}` for the asking client — the app can offer pairing when it is `false`. A refused password sign-in (`POST /api/auth/device`) answers **403** with `code` `password_off` or `password_private_only`.
+
 ## Android app
 
-The Servify app for Android (in [`mobile/`](mobile/README.md)) signs in like a password manager's self-hosted mode: enter your Servify's address, then the owner password. The phone gets its own token, listed under **Settings → Security → Signed-in devices**, where you can sign it out. The app shows your projects and services live, with metrics, deployments and logs, and can restart, redeploy, stop, start and run scheduled jobs.
+The Servify app for Android (in [`mobile/`](mobile/README.md)) signs in like a password manager's self-hosted mode: enter your Servify's address, then the owner password, or, when password sign-in is off or limited, tap **Approve from dashboard** and approve the code it shows under Settings → Security on a signed-in device. The phone gets its own token, listed under **Settings → Security → Signed-in devices**, where you can sign it out. The app shows your projects and services live, with metrics, deployments and logs, and can restart, redeploy, stop, start and run scheduled jobs.
 
 Reach Servify from your phone through your home network or a VPN (Tailscale, WireGuard); there's no need to put the dashboard on the internet. Plain `http://` is only accepted for local and VPN addresses. Servify always answers on bare IP addresses; add any hostname you use (for example a Tailscale MagicDNS name) to `SERVIFY_ALLOWED_HOSTS`. For `https://`, set a [dashboard domain](#the-dashboard-on-its-own-domain): the app pins Servify's local CA after you compare its fingerprint with the one in Settings → HTTPS.
 
@@ -542,8 +571,8 @@ The acceptance script deploys, load-balances, scales, redeploys under load (asse
 ## Security notes
 
 - Servify controls your Docker daemon, which is root-equivalent. Keep it bound to localhost unless you know what you're doing.
-- The dashboard uses an scrypt-hashed owner password and an HttpOnly, SameSite=Strict session cookie. Writes must come from Servify's own origin (hosted apps live on `*.localhost` too, so this matters). Host headers are checked to block DNS rebinding.
-- The Android app signs in with the owner password and gets a device token that acts as the owner; it is revocable under Settings → Security, shares the login rate limit, and sits in the Android Keystore on the phone. The API answers CORS only for the app's own WebView origins, never with credentials, and a request that carries a Bearer token skips the Origin check (no site can attach someone else's token).
+- The dashboard uses an scrypt-hashed owner password (checked off the main thread) and/or passkeys, and an HttpOnly, SameSite=Strict session cookie (Secure over HTTPS) that ends after 7 idle days or 30 days ([sign-in](#signing-in-from-the-internet-passkeys-password-policy-throttling)). Writes must come from Servify's own origin (hosted apps live on `*.localhost` too, so this matters). Host headers are checked to block DNS rebinding.
+- The Android app signs in with the owner password and gets a device token that acts as the owner; it is revocable under Settings → Security, shares the per-address sign-in limit and obeys the password policy (or is approved from the dashboard instead), and sits in the Android Keystore on the phone. The API answers CORS only for the app's own WebView origins, never with credentials, and a request that carries a Bearer token skips the Origin check (no site can attach someone else's token).
 - API tokens and session ids are stored as SHA-256 hashes; tokens can be read-only, deploy-only and limited to some projects ([Token scopes](#token-scopes)), and are only accepted in the `Authorization` header, never in a URL. Secrets are masked for read-only and deploy tokens; instance settings can only be changed by the owner (not by agent tokens), and so can servers (adding, renaming, new agent tokens, removing). Agent tokens don't see where notification channels point (ntfy topics, chat ids) or the delivery logs.
 - Building from a folder of this machine (`path`) is the owner's to set up: any folder could become a build context. An agent token can still redeploy such a service and change its other settings, just not its folder or Dockerfile.
 - Credentials typed into a git URL (`https://user:token@host/repo`) are taken out of the URL and stored as the encrypted token.

@@ -256,7 +256,7 @@ function internalRequest(req: http.IncomingMessage): boolean {
 }
 
 /** A private peer that isn't a trusted proxy sent X-Forwarded-For: a proxy Servify doesn't believe is in front. */
-function untrustedForwarder(req: http.IncomingMessage): string | null {
+export function untrustedForwarder(req: http.IncomingMessage): string | null {
   if (!req.headers['x-forwarded-for']) return null;
   const peer = normalizeIp(req.socket.remoteAddress);
   return peer && isPrivateIp(peer) && !fromTrustedProxy(peer) ? peer : null;
@@ -359,10 +359,16 @@ function handleDashboard(req: http.IncomingMessage, res: http.ServerResponse, pr
   const d = dashboardDenied(req);
   if (d) return deny(req, res, d);
   const headers: http.OutgoingHttpHeaders = {};
-  for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k) && k !== INTERNAL_HEADER) headers[k] = v;
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP.has(k) && k !== INTERNAL_HEADER && !ROUTER_HOP_HEADERS.includes(k)) headers[k] = v;
   const peer = req.socket.remoteAddress ?? '';
   headers['x-forwarded-for'] = req.headers['x-forwarded-for'] ? `${req.headers['x-forwarded-for']}, ${peer}` : peer;
   headers['x-forwarded-proto'] = visitorProto(req, proto);
+  // What the router decided about the visitor, for the dashboard port (sign-in policy, throttling, Secure cookies,
+  // the passkey origin): it sees only the router's own connection, so it believes these under the per-process key.
+  headers[ROUTER_HOP] = ROUTER_HOP_KEY;
+  headers['x-servify-client'] = clientIpOf(req);
+  headers['x-servify-proto'] = visitorProto(req, proto);
+  headers['x-servify-unsure'] = untrustedForwarder(req) ? '1' : '0';
   let finished = false;
   const preq = http.request({ host: dashboardTarget(), port: config.port, method: req.method, path: req.url, headers }, (pres) => {
     const out = { ...pres.headers };
@@ -381,6 +387,38 @@ function handleDashboard(req: http.IncomingMessage, res: http.ServerResponse, pr
     else res.destroy();
   });
   req.pipe(preq);
+}
+
+// ───────────────────────────── the client as the dashboard port sees it ─────────────────────────────
+
+const ROUTER_HOP = 'x-servify-hop';
+const ROUTER_HOP_KEY = randomBytes(18).toString('base64url');
+const ROUTER_HOP_HEADERS = [ROUTER_HOP, 'x-servify-client', 'x-servify-proto', 'x-servify-unsure'];
+
+/**
+ * Who is on the other end of a request to the dashboard port. `ip`: the visitor's address; `proto`: the scheme they
+ * used; `unsure`: a proxy Servify doesn't trust sits in front (every visitor would look like it), so address-based
+ * decisions must fail closed. `viaRouter`: it came through the dashboard domain.
+ *
+ *  - Through the router (dashboard domain): its own connection over loopback, carrying the router's verdict under a
+ *    per-process key. Anything else claiming to be the router is ignored.
+ *  - Directly: the socket peer, or the X-Forwarded-For hop a trusted proxy (SERVIFY_TRUSTED_PROXIES) reports, and the
+ *    X-Forwarded-Proto that proxy sends. Never X-Forwarded-For from anyone else.
+ */
+export type DashboardClient = { ip: string | null; proto: 'http' | 'https'; viaRouter: boolean; unsure: boolean };
+export function dashboardClient(req: http.IncomingMessage | undefined): DashboardClient {
+  if (!req) return { ip: null, proto: 'http', viaRouter: false, unsure: true };
+  const peer = normalizeIp(req.socket.remoteAddress);
+  const fromRouter = req.headers[ROUTER_HOP] === ROUTER_HOP_KEY && (peer === '127.0.0.1' || peer === '::1' || peer === normalizeIp(dashboardTarget()));
+  if (fromRouter) {
+    return {
+      ip: normalizeIp(one(req.headers['x-servify-client'])),
+      proto: one(req.headers['x-servify-proto']) === 'https' ? 'https' : 'http',
+      viaRouter: true,
+      unsure: one(req.headers['x-servify-unsure']) !== '0',
+    };
+  }
+  return { ip: normalizeIp(clientIpOf(req)), proto: visitorProto(req, 'http') === 'https' ? 'https' : 'http', viaRouter: false, unsure: !!untrustedForwarder(req) };
 }
 
 function dashboardDenied(req: http.IncomingMessage): Denial | null {

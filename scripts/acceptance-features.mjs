@@ -48,6 +48,15 @@
  * holding the owner password; never printed). Without trust, the hook check locks 127.0.0.1 out of the deploy hooks
  * for a few minutes (that is the point): run it last, or wait before running hook checks again.
  *
+ * Signing in (ONLY=auth): passkeys through a software authenticator in this script (registration and sign-in, a wrong
+ * origin, a wrong RP id, a replayed challenge, a counter going back, an unknown credential, a tampered signature), the
+ * passkey host bound to the request's host (localhost, the dashboard domain over HTTPS; never an IP or plain HTTP), the
+ * password policy (everywhere / private networks only / off) with and without a trusted proxy, `servify auth reset`,
+ * the per-address throttle and the global slow-down, Secure cookies over HTTPS, sign out everywhere, and approving a
+ * phone from the dashboard (pairing). Needs sign-in on, SERVIFY_COOKIE, SERVIFY_PASSWORD_FILE and SERVIFY_DATA_DIR;
+ * start Servify with SERVIFY_AUTH_LOG_QUIET_MS=3000 and SERVIFY_PAIRING_TTL_MS=15000. Run it twice — with
+ * SERVIFY_TRUSTED_PROXIES=127.0.0.1 and without (restart Servify between, and pass the same value to this script).
+ *
  * The phone app mirror (ONLY=mobileapp): this script serves a fake release feed (GitHub-API-shaped JSON and assets) on
  * SERVIFY_MOBILE_FEED_PORT (default 17899) and signs its manifests with a THROWAWAY Ed25519 key, SERVIFY_MOBILE_KEY (a
  * PEM file; never the real release key). Start Servify with SERVIFY_UPDATE_FEED=http://127.0.0.1:<port>/repos/test/servify/releases/latest,
@@ -71,7 +80,7 @@ const BASE = process.env.SERVIFY_URL ?? 'http://localhost:7700';
 const PROXY = Number(process.env.SERVIFY_PROXY_PORT ?? 8080);
 const HTTPS_PORT = Number(process.env.SERVIFY_HTTPS_PORT ?? 8443);
 const DATA = process.env.SERVIFY_DATA_DIR?.replace(/^~/, process.env.HOME);
-const COOKIE = process.env.SERVIFY_COOKIE;
+let COOKIE = process.env.SERVIFY_COOKIE;
 /** Mirror of the instance's SERVIFY_TRUSTED_PROXIES (pass the same value to both): does it believe X-Forwarded-For from us? */
 const TRUSTS_LOCAL = (process.env.SERVIFY_TRUSTED_PROXIES ?? '').split(',').some((t) => ['127.0.0.1', '127.0.0.0/8', '0.0.0.0/0'].includes(t.trim()));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1612,6 +1621,7 @@ async function main() {
   const settings = await api('GET', '/settings');
   const secret = settings.webhooks.secret;
   if (!secret || secret.includes('•')) throw new Error('needs owner access: set SERVIFY_COOKIE or run Servify with SERVIFY_AUTH=none');
+  if (process.env.ONLY === 'auth') return authChecks();
   const P = await api('POST', '/projects', { name: `features-${Date.now().toString(36)}` });
   projectsToDelete.push(P.id);
   if (process.env.ONLY === 'restarts') return hungReplicaChecks(P);
@@ -3335,6 +3345,552 @@ async function mobileAppChecks() {
   publish({ apk: a204 });
   const back = await refresh();
   check('verified again: the cached 204 is served, nothing re-downloaded', back.available && back.versionCode === 204 && /up to date/.test(back.status), JSON.stringify(back));
+}
+
+// ───────────────────────────── sign-in: passkeys, password policy, throttling, pairing ─────────────────────────────
+
+/**
+ * A tiny software authenticator (no browser): a P-256 key from WebCrypto, clientDataJSON, authenticatorData (rpIdHash,
+ * UP/UV flags, counter, attested credential data on registration) and a "none" attestation, CBOR-encoded by hand.
+ */
+function cborEncode(v) {
+  const head = (major, n) => {
+    if (n < 24) return Buffer.from([(major << 5) | n]);
+    if (n < 256) return Buffer.from([(major << 5) | 24, n]);
+    if (n < 65536) {
+      const b = Buffer.alloc(3);
+      b[0] = (major << 5) | 25;
+      b.writeUInt16BE(n, 1);
+      return b;
+    }
+    const b = Buffer.alloc(5);
+    b[0] = (major << 5) | 26;
+    b.writeUInt32BE(n, 1);
+    return b;
+  };
+  if (typeof v === 'number') return v >= 0 ? head(0, v) : head(1, -1 - v);
+  if (typeof v === 'string') {
+    const s = Buffer.from(v, 'utf8');
+    return Buffer.concat([head(3, s.length), s]);
+  }
+  if (v instanceof Uint8Array) return Buffer.concat([head(2, v.length), Buffer.from(v)]);
+  if (Array.isArray(v)) return Buffer.concat([head(4, v.length), ...v.map(cborEncode)]);
+  if (v instanceof Map) return Buffer.concat([head(5, v.size), ...[...v].flatMap(([k, x]) => [cborEncode(k), cborEncode(x)])]);
+  throw new Error('cbor: unsupported value');
+}
+function ecdsaDer(raw) {
+  const int = (b) => {
+    let i = 0;
+    while (i < b.length - 1 && b[i] === 0) i++;
+    b = b.subarray(i);
+    if (b[0] & 0x80) b = Buffer.concat([Buffer.from([0]), b]);
+    return Buffer.concat([Buffer.from([2, b.length]), b]);
+  };
+  const r = int(raw.subarray(0, 32));
+  const s = int(raw.subarray(32));
+  return Buffer.concat([Buffer.from([0x30, r.length + s.length]), r, s]);
+}
+async function softAuthenticator() {
+  const { subtle } = (await import('node:crypto')).webcrypto;
+  const kp = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+  const jwk = await subtle.exportKey('jwk', kp.publicKey);
+  const credId = randomBytes(16);
+  const b64u = (b) => Buffer.from(b).toString('base64url');
+  const sha = (b) => createHash('sha256').update(b).digest();
+  const st = { counter: 0, userHandle: null };
+  const authData = (rpId, attested, count) => {
+    const c = Buffer.alloc(4);
+    c.writeUInt32BE(count);
+    const parts = [sha(rpId), Buffer.from([0x01 | 0x04 | (attested ? 0x40 : 0)]), c];
+    if (attested) {
+      const len = Buffer.alloc(2);
+      len.writeUInt16BE(credId.length);
+      const cose = cborEncode(new Map([[1, 2], [3, -7], [-1, 1], [-2, Buffer.from(jwk.x, 'base64url')], [-3, Buffer.from(jwk.y, 'base64url')]]));
+      parts.push(Buffer.alloc(16), len, credId, cose);
+    }
+    return Buffer.concat(parts);
+  };
+  return {
+    id: b64u(credId),
+    st,
+    register(options, { origin, rpId = options.rp.id } = {}) {
+      st.userHandle = options.user.id;
+      const cd = Buffer.from(JSON.stringify({ type: 'webauthn.create', challenge: options.challenge, origin, crossOrigin: false }));
+      const att = cborEncode(new Map([['fmt', 'none'], ['attStmt', new Map()], ['authData', authData(rpId, true, st.counter)]]));
+      return { id: b64u(credId), rawId: b64u(credId), type: 'public-key', response: { clientDataJSON: b64u(cd), attestationObject: b64u(att), transports: ['internal', 'hybrid'] }, clientExtensionResults: {}, authenticatorAttachment: 'platform' };
+    },
+    /** count: report this counter once (a cloned authenticator) without changing the real one. */
+    async assert(options, { origin, rpId = options.rpId, count, tamper = false } = {}) {
+      if (count === undefined) st.counter++;
+      const cd = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: options.challenge, origin, crossOrigin: false }));
+      const ad = authData(rpId, false, count ?? st.counter);
+      const sig = ecdsaDer(Buffer.from(await subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, kp.privateKey, Buffer.concat([ad, sha(cd)]))));
+      if (tamper) sig[sig.length - 3] ^= 0x01;
+      return { id: b64u(credId), rawId: b64u(credId), type: 'public-key', response: { clientDataJSON: b64u(cd), authenticatorData: b64u(ad), signature: b64u(sig), userHandle: st.userHandle }, clientExtensionResults: {}, authenticatorAttachment: 'platform' };
+    },
+  };
+}
+
+/**
+ * ONLY=auth. Needs sign-in on, SERVIFY_COOKIE, SERVIFY_PASSWORD_FILE (the owner password; never printed) and
+ * SERVIFY_DATA_DIR (the recovery CLI, and ageing a session's confirmation time). Start Servify with
+ * SERVIFY_AUTH_LOG_QUIET_MS=3000 (activity batches) and SERVIFY_PAIRING_TTL_MS=15000 (pairing expiry), and pass this
+ * script the instance's SERVIFY_TRUSTED_PROXIES: with 127.0.0.1 in it, X-Forwarded-For stands for other addresses (the
+ * multi-address throttle, the global slow-down, pairing limits); without, it must be ignored, and "private networks
+ * only" must fail closed when it is sent. Run it once each way (restart Servify in between). It leaves the instance as
+ * it found it: password policy everywhere, no passkeys, the dashboard domain as it was.
+ */
+async function authChecks() {
+  const pwFile = process.env.SERVIFY_PASSWORD_FILE;
+  if (!pwFile || !DATA || !COOKIE) throw new Error('ONLY=auth needs SERVIFY_COOKIE, SERVIFY_PASSWORD_FILE and SERVIFY_DATA_DIR');
+  const PASSWORD = readFileSync(pwFile, 'utf8').trim();
+  const sectionStart = Date.now();
+  const { DatabaseSync } = await import('node:sqlite');
+  const port = Number(new URL(BASE).port);
+  const LOCAL_ORIGIN = `http://localhost:${port}`;
+  const CA = (await (await fetch(`${BASE}/api/certs/local-ca.pem`, { headers: { cookie: COOKIE } })).text());
+  const DD = `servify-auth-${randomBytes(3).toString('hex')}.test`;
+  const DD_ORIGIN = `https://${DD}:${HTTPS_PORT}`;
+  const xff = (ip) => ({ 'x-forwarded-for': ip });
+
+  /** One request, to the dashboard port (default) or through the router's HTTPS port (router: true). */
+  const hreq = ({ router = false, host, path, method = 'GET', headers = {}, body } = {}) =>
+    new Promise((resolve) => {
+      const t0 = Date.now();
+      const data = body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body);
+      const opts = {
+        host: '127.0.0.1',
+        port: router ? HTTPS_PORT : port,
+        path,
+        method,
+        agent: false,
+        headers: { host: host ?? (router ? `${DD}:${HTTPS_PORT}` : `localhost:${port}`), ...(data !== undefined ? { 'content-type': 'application/json' } : {}), ...headers },
+        ...(router ? { servername: DD, ca: CA } : {}),
+      };
+      const r = (router ? https : http).request(opts, (res) => {
+        let b = '';
+        res.on('data', (c) => (b += c));
+        res.on('end', () => {
+          let json = {};
+          try {
+            json = JSON.parse(b);
+          } catch {}
+          resolve({ status: res.statusCode, headers: res.headers, json, ms: Date.now() - t0 });
+        });
+      });
+      r.on('error', (e) => resolve({ status: 0, headers: {}, json: { error: e.message }, ms: Date.now() - t0 }));
+      r.end(data);
+    });
+  const cookieOf = (r) => String([].concat(r.headers['set-cookie'] ?? [])[0] ?? '').split(';')[0];
+  const setCookieLine = (r) => String([].concat(r.headers['set-cookie'] ?? [])[0] ?? '');
+  const as = (cookie, o) => hreq({ ...o, headers: { ...(o.router ? { origin: DD_ORIGIN } : { origin: LOCAL_ORIGIN }), ...(cookie ? { cookie } : {}), ...(o.headers ?? {}) } });
+  const login = (o = {}) => hreq({ path: '/api/auth/login', method: 'POST', body: { password: o.password ?? PASSWORD }, ...o, headers: { origin: o.router ? DD_ORIGIN : LOCAL_ORIGIN, ...(o.headers ?? {}) } });
+  const relogin = async () => {
+    const r = await login();
+    if (r.status !== 200) throw new Error(`could not sign in again (${r.status} ${r.json.error ?? ''})`);
+    COOKIE = cookieOf(r);
+  };
+  const ageSession = (cookie) => {
+    const sid = decodeURIComponent(cookie.split('=')[1]);
+    const db = new DatabaseSync(join(DATA, 'servify.db'));
+    db.prepare('UPDATE sessions SET reauth_at = 0 WHERE id = ?').run(`h:${createHash('sha256').update(sid).digest('hex')}`);
+    db.close();
+  };
+  const cliAuth = (args, input) => spawnSync(process.execPath, [new URL('../server/bin/servify.mjs', import.meta.url).pathname, 'auth', ...args], { env: { ...process.env, SERVIFY_DATA_DIR: DATA }, input, encoding: 'utf8' });
+  const setPolicy = (policy, cookie = COOKIE) => as(cookie, { path: '/api/auth/password-policy', method: 'PUT', body: { policy } });
+  const pkOptions = (o = {}) => as(null, { path: '/api/auth/passkey/options', method: 'POST', body: {}, ...o });
+  const pkLogin = (o, challengeId, response) => as(null, { path: '/api/auth/passkey/login', method: 'POST', body: { challengeId, response }, ...o });
+  /** A full passkey sign-in with `auth` on this host (router or direct); returns the response. */
+  const passkeySignIn = async (auth, o = {}, assertOpts = {}) => {
+    const opt = await pkOptions(o);
+    if (opt.status !== 200) return opt;
+    const origin = o.router ? DD_ORIGIN : LOCAL_ORIGIN;
+    return pkLogin(o, opt.json.challengeId, await auth.assert(opt.json.options, { origin, ...assertOpts }));
+  };
+  const created = { tokens: [], channel: null };
+
+  // ─── the throttle's arithmetic ───
+  console.log('\n▸ sign-in throttle: the arithmetic');
+  {
+    const { FailureThrottle } = await import(new URL('../server/src/throttle.ts', import.meta.url).href);
+    let now = 1_000_000_000;
+    const t = new FailureThrottle({}, () => now);
+    const fails = [1, 2, 3, 4].map(() => t.fail('a').lockMs);
+    check('the first four failures in a row cost nothing', fails.every((x) => x === 0) && t.lockedMs('a') === 0);
+    const locks = [t.fail('a').lockMs, t.fail('a').lockMs, t.fail('a').lockMs];
+    check('then the lock doubles: 1 s, 2 s, 4 s', JSON.stringify(locks) === '[1000,2000,4000]', JSON.stringify(locks));
+    for (let i = 0; i < 20; i++) t.fail('a');
+    check('…up to 15 minutes at most', t.lockedMs('a') === 15 * 60_000, String(t.lockedMs('a')));
+    check('another address is not affected', t.lockedMs('b') === 0);
+    t.succeed('a');
+    check('a success resets the address', t.lockedMs('a') === 0 && t.fail('a').lockMs === 0);
+    const d = new FailureThrottle({}, () => now);
+    for (let i = 0; i < 50; i++) {
+      d.fail('c');
+      now += 20 * 60_000; // past every backoff lock
+    }
+    check('the daily cap: 50 failures within 24 h lock the address until the oldest is a day old', d.lockedMs('c') > 0 && d.lockedMs('c') <= 86_400_000, String(d.lockedMs('c')));
+    now += 86_400_000;
+    check('…and a quiet day forgets it', d.lockedMs('c') === 0);
+    const g = new FailureThrottle({}, () => now);
+    for (let i = 0; i < 30; i++) g.fail(`ip${i}`);
+    check('global: up to 30 failures a minute, no slow-down', g.globalDelayMs() === 0);
+    for (let i = 0; i < 20; i++) g.fail(`ip${i + 30}`);
+    check('above it each password check waits (100 ms per extra failure)', g.globalDelayMs() === 2000, String(g.globalDelayMs()));
+    for (let i = 0; i < 500; i++) g.fail(`x${i}`);
+    check('…never more than 5 s, and never a refusal (no lock for fresh addresses)', g.globalDelayMs() === 5000 && g.lockedMs('fresh') === 0);
+    now += 61_000;
+    check('a quiet minute ends the slow-down', g.globalDelayMs() === 0);
+  }
+
+  // ─── fixtures ───
+  console.log('\n▸ sign-in: fixtures');
+  check('starts with password sign-in everywhere and no passkeys (clean instance)', (await as(COOKIE, { path: '/api/auth/security' })).json.passwordPolicy === 'everywhere' && (await as(COOKIE, { path: '/api/auth/security' })).json.passkeys?.length === 0);
+  const hooks = [];
+  const receiver = http.createServer((q, s) => {
+    let b = '';
+    q.on('data', (c) => (b += c));
+    q.on('end', () => {
+      try {
+        hooks.push(JSON.parse(b));
+      } catch {}
+      s.end('ok');
+    });
+  });
+  await new Promise((r) => receiver.listen(0, '127.0.0.1', r));
+  cleanups.push(() => new Promise((r) => receiver.close(r)));
+  const ch = await api('POST', '/settings/notifications/channels', { name: 'acc-auth', type: 'webhook', url: `http://127.0.0.1:${receiver.address().port}/hook`, events: ['auth.failed'] });
+  cleanups.push(() => api('DELETE', `/settings/notifications/channels/${ch.id}`).catch(() => {}));
+  const settings0 = await api('GET', '/settings');
+  // Open to anyone, so the router passes forwarded addresses through instead of refusing them at the door.
+  await api('PATCH', '/settings/general', { dashboardDomain: DD, dashboardAllow: [] });
+  cleanups.push(() => api('PATCH', '/settings/general', { dashboardDomain: settings0.dashboardDomain ?? null, dashboardAllow: settings0.dashboardAllow }).catch(() => {}));
+  const readTok = (await api('POST', '/tokens', { name: 'acc-auth-read', scope: 'read' })).token;
+  const readId = (await api('GET', '/tokens')).find((t) => t.name === 'acc-auth-read')?.id;
+  cleanups.push(() => api('DELETE', `/tokens/${readId}`).catch(() => {}));
+
+  // ─── where passkeys can be used ───
+  console.log('\n▸ passkeys: which hosts');
+  const st = async (o) => (await hreq({ path: '/api/auth/status', ...o })).json.passkeySignIn ?? {};
+  const local = await st({});
+  check('http://localhost: passkeys available, bound to "localhost"', local.available === true && local.rpId === 'localhost', JSON.stringify(local));
+  const ip = await st({ host: `127.0.0.1:${port}` });
+  check('an IP address (even 127.0.0.1): no passkeys, and the login page is told why', ip.available === false && /IP address/.test(ip.reason ?? ''), JSON.stringify(ip));
+  const lan = await st({ host: `192.0.2.10:${port}` });
+  check('a LAN address over plain HTTP: no passkeys', lan.available === false, JSON.stringify(lan));
+  const appHost = await st({ host: `web.someproject.localhost:${port}` });
+  check('*.localhost names Servify does not list (hosted apps live there): no passkeys', appHost.available === false && /aren't offered/.test(appHost.reason ?? ''), JSON.stringify(appHost));
+  const ddHttp = await st({ host: `${DD}:${port}` });
+  check('the dashboard domain over plain HTTP (dashboard port): no passkeys, "need HTTPS"', ddHttp.available === false && /HTTPS/.test(ddHttp.reason ?? ''), JSON.stringify(ddHttp));
+  const ddHttps = await st({ router: true });
+  check('the dashboard domain over HTTPS through the router: passkeys bound to it', ddHttps.available === true && ddHttps.rpId === DD, JSON.stringify(ddHttps));
+  const caDir = mkdtempSync(join(tmpdir(), 'acc-auth-ca-'));
+  writeFileSync(join(caDir, 'ca.pem'), CA);
+  cleanups.push(() => rmSync(caDir, { recursive: true, force: true }));
+  const curlStatus = execSync(`curl -s --max-time 10 --resolve ${DD}:${HTTPS_PORT}:127.0.0.1 --cacert ${join(caDir, 'ca.pem')} https://${DD}:${HTTPS_PORT}/api/auth/status`).toString();
+  check('curl --resolve with the local CA (the real HTTPS path): passkeys offered for the domain', JSON.parse(curlStatus).passkeySignIn?.rpId === DD, curlStatus.slice(0, 160));
+
+  // ─── password policy ───
+  console.log('\n▸ password policy');
+  check('"off" is refused while there is no passkey (409)', (await setPolicy('off')).status === 409);
+  check('an unknown value is refused (400)', (await setPolicy('sometimes')).status === 400);
+  check('tokens can\'t change it', (await hreq({ path: '/api/auth/password-policy', method: 'PUT', body: { policy: 'private' }, headers: { authorization: `Bearer ${readTok}` } })).status === 403);
+  const pPriv = await setPolicy('private');
+  check('"private networks only" is set (fresh session)', pPriv.status === 200 && pPriv.json.passwordPolicy === 'private', `${pPriv.status} ${pPriv.json.error ?? ''}`);
+  check('…from this machine (loopback, no proxy) the password still works', (await login()).status === 200);
+  if (TRUSTS_LOCAL) {
+    const pub = await login({ headers: xff('203.0.113.7') });
+    check('trusted proxy: a public forwarded client is refused (403 password_private_only)', pub.status === 403 && pub.json.code === 'password_private_only', `${pub.status} ${pub.json.code}`);
+    check('trusted proxy: a private forwarded client (10.x) is let in', (await login({ headers: xff('10.20.30.40') })).status === 200);
+    const dev = await hreq({ path: '/api/auth/device', method: 'POST', body: { password: PASSWORD, name: 'acc' }, headers: { origin: 'http://localhost', ...xff('203.0.113.7') } });
+    check('…and the phone app sign-in (/auth/device) obeys it too', dev.status === 403 && dev.json.code === 'password_private_only', `${dev.status}`);
+    const viaRouter = await login({ router: true, headers: xff('198.51.100.44') });
+    check('through the dashboard domain the router passes the real visitor on: public → refused', viaRouter.status === 403 && viaRouter.json.code === 'password_private_only', `${viaRouter.status} ${viaRouter.json.code ?? ''}`);
+    check('…and its own loopback hop does not count as private for a public visitor, but a local visitor gets in', (await login({ router: true })).status === 200);
+    const stPub = (await hreq({ path: '/api/auth/status', headers: xff('203.0.113.7') })).json.passwordSignIn;
+    check('/auth/status tells a public client the password is refused here (for the login page)', stPub?.allowed === false && stPub.code === 'password_private_only', JSON.stringify(stPub));
+  } else {
+    const spoofPub = await login({ headers: xff('203.0.113.7') });
+    const spoofPriv = await login({ headers: xff('10.20.30.40') });
+    check('untrusted peer sending X-Forwarded-For: not believed either way — refused, fails closed (403)', spoofPub.status === 403 && spoofPriv.status === 403 && spoofPriv.json.code === 'password_private_only', `${spoofPub.status} ${spoofPriv.status}`);
+    const viaRouter = await login({ router: true, headers: xff('10.20.30.40') });
+    check('through the router with X-Forwarded-For from an untrusted peer: refused too (the router flags it)', viaRouter.status === 403, `${viaRouter.status}`);
+    check('…and without it, the local visitor through the router gets in', (await login({ router: true })).status === 200);
+  }
+  check('back to "everywhere"', (await setPolicy('everywhere')).json.passwordPolicy === 'everywhere');
+
+  // ─── confirming before sensitive changes ───
+  console.log('\n▸ confirm it is you (re-authentication)');
+  ageSession(COOKIE);
+  const stale = await as(COOKIE, { path: '/api/auth/passkeys/options', method: 'POST', body: {} });
+  check('a session signed in more than 5 minutes ago must confirm first (403 reauth_required)', stale.status === 403 && stale.json.code === 'reauth_required', `${stale.status} ${stale.json.code}`);
+  check('…also for the password policy', (await setPolicy('private')).json.code === 'reauth_required');
+  check('a wrong password does not confirm (401)', (await as(COOKIE, { path: '/api/auth/reauth', method: 'POST', body: { password: 'nope-nope' } })).status === 401);
+  const ok = await as(COOKIE, { path: '/api/auth/reauth', method: 'POST', body: { password: PASSWORD } });
+  check('the right one does, for 5 minutes', ok.status === 200 && ok.json.freshUntil > Date.now() + 4 * 60_000);
+  const devSignin = await hreq({ path: '/api/auth/device', method: 'POST', body: { password: PASSWORD, name: 'acc-auth-phone' }, headers: { origin: 'http://localhost' } });
+  const devTok = devSignin.json.token;
+  check('a phone signs in with the password (everywhere)', devSignin.status === 201 && typeof devTok === 'string');
+  check('a phone (device token) can\'t add passkeys or change the policy, though it acts as the owner', (await hreq({ path: '/api/auth/passkeys/options', method: 'POST', body: {}, headers: { authorization: `Bearer ${devTok}` } })).status === 403 && (await hreq({ path: '/api/auth/password-policy', method: 'PUT', body: { policy: 'off' }, headers: { authorization: `Bearer ${devTok}` } })).status === 403);
+
+  // ─── adding a passkey ───
+  console.log('\n▸ passkeys: adding');
+  const A = await softAuthenticator();
+  const regOpt = await as(COOKIE, { path: '/api/auth/passkeys/options', method: 'POST', body: {} });
+  check('registration options: discoverable, user verification required, bound to localhost', regOpt.status === 200 && regOpt.json.options?.rp?.id === 'localhost' && regOpt.json.options.authenticatorSelection?.residentKey === 'required' && regOpt.json.options.authenticatorSelection?.userVerification === 'required', JSON.stringify(regOpt.json.options?.authenticatorSelection));
+  const badOrigin = await softAuthenticator();
+  const regBad = await as(COOKIE, { path: '/api/auth/passkeys', method: 'POST', body: { challengeId: regOpt.json.challengeId, response: badOrigin.register(regOpt.json.options, { origin: 'http://evil.example' }) } });
+  check('a registration from another origin is refused', regBad.status === 400, `${regBad.status}`);
+  const regReplay = await as(COOKIE, { path: '/api/auth/passkeys', method: 'POST', body: { challengeId: regOpt.json.challengeId, response: A.register(regOpt.json.options, { origin: LOCAL_ORIGIN }) } });
+  check('…and its challenge is gone afterwards (single use, pass or fail)', regReplay.status === 401 && regReplay.json.code === 'challenge_expired', `${regReplay.status} ${regReplay.json.code}`);
+  const otherSession = cookieOf(await login());
+  const regOpt2 = await as(COOKIE, { path: '/api/auth/passkeys/options', method: 'POST', body: {} });
+  const regOtherSess = await as(otherSession, { path: '/api/auth/passkeys', method: 'POST', body: { challengeId: regOpt2.json.challengeId, response: A.register(regOpt2.json.options, { origin: LOCAL_ORIGIN }) } });
+  check('a registration challenge belongs to the session that asked for it', regOtherSess.status === 401 && regOtherSess.json.code === 'challenge_mismatch', `${regOtherSess.status} ${regOtherSess.json.code}`);
+  const regOpt3 = await as(COOKIE, { path: '/api/auth/passkeys/options', method: 'POST', body: {} });
+  const reg = await as(COOKIE, { path: '/api/auth/passkeys', method: 'POST', body: { challengeId: regOpt3.json.challengeId, response: A.register(regOpt3.json.options, { origin: LOCAL_ORIGIN }), name: 'acc soft key' } });
+  check('a passkey is added (software authenticator, "none" attestation)', reg.status === 201 && reg.json.passkey?.rpId === 'localhost' && reg.json.passkey?.name === 'acc soft key', `${reg.status} ${reg.json.error ?? ''}`);
+  check('the first passkey: the server suggests "private networks only" — and changes nothing by itself', reg.json.suggestPolicy === 'private' && (await as(COOKIE, { path: '/api/auth/security' })).json.passwordPolicy === 'everywhere');
+  const sec = (await as(COOKIE, { path: '/api/auth/security' })).json;
+  check('the list shows name, host (RP id), created and last used', sec.passkeys?.length === 1 && sec.passkeys[0].rpId === 'localhost' && sec.passkeys[0].createdAt > 0 && sec.passkeys[0].lastUsedAt === null && !('publicKey' in sec.passkeys[0]));
+  const regOpt4 = await as(COOKIE, { path: '/api/auth/passkeys/options', method: 'POST', body: {} });
+  check('the same authenticator is excluded next time (excludeCredentials)', regOpt4.json.options?.excludeCredentials?.some((c) => c.id === A.id));
+  const pkId = reg.json.passkey?.id;
+  check('rename works', (await as(COOKIE, { path: `/api/auth/passkeys/${pkId}`, method: 'PATCH', body: { name: 'acc renamed' } })).json.name === 'acc renamed');
+
+  // ─── signing in with it ───
+  console.log('\n▸ passkeys: signing in');
+  const good = await passkeySignIn(A);
+  const pkCookie = cookieOf(good);
+  check('sign in with the passkey: a session cookie (no Secure on plain http://localhost)', good.status === 200 && pkCookie.startsWith('servify_session=') && !/;\s*Secure/i.test(setCookieLine(good)), `${good.status} ${good.json.error ?? ''}`);
+  check('…that works', (await as(pkCookie, { path: '/api/projects' })).status === 200);
+  check('…and last used is recorded', (await as(COOKIE, { path: '/api/auth/security' })).json.passkeys[0].lastUsedAt > 0);
+  // Negative cases, each followed by a good sign-in (which resets this address's passkey failures).
+  const neg = async (label, fn, want = 401) => {
+    const r = await fn();
+    check(label, r.status === want, `${r.status} ${r.json.code ?? ''} ${r.json.error ?? ''}`.slice(0, 160));
+    await passkeySignIn(A);
+    return r;
+  };
+  {
+    const o = await pkOptions();
+    const resp = await A.assert(o.json.options, { origin: LOCAL_ORIGIN });
+    await pkLogin({}, o.json.challengeId, resp);
+    await neg('a replayed assertion (same challenge) is refused', () => pkLogin({}, o.json.challengeId, resp));
+  }
+  await neg('a wrong origin is refused', async () => {
+    const o = await pkOptions();
+    return pkLogin({}, o.json.challengeId, await A.assert(o.json.options, { origin: 'http://evil.example' }));
+  });
+  await neg('a wrong RP id (signed for another host) is refused', async () => {
+    const o = await pkOptions();
+    return pkLogin({}, o.json.challengeId, await A.assert(o.json.options, { origin: LOCAL_ORIGIN, rpId: 'example.com' }));
+  });
+  await neg('an unknown credential is refused (unknown_passkey)', async () => {
+    const stranger = await softAuthenticator();
+    const o = await pkOptions();
+    return pkLogin({}, o.json.challengeId, await stranger.assert(o.json.options, { origin: LOCAL_ORIGIN }));
+  });
+  await neg('a tampered signature is refused', async () => {
+    const o = await pkOptions();
+    return pkLogin({}, o.json.challengeId, await A.assert(o.json.options, { origin: LOCAL_ORIGIN, tamper: true }));
+  });
+  await neg('a counter going backwards is refused (a cloned authenticator)', async () => {
+    const o = await pkOptions();
+    return pkLogin({}, o.json.challengeId, await A.assert(o.json.options, { origin: LOCAL_ORIGIN, count: 1 }));
+  });
+  await neg('a made-up challenge id is refused', async () => {
+    const o = await pkOptions();
+    return pkLogin({}, 'not-a-challenge', await A.assert(o.json.options, { origin: LOCAL_ORIGIN }));
+  });
+  check('passkey options on an IP address are refused (400 passkeys_unavailable)', (await pkOptions({ host: `127.0.0.1:${port}`, headers: { origin: `http://127.0.0.1:${port}` } })).json.code === 'passkeys_unavailable');
+
+  // ─── the dashboard domain: Secure cookies, a passkey bound to it ───
+  console.log('\n▸ the dashboard domain over HTTPS');
+  const ddLogin = await login({ router: true });
+  const ddCookie = cookieOf(ddLogin);
+  check('password sign-in over HTTPS (router): the cookie is Secure, HttpOnly, SameSite=Strict', ddLogin.status === 200 && /;\s*Secure/i.test(setCookieLine(ddLogin)) && /HttpOnly/i.test(setCookieLine(ddLogin)) && /SameSite=Strict/i.test(setCookieLine(ddLogin)), setCookieLine(ddLogin).replace(/=[^;]+/, '=…'));
+  const plainLogin = await login();
+  check('…and not Secure over plain http://localhost', plainLogin.status === 200 && !/;\s*Secure/i.test(setCookieLine(plainLogin)));
+  const B = await softAuthenticator();
+  const ddOpt = await as(ddCookie, { router: true, path: '/api/auth/passkeys/options', method: 'POST', body: {} });
+  const ddReg = await as(ddCookie, { router: true, path: '/api/auth/passkeys', method: 'POST', body: { challengeId: ddOpt.json.challengeId, response: B.register(ddOpt.json.options, { origin: DD_ORIGIN }) } });
+  check('a passkey added through the domain is bound to the domain', ddReg.status === 201 && ddReg.json.passkey?.rpId === DD && ddReg.json.suggestPolicy === null, `${ddReg.status} ${ddReg.json.error ?? ''}`);
+  const ddPk = await passkeySignIn(B, { router: true });
+  check('it signs in there (Secure cookie)', ddPk.status === 200 && /;\s*Secure/i.test(setCookieLine(ddPk)), `${ddPk.status} ${ddPk.json.error ?? ''}`);
+  const crossA = await passkeySignIn(A, { router: true }, { rpId: DD });
+  check('the localhost passkey does not sign in on the domain (wrong_host)', crossA.status === 401 && crossA.json.code === 'wrong_host', `${crossA.status} ${crossA.json.code}`);
+  await passkeySignIn(A);
+  const crossB = await passkeySignIn(B, {}, { rpId: 'localhost' });
+  check('…nor the domain\'s passkey on localhost', crossB.status === 401 && crossB.json.code === 'wrong_host', `${crossB.status} ${crossB.json.code}`);
+  await passkeySignIn(B, { router: true });
+  const ddKey = (await as(COOKIE, { path: '/api/auth/security' })).json.passkeys.find((p) => p.rpId === DD);
+
+  // ─── per-address throttle ───
+  console.log('\n▸ sign-in throttle on the instance');
+  const wrong = (o = {}) => login({ password: 'definitely-wrong', ...o });
+  if (TRUSTS_LOCAL) {
+    const atk = xff('198.51.100.20');
+    const five = [];
+    for (let i = 0; i < 5; i++) five.push((await wrong({ headers: atk })).status);
+    check('an attacker address: five wrong passwords get 401', five.every((s) => s === 401), five.join(','));
+    const locked = await wrong({ headers: atk });
+    check('…then 429 with Retry-After', locked.status === 429 && Number(locked.headers['retry-after']) >= 1 && locked.json.code === 'throttled', `${locked.status} ${locked.headers['retry-after']}`);
+    check('…even with the right password (locked addresses learn nothing)', (await login({ headers: atk })).status === 429);
+    check('the owner from another address signs in at once', (await login({ headers: xff('198.51.100.30') })).status === 200);
+    check('a passkey still signs in from the locked address (counted separately)', (await passkeySignIn(A, { headers: atk })).status === 200);
+    await sleep(2200);
+    check('after the lock, the right password from that address works…', (await login({ headers: atk })).status === 200);
+    check('…and resets it (the next wrong one is a plain 401, not 429)', (await wrong({ headers: atk })).status === 401);
+    for (let i = 0; i < 5; i++) await wrong({ headers: xff('2001:db8:aa:bb::1') });
+    check('IPv6 counts by /64: another address in the same /64 is locked too', (await wrong({ headers: xff('2001:db8:aa:bb::2') })).status === 429);
+    check('…a different /64 is not', (await wrong({ headers: xff('2001:db8:aa:cc::1') })).status === 401);
+    for (let i = 0; i < 5; i++) await hreq({ path: '/api/auth/device', method: 'POST', body: { password: 'wrong-again', name: 'x' }, headers: { origin: 'http://localhost', ...xff('198.51.100.21') } });
+    check('phone sign-in failures count toward the same address limit', (await login({ headers: xff('198.51.100.21') })).status === 429);
+    // The global backstop: many addresses failing at once slow every password check down, never refuse it.
+    for (let a = 0; a < 8; a++) for (let i = 0; i < 5; i++) await wrong({ headers: xff(`198.51.100.${100 + a}`) });
+    const fresh = await login({ headers: xff('198.51.100.250') });
+    check('under a spread-out attack the owner on a fresh address still gets in (slowed, never 429)', fresh.status === 200 && fresh.ms >= 500, `${fresh.status} after ${fresh.ms} ms`);
+    const pkFast = await passkeySignIn(A, { headers: xff('198.51.100.251') });
+    check('…and passkey sign-in is not slowed by it', pkFast.status === 200 && pkFast.ms < 500, `${pkFast.status} ${pkFast.ms} ms`);
+  } else {
+    for (let i = 0; i < 5; i++) await wrong();
+    const locked = await wrong();
+    check('five wrong passwords from this address, then 429 with Retry-After', locked.status === 429 && Number(locked.headers['retry-after']) >= 1, `${locked.status}`);
+    check('a forwarded address from an untrusted peer does not get around it (X-Forwarded-For ignored)', (await wrong({ headers: xff('198.51.100.77') })).status === 429);
+    check('a passkey still signs in (counted separately)', (await passkeySignIn(A)).status === 200);
+    await sleep(2200);
+    check('after the lock the right password works and resets the count', (await login()).status === 200 && (await wrong()).status === 401);
+    await login();
+    console.log('  – the multi-address checks (owner on another address, IPv6 /64, global slow-down) need SERVIFY_TRUSTED_PROXIES=127.0.0.1');
+  }
+
+  // ─── password sign-in off, and the way back ───
+  console.log('\n▸ password sign-in off, and recovery');
+  const pkConfirmOpt = await pkOptions();
+  const pkConfirm = await as(COOKIE, { path: '/api/auth/reauth', method: 'POST', body: { challengeId: pkConfirmOpt.json.challengeId, response: await A.assert(pkConfirmOpt.json.options, { origin: LOCAL_ORIGIN }) } });
+  check('confirming with a passkey works too', pkConfirm.status === 200 && pkConfirm.json.freshUntil > Date.now(), `${pkConfirm.status} ${pkConfirm.json.error ?? ''}`);
+  check('"off" is accepted now that passkeys exist', (await setPolicy('off')).json.passwordPolicy === 'off');
+  const offLogin = await login();
+  const offDev = await hreq({ path: '/api/auth/device', method: 'POST', body: { password: PASSWORD, name: 'x' }, headers: { origin: 'http://localhost' } });
+  check('the password is refused everywhere — dashboard and phone (403 password_off)', offLogin.status === 403 && offLogin.json.code === 'password_off' && offDev.status === 403 && offDev.json.code === 'password_off', `${offLogin.status} ${offDev.status}`);
+  check('…and confirming with it too', (await as(COOKIE, { path: '/api/auth/reauth', method: 'POST', body: { password: PASSWORD } })).json.code === 'password_off');
+  check('passkeys still sign in', (await passkeySignIn(A)).status === 200);
+  check('removing one of two passkeys is fine', (await as(COOKIE, { path: `/api/auth/passkeys/${pkId}`, method: 'DELETE' })).status === 200);
+  const moveDomain = await api('PATCH', '/settings/general', { dashboardDomain: null }).then(() => 200, (e) => Number(/→ (\d+)/.exec(e.message)?.[1]));
+  check('clearing the dashboard domain is refused while its passkey is the only way in (409)', moveDomain === 409, String(moveDomain));
+  check('removing the last usable passkey is refused (409)', (await as(COOKIE, { path: `/api/auth/passkeys/${ddKey?.id}`, method: 'DELETE' })).status === 409);
+  const status0 = cliAuth(['status']);
+  check('`servify auth status` on the host shows the policy and passkeys (no secrets)', status0.status === 0 && /off \(passkeys only\)/.test(status0.stdout) && status0.stdout.includes(DD) && !status0.stdout.includes(PASSWORD), status0.stderr.slice(0, 200));
+  const rst = cliAuth(['reset', '--keep-password']);
+  check('`servify auth reset --keep-password` turns password sign-in back on (no restart)', rst.status === 0 && /allowed everywhere/.test(rst.stdout) && (await login()).status === 200, (rst.stderr || rst.stdout).slice(0, 200));
+  check('…and it ended every dashboard session', (await as(COOKIE, { path: '/api/projects' })).status === 401);
+  const newPw = cliAuth(['reset', '--password-stdin'], `${PASSWORD}\n`);
+  check('`servify auth reset --password-stdin` sets a new password from stdin (never argv)', newPw.status === 0 && /new owner password/.test(newPw.stdout), (newPw.stderr || newPw.stdout).slice(0, 200));
+  check('a too-short password is refused and nothing changes', cliAuth(['reset', '--password-stdin'], 'abc\n').status === 1 && (await login()).status === 200);
+  check('the activity log records the reset', (await (async () => (await relogin(), await api('GET', '/activity?limit=50')))()).some((a) => a.action === 'auth.reset'));
+
+  // ─── sign out everywhere ───
+  console.log('\n▸ sign out everywhere');
+  const s1 = cookieOf(await login());
+  const s2 = cookieOf(await login());
+  const phone = (await hreq({ path: '/api/auth/device', method: 'POST', body: { password: PASSWORD, name: 'acc-auth-phone-2' }, headers: { origin: 'http://localhost' } })).json.token;
+  const out1 = await as(s1, { path: '/api/auth/signout-all', method: 'POST', body: {} });
+  check('ends every dashboard session, this one too', out1.status === 200 && (await as(s1, { path: '/api/projects' })).status === 401 && (await as(s2, { path: '/api/projects' })).status === 401 && (await as(COOKIE, { path: '/api/projects' })).status === 401);
+  check('…phones stay signed in unless asked', (await hreq({ path: '/api/projects', headers: { authorization: `Bearer ${phone}` } })).status === 200);
+  await relogin();
+  const out2 = await as(COOKIE, { path: '/api/auth/signout-all', method: 'POST', body: { devices: true } });
+  check('with devices: true every phone is signed out too', out2.status === 200 && out2.json.devices >= 1 && (await hreq({ path: '/api/projects', headers: { authorization: `Bearer ${phone}` } })).status === 401 && (await hreq({ path: '/api/projects', headers: { authorization: `Bearer ${devTok}` } })).status === 401);
+  check('tokens can\'t sign everyone out', (await hreq({ path: '/api/auth/signout-all', method: 'POST', body: {}, headers: { authorization: `Bearer ${readTok}` } })).status === 403);
+  await relogin();
+
+  // ─── phone pairing ───
+  console.log('\n▸ approving a phone from the dashboard');
+  const app = { origin: 'http://localhost' };
+  const tip = (n) => (TRUSTS_LOCAL ? xff(`192.0.2.${n}`) : {});
+  const start = (n, name = 'acc pixel') => hreq({ path: '/api/auth/pair/start', method: 'POST', body: { name }, headers: { ...app, ...tip(n) } });
+  const poll = (pid, n) => hreq({ path: `/api/auth/pair/${pid}`, headers: { ...app, ...tip(n) } });
+  const events = [];
+  const listen = (headers) => {
+    const r = http.get({ host: '127.0.0.1', port, path: '/api/events', headers: { host: `localhost:${port}`, accept: 'text/event-stream', ...headers }, agent: false }, (res) => res.on('data', (c) => events.push([headers.cookie ? 'owner' : 'token', String(c)])));
+    r.on('error', () => {});
+    return r;
+  };
+  const evOwner = listen({ cookie: COOKIE });
+  const evTok = listen({ authorization: `Bearer ${readTok}` });
+  await sleep(400);
+  const p1 = await start(1);
+  check('POST /auth/pair/start (from the app\'s origin, no credentials): 201 with pairingId, an 8-character code and expiresAt', p1.status === 201 && p1.json.pairingId?.length >= 40 && /^[A-HJ-NP-Z2-9]{8}$/.test(p1.json.code ?? '') && p1.json.expiresAt > Date.now(), `${p1.status} ${p1.json.error ?? ''}`);
+  const ttl = p1.json.expiresAt - Date.now();
+  check('the app polls: pending', (await poll(p1.json.pairingId, 1)).json.status === 'pending');
+  const pend = await as(COOKIE, { path: '/api/auth/pairings' });
+  const mine = pend.json.find?.((p) => p.code === p1.json.code);
+  check('the owner sees it: code, device name, address and time (no pairingId)', !!mine && mine.name === 'acc pixel' && mine.ip === (TRUSTS_LOCAL ? '192.0.2.1' : '127.0.0.1') && mine.createdAt > 0 && !JSON.stringify(pend.json).includes(p1.json.pairingId), JSON.stringify(mine ?? {}).replace(/"code":"[^"]+"/, '"code":"…"'));
+  check('tokens can\'t list or approve pairings', (await hreq({ path: '/api/auth/pairings', headers: { authorization: `Bearer ${readTok}` } })).status === 403 && (await hreq({ path: `/api/auth/pairings/${mine?.id}/approve`, method: 'POST', body: {}, headers: { authorization: `Bearer ${readTok}` } })).status === 403);
+  await sleep(400);
+  check('the owner\'s dashboard is told (auth.pairing event); a read token\'s event stream is not', events.some(([w, d]) => w === 'owner' && d.includes('auth.pairing')) && !events.some(([w, d]) => w === 'token' && d.includes('auth.pairing')));
+  evOwner.destroy();
+  evTok.destroy();
+  check('approve', (await as(COOKIE, { path: `/api/auth/pairings/${mine?.id}/approve`, method: 'POST', body: {} })).status === 200);
+  const claimed = await poll(p1.json.pairingId, 1);
+  const pairTok = claimed.json.token;
+  check('the next poll: approved, with a device token and the device record', claimed.status === 200 && claimed.json.status === 'approved' && /^svf_/.test(pairTok ?? '') && claimed.json.device?.kind === 'device' && claimed.json.device?.name === 'acc pixel', `${claimed.status} ${claimed.json.status}`);
+  const again = await poll(p1.json.pairingId, 1);
+  check('…exactly once: the poll after that gets nothing (404 expired)', again.status === 404 && again.json.status === 'expired' && !again.json.token);
+  check('the token is a normal device token: listed under signed-in devices, acts as the owner', (await api('GET', '/devices')).some((d) => d.name === 'acc pixel') && (await hreq({ path: '/api/devices', headers: { authorization: `Bearer ${pairTok}` } })).status === 200);
+  check('…and it can sign itself out', (await hreq({ path: '/api/auth/device', method: 'DELETE', headers: { authorization: `Bearer ${pairTok}` } })).status === 200);
+  const acts = JSON.stringify(await api('GET', '/activity?limit=50'));
+  check('neither the code nor the pairingId reaches the activity log', !acts.includes(p1.json.code) && !acts.includes(p1.json.pairingId));
+  const p2 = await start(2, 'acc deny me');
+  const p2id = (await as(COOKIE, { path: '/api/auth/pairings' })).json.find((p) => p.code === p2.json.code)?.id;
+  check('deny', (await as(COOKIE, { path: `/api/auth/pairings/${p2id}/deny`, method: 'POST', body: {} })).status === 200);
+  check('…the app is told: denied (no token)', (await poll(p2.json.pairingId, 2)).json.status === 'denied');
+  check('…and a denied request can\'t be approved afterwards', (await as(COOKIE, { path: `/api/auth/pairings/${p2id}/approve`, method: 'POST', body: {} })).status === 404);
+  check('a made-up pairingId: 404 expired', (await poll(randomBytes(32).toString('base64url'), 2)).status === 404);
+  const p3 = await start(3, 'acc second');
+  const p4 = await start(3, 'acc third');
+  const p5 = await start(3, 'acc fourth');
+  check('at most 2 waiting requests per address (the third: 429)', p3.status === 201 && p4.status === 201 && p5.status === 429 && Number(p5.headers['retry-after']) > 0, `${p3.status} ${p4.status} ${p5.status}`);
+  if (ttl <= 20_000) {
+    // p3 and p4 are still waiting: let them run out.
+    await sleep(Math.max(0, p4.json.expiresAt - Date.now()) + 1500);
+    const exp = await poll(p4.json.pairingId, 3);
+    check('an unanswered request expires (the app sees "expired")', exp.json.status === 'expired', JSON.stringify(exp.json.status));
+    check('…and is gone from the owner\'s list', !(await as(COOKIE, { path: '/api/auth/pairings' })).json.some((p) => p.code === p4.json.code || p.code === p3.json.code));
+    check('…which frees the address\'s slots', (await as(COOKIE, { path: '/api/auth/pairings' })).json.length === 0);
+  } else {
+    console.log(`  – skipped the expiry check (start Servify with SERVIFY_PAIRING_TTL_MS=15000; the TTL here is ${Math.round(ttl / 1000)} s)`);
+    await as(COOKIE, { path: '/api/auth/pairings/deny-all', method: 'POST', body: {} });
+  }
+  if (TRUSTS_LOCAL) {
+    for (let n = 10; n < 15; n++) for (let k = 0; k < 2; k++) await start(n);
+    const full = await start(20);
+    check('at most 10 waiting in all: then new requests are refused (429), not pushed out', full.status === 429 && /waiting/.test(full.json.error ?? ''), `${full.status}`);
+    check('deny all frees them', (await as(COOKIE, { path: '/api/auth/pairings/deny-all', method: 'POST', body: {} })).json.denied === 10 && (await start(20)).status === 201);
+    const starts = [];
+    for (let k = 0; k < 6; k++) {
+      const r = await start(30);
+      starts.push(r.status);
+      await as(COOKIE, { path: '/api/auth/pairings/deny-all', method: 'POST', body: {} });
+    }
+    check('at most 5 starts per address per 10 minutes', JSON.stringify(starts) === '[201,201,201,201,201,429]', starts.join(','));
+  }
+  await as(COOKIE, { path: '/api/auth/pairings/deny-all', method: 'POST', body: {} });
+
+  // ─── what the owner hears about failures ───
+  console.log('\n▸ failed sign-ins in the activity log and notifications');
+  await sleep(4500); // SERVIFY_AUTH_LOG_QUIET_MS=3000
+  const fails = (await api('GET', '/activity?limit=200')).filter((a) => a.action === 'auth.failed' && a.ts >= sectionStart);
+  const counted = fails.reduce((n, a) => n + Number(/^(\d+) failed/.exec(a.summary)?.[1] ?? 0), 0);
+  check(`failures are logged in batches: ${counted} failures in ${fails.length} entr${fails.length === 1 ? 'y' : 'ies'}`, fails.length >= 1 && counted >= 10 && fails.length * 3 < counted, fails.map((a) => a.summary.slice(0, 80)).join(' | '));
+  check('…naming the addresses and how they were tried', fails.some((a) => /password/.test(a.summary) && /\(\d+\)/.test(a.summary)));
+  const notes = hooks.filter((h) => h.event === 'auth.failed');
+  check('one notification for the whole burst', notes.length === 1, `${notes.length}`);
+
+  // ─── leave it as it was ───
+  const done = cliAuth(['reset', '--keep-password', '--remove-passkeys']);
+  check('clean-up: `servify auth reset --keep-password --remove-passkeys`', done.status === 0 && /passkey\(s\) removed/.test(done.stdout), (done.stderr || done.stdout).slice(0, 200));
+  await relogin();
 }
 
 main()

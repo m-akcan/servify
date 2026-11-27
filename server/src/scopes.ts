@@ -164,6 +164,8 @@ export function eventFor(p: Principal, ev: ServerEvent): ServerEvent | null {
   switch (ev.type) {
     case 'hello':
       return ev;
+    case 'auth.pairing':
+      return null;
     case 'project.updated':
       return inReach(p, ev.project.id) ? ev : null;
     case 'project.deleted':
