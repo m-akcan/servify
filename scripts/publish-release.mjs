@@ -127,7 +127,10 @@ if (apkArg) {
   const prevTag = sh('git', ['-C', src, 'tag', '--list', 'v*', '--sort=-v:refname', '--merged', commit]).split('\n').filter((t) => t && t !== tag)[0];
   const prevManifest = previousManifest(prevTag);
   if (prevManifest?.android) {
-    if (!(apk.versionCode > prevManifest.android.versionCode)) fail(`the APK's versionCode ${apk.versionCode} isn't higher than ${prevManifest.android.versionCode} in ${prevManifest.tag ?? 'the previous release'}'s manifest — raise mobile/package.json's version and rebuild`);
+    // The unchanged app again (a server-only release) is fine: each Servify mirrors the app from its own release.
+    const sameApp = apk.versionCode === prevManifest.android.versionCode && apk.sha256 === prevManifest.android.sha256;
+    if (sameApp) console.log(`  the same app as ${prevManifest.tag ?? 'the previous release'} (unchanged)`);
+    else if (!(apk.versionCode > prevManifest.android.versionCode)) fail(`the APK's versionCode ${apk.versionCode} isn't higher than ${prevManifest.android.versionCode} in ${prevManifest.tag ?? 'the previous release'}'s manifest — raise mobile/package.json's version and rebuild`);
     console.log(`  newer than the app in ${prevManifest.tag ?? 'the previous release'} (versionCode ${prevManifest.android.versionCode})`);
   } else if (prevManifest) console.log(`  ${prevManifest.tag ?? 'the previous release'} has no app in its manifest: nothing to compare`);
 } else {
