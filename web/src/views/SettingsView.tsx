@@ -1197,7 +1197,7 @@ function RegistryLogins() {
           <div className="faint">Loading…</div>
         ) : logins.length === 0 ? (
           <div className="faint" style={{ fontSize: 13 }}>
-            No logins yet. Public images need none. Servify also uses a <span className="mono">docker login</span> made on this machine by the user it runs as, but only for pulls on this machine.
+            No logins yet. Public images need none. Servify also uses a <span className="mono">docker login</span> made on this machine by the user it runs as, but doesn’t send it to your other servers itself.
           </div>
         ) : (
           <div className="channel-list">
