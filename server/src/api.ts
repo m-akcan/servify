@@ -53,6 +53,7 @@ import { fileURLToPath } from 'node:url';
 import { replicasOf } from './engine.ts';
 import * as settings from './settings.ts';
 import * as updater from './updater.ts';
+import * as relocate from './relocate.ts';
 import { testChannel, recentDeliveries } from './notify.ts';
 import { recentHookDeliveries, deployHookToken } from './hooks.ts';
 import { listCertificates, retryCertificate, localCaPem } from './certs.ts';
@@ -832,9 +833,14 @@ api.post('/services/:id/move-project', async (c) => {
   return c.json(moveServiceToProject(actor(c), c.req.param('id'), project ?? '', { force: force === true, name }).service);
 });
 api.post('/services/:id/move', async (c) => {
-  const { server } = await jsonBody<{ server: string }>(c);
-  return c.json(await ops.moveService(actor(c), c.req.param('id'), server ?? ''));
+  const { server, withData } = await jsonBody<{ server: string; withData?: boolean }>(c);
+  return c.json(await ops.moveService(actor(c), c.req.param('id'), server ?? '', { withData: withData === true }));
 });
+// Moving with data (relocate.ts): what it would take, forgetting a finished move's outcome, the copy left behind.
+api.get('/services/:id/move-plan', async (c) => c.json(await relocate.movePlan(ops.getServiceOrThrow(c.req.param('id')), ops.resolveServer(c.req.query('server') ?? ''))));
+api.delete('/services/:id/move', (c) => c.json(ops.serializeService(relocate.dismissMove(ops.getServiceOrThrow(c.req.param('id'))))));
+api.post('/volumes/:id/discard-move-copy', async (c) => c.json(await relocate.discardMoveCopy(actor(c), c.req.param('id'))));
+api.post('/volumes/:id/keep-move-copy', (c) => c.json(relocate.keepMoveCopy(actor(c), c.req.param('id'))));
 
 api.post('/services/:id/cluster/switchover', async (c) => {
   const { to } = await jsonBody<{ to?: number }>(c);

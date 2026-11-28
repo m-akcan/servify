@@ -1551,3 +1551,42 @@
     flex-wrap: wrap;
   }
 }
+
+/* ───────────── moving a service with its data ───────────── */
+.move-plan {
+  display: grid;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+  font-size: var(--fs-13);
+}
+.move-plan-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 4px 0;
+  color: var(--text-2);
+}
+.move-plan-row .mono {
+  font-size: 12px;
+}
+.move-plan-total {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-2);
+  color: var(--text);
+}
+.move-progress .ov-bar {
+  background: color-mix(in srgb, var(--build) 15%, var(--bg-3));
+}
+.vol-node-copy {
+  color: var(--warn);
+}
+@media (max-width: 560px) {
+  .move-plan-row .faint {
+    display: none;
+  }
+}

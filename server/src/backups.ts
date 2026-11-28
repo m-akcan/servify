@@ -38,7 +38,7 @@ import { minuteOf } from './cron.ts';
 import { anyPending, dropPending, readBeat, reportOutcome, stepSchedule, writeBeat, type CatchUpInfo } from './schedstate.ts';
 import type { BackupMethod, BackupRecord, BackupTest, DatabaseKind, SafetyBackupConfig, Service, VolumeRecord } from './types.ts';
 
-const HELPER_IMAGE = 'alpine:3.20';
+export const HELPER_IMAGE = 'alpine:3.20';
 // Docker's default log driver keeps a copy of everything a container prints. For a helper that prints the archive
 // itself that is a second copy of the whole volume under /var/lib/docker until it exits. We read the output over
 // the attached stream, which doesn't need the log.
@@ -123,7 +123,7 @@ const READY: Record<Exclude<BackupMethod, 'volume'>, string> = {
 // ───────────────────────────── docker CLI plumbing ─────────────────────────────
 
 /** The docker CLI against the server of a service or volume (backup helpers and dumps run there; data streams back here). */
-function cli(svc: { nodeId?: string | null }, args: string[], io: { stdin?: Readable; stdout?: Writable; env?: Record<string, string> } = {}): Promise<{ code: number; stderr: string }> {
+export function cli(svc: { nodeId?: string | null }, args: string[], io: { stdin?: Readable; stdout?: Writable; env?: Record<string, string> } = {}): Promise<{ code: number; stderr: string }> {
   const hostEnv = dockerFor(nodeOf(svc)).hostEnv;
   return new Promise((resolve, reject) => {
     const child = spawn('docker', args, { env: { ...process.env, ...io.env, DOCKER_HOST: hostEnv }, stdio: [io.stdin ? 'pipe' : 'ignore', io.stdout ? 'pipe' : 'ignore', 'pipe'] });
@@ -172,7 +172,7 @@ function cli(svc: { nodeId?: string | null }, args: string[], io: { stdin?: Read
   });
 }
 
-async function ensureHelper(svc: { nodeId?: string | null }) {
+export async function ensureHelper(svc: { nodeId?: string | null }) {
   const d = dockerFor(nodeOf(svc));
   if (!(await d.inspectImage(HELPER_IMAGE))) await d.pullImage(normalizeImageRef(HELPER_IMAGE));
 }
@@ -1093,7 +1093,7 @@ const SCRATCH_QUERY: Record<Exclude<BackupMethod, 'volume'>, string> = {
 const EXPECTED_PG_ERRORS = /already exists|current user cannot be dropped|cannot drop the currently open database/;
 
 /** The docker CLI's output as text (small outputs: df, wc). */
-async function cliText(on: { nodeId?: string | null }, args: string[], env?: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
+export async function cliText(on: { nodeId?: string | null }, args: string[], env?: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
   let stdout = '';
   const out = new Writable({
     write(c: Buffer, _e, cb) {

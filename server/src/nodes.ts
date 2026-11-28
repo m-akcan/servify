@@ -148,6 +148,20 @@ export function openStream(nodeId: string, target: 'docker' | number): Promise<D
   });
 }
 
+/**
+ * One end of a spliced stream is gone: the other gets what is still queued for it, then closes. Destroying it at once
+ * dropped the tail of long outputs (a volume streamed out of a server came back a few dozen kB short). After an
+ * error, or if it doesn't drain within 30 s, it is destroyed.
+ */
+function closeAfter(s: Duplex, hadError: boolean) {
+  if (hadError || s.destroyed || s.writableFinished) return void s.destroy(); // nothing left to deliver
+  const t = setTimeout(() => s.destroy(), 30_000);
+  t.unref();
+  s.once('close', () => clearTimeout(t));
+  s.once('finish', () => s.destroy());
+  s.end();
+}
+
 function splice(local: net.Socket, nodeId: string, target: 'docker' | number) {
   local.pause();
   local.on('error', () => {});
@@ -155,8 +169,8 @@ function splice(local: net.Socket, nodeId: string, target: 'docker' | number) {
     (up) => {
       up.on('error', () => local.destroy());
       local.on('error', () => up.destroy());
-      up.on('close', () => local.destroy());
-      local.on('close', () => up.destroy());
+      up.on('close', (hadError) => closeAfter(local, hadError));
+      local.on('close', (hadError) => closeAfter(up, hadError));
       local.pipe(up);
       up.pipe(local);
       local.resume();

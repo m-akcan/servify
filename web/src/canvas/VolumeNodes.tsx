@@ -120,7 +120,8 @@ export function DetachedVolumeNode({
       <div className="grow" style={{ minWidth: 0 }}>
         <div className="vol-node-name truncate">{v.name}</div>
         <div className="vol-node-meta">
-          detached{v.members > 1 ? ` · ×${v.members}` : ''} · {bytes(v.sizeBytes)}
+          {v.moveCopy ? <span className="vol-node-copy" title={`${v.moveCopy.serviceName}'s data from before it moved to another server — delete it once you no longer need it`}>copy from move</span> : 'detached'}
+          {v.members > 1 ? ` · ×${v.members}` : ''} · {bytes(v.sizeBytes)}
         </div>
       </div>
       <button className="vol-node-more" onClick={(e) => openMenuAt(e.currentTarget, volumeMenu(v), 'right')} aria-label={`${v.name} actions`}>

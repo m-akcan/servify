@@ -158,6 +158,10 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   // Also its dry run (dryRun: true, `project` optional): both ends must be in reach.
   'POST /services/:id/move-project': { level: 'write', params: S, body: { project: 'project' } },
   'POST /services/:id/move': { level: 'write', params: S },
+  'GET /services/:id/move-plan': { level: 'write', params: S },
+  'DELETE /services/:id/move': { level: 'write', params: S },
+  'POST /volumes/:id/discard-move-copy': { level: 'write', params: V },
+  'POST /volumes/:id/keep-move-copy': { level: 'write', params: V },
   'POST /services/:id/cluster/switchover': { level: 'write', params: S },
   'POST /services/:id/cluster/rebuild': { level: 'write', params: S },
   'POST /services/:id/run': { level: 'write', params: S },

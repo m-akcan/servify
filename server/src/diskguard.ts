@@ -388,7 +388,8 @@ export function diskSummary() {
 // ───────────────────────────── gates ─────────────────────────────
 
 const dataDisk = () => disks.find((d) => d.roles.includes('data')) ?? null;
-const dockerDisk = (nodeId: string | null | undefined) => (!nodeId || nodeId === LOCAL ? disks.find((d) => !d.nodeId && d.roles.includes('docker')) : disks.find((d) => d.nodeId === nodeId)) ?? null;
+/** The Docker disk of a server (null: this machine), or null while unmeasured. */
+export const dockerDisk = (nodeId: string | null | undefined): DiskStatus | null => (!nodeId || nodeId === LOCAL ? disks.find((d) => !d.nodeId && d.roles.includes('docker')) : disks.find((d) => d.nodeId === nodeId)) ?? null;
 
 /** Persistence of logs, metrics and access-log rows is paused (the data disk is in protect mode). */
 export const persistPaused = () => dataDisk()?.level === 'protect';

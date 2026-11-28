@@ -78,8 +78,49 @@ export interface VolumeRecord {
   x: number;
   y: number;
   sizeBytes: number | null;
+  /** The data a service left behind on its old server when it moved with its volumes (kept until someone deletes it). */
+  moveCopy?: MoveCopy | null;
   createdAt: number;
   updatedAt: number;
+}
+
+/** A source copy left by "Move to <server>": the moved volume's data as it was before the move. */
+export interface MoveCopy {
+  serviceId: string;
+  serviceName: string;
+  /** The live volume it is a copy of, and where that one went (null = this machine). */
+  volumeId: string;
+  toNodeId: string | null;
+  movedAt: number;
+  /** Someone chose to keep it (the offer to delete it is no longer shown). */
+  keptAt?: number | null;
+  /** When the service started healthy on the new server after this move (the copy may be deleted from then on). */
+  provenAt?: number | null;
+}
+
+/** A service moving to another server with its volumes' data (relocate.ts). The last outcome stays until dismissed. */
+export interface ServiceMove {
+  phase: 'stopping' | 'copying' | 'starting' | 'rolling-back' | 'done' | 'failed';
+  /** Server ids (null = this machine) and their names at the time. */
+  from: string | null;
+  to: string | null;
+  fromName: string;
+  toName: string;
+  /** It was running: it is started on the new server (and, on failure, on the old one again). */
+  wasRunning: boolean;
+  startedAt: number;
+  finishedAt: number | null;
+  /** Bytes of volume data to copy (null = unknown) and copied so far. */
+  bytesTotal: number | null;
+  bytesDone: number;
+  /** The volume being copied now. */
+  current: string | null;
+  /** Every volume record that moves (members of per-replica sets too), with its Docker volume on each side. */
+  volumes: { id: string; name: string; fromDocker: string; toDocker: string; copyId: string | null; existed: boolean }[];
+  deploymentId: string | null;
+  message: string | null;
+  error: string | null;
+  actor: string;
 }
 
 export interface ClusterConfig {
@@ -195,6 +236,8 @@ export interface Service {
   nodeId?: string | null;
   /** Ports published straight on the server (owner only). Forces one replica and stop-first deploys. */
   ports?: PublishedPort[];
+  /** A move to another server with its data, running or just finished (relocate.ts). */
+  move?: ServiceMove | null;
   x: number;
   y: number;
   status: ServiceStatus;

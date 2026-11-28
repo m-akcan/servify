@@ -49,6 +49,7 @@ function rollingOrder(svc: Service, want: number): number[] {
 }
 import { iconForStack, referencedServicesOn } from './ops.ts';
 import { betterIcon } from './icons.ts';
+import { isCopyingData } from './relocate.ts';
 
 const lock = new KeyedLock();
 
@@ -312,11 +313,12 @@ export function queueDeployment(
 async function runDeployment(depId: string, actor: Actor) {
   // A restore owns the service's data until it is done (it wipes the volumes): the deploy stays queued meanwhile,
   // and can still be cancelled.
-  // The same for the owners of volumes it writes to through read-and-write shares.
+  // The same for the owners of volumes it writes to through read-and-write shares, and for a move to another server
+  // while it copies the data (relocate.ts).
   const restoringNow = () => {
     const sid = deploymentsTable.get(depId)?.serviceId ?? '';
     const s = servicesTable.get(sid);
-    return isRestoring(sid) || (!!s && sharedWriteOwners(s).some((o) => isRestoring(o.id)));
+    return isRestoring(sid) || isCopyingData(sid) || (!!s && sharedWriteOwners(s).some((o) => isRestoring(o.id)));
   };
   while (restoringNow()) await sleep(1000);
   // A cluster failover, switchover or rebuild holds members back while it works on them: let it finish first (the

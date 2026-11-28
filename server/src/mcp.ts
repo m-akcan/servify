@@ -673,12 +673,12 @@ export function buildMcpServer(principal: Principal): McpServer {
   tool(
     'move_service',
     {
-      description: 'Run a service on another server (id or name from list_servers; "local" = this machine). Redeploys there, then retires the old replicas. Services with volumes cannot move (data stays on its server). Private service names keep working across servers (connections to the main port are relayed through Servify).',
-      inputSchema: { service: svcRef, server: z.string() },
+      description: 'Run a service on another server (id or name from list_servers; "local" = this machine). Stateless services redeploy there with no downtime, then the old replicas retire. A service with volumes needs with_data: true — it stops, its volumes are copied to the new server, and it starts there; if it doesn\'t start healthy it goes back, untouched. Progress is in the service\'s `move` field; the old data stays on the old server as a detached copy until deleted. Host folders, adopted volumes, read-only shares and clusters can\'t move. Private service names keep working across servers (connections to the main port are relayed through Servify).',
+      inputSchema: { service: svcRef, server: z.string(), with_data: z.boolean().optional().describe('Required for services with volumes: copy their data along (the service is down while it copies)') },
       annotations: { destructiveHint: true },
     },
-    wrap(async ({ service, server: target }: { service: string; server: string }) => {
-      return ops.moveService(actor, service, target);
+    wrap(async ({ service, server: target, with_data }: { service: string; server: string; with_data?: boolean }) => {
+      return ops.moveService(actor, service, target, { withData: with_data === true });
     }),
   );
 

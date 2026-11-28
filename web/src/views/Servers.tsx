@@ -195,7 +195,7 @@ export function ServersView() {
           <ul className="muted">
             <li>Builds, image pulls, backups and logs run on the server itself; only the results travel back.</li>
             <li>The router here sends traffic to replicas on any server, through the agent’s encrypted connection.</li>
-            <li>Volumes stay on the server that holds them, so services with volumes don’t move between servers.</li>
+            <li>Services with volumes can move too: Servify stops them, copies the data to the other server and starts them there (they are down while it copies). The old data stays until you delete it.</li>
             <li>
               Private names like <code className="inline-code">db</code> resolve between services on the <b>same</b> server. Keep services that talk to each other together, or use the public URL or TCP address.
             </li>
