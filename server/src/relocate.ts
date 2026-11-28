@@ -92,7 +92,7 @@ export async function movePlan(svc: Service, target: string): Promise<MovePlan> 
     if (m.hostPath) blockers.push(`${svc.name} mounts the host folder ${m.hostPath} at ${m.mountPath}. A host folder is part of ${fromName}'s own disk, so Servify can't take it along — copy the folder to the other machine yourself and point the mount there, or replace it with a volume first.`);
     else if (m.borrowed) {
       const owner = m.volumeId ? volumesTable.get(m.volumeId) : null;
-      blockers.push(`${svc.name} mounts ${m.name}${owner?.serviceId ? ` (owned by ${servicesTable.get(owner.serviceId)?.name ?? 'another service'})` : ''} read-only at ${m.mountPath}. Read-only shares only work on one server — remove that mount first.`);
+      blockers.push(`${svc.name} mounts ${m.name}${owner?.serviceId ? ` (owned by ${servicesTable.get(owner.serviceId)?.name ?? 'another service'})` : ''} at ${m.mountPath} (shared from another service). Shares only work on one server — remove that mount first.`);
     }
   }
   const records = ownedRecords(svc);
@@ -100,7 +100,7 @@ export async function movePlan(svc: Service, target: string): Promise<MovePlan> 
   for (const v of leaders) {
     if (v.adopted) blockers.push(`${v.name} was taken over from an existing Docker volume on ${fromName}: its data predates Servify and may still be used outside it, so Servify doesn't copy it to another machine. Back it up and restore it into a service on ${toName} instead.`);
     const borrowers = borrowersOf(v);
-    if (borrowers.length) blockers.push(`${borrowers.map((b) => b.name).join(', ')} mount${borrowers.length === 1 ? 's' : ''} ${v.name} read-only. Shares only work on one server — remove ${borrowers.length === 1 ? 'that mount' : 'those mounts'} first.`);
+    if (borrowers.length) blockers.push(`${borrowers.map((b) => b.name).join(', ')} mount${borrowers.length === 1 ? 's' : ''} ${v.name} (shared). Shares only work on one server — remove ${borrowers.length === 1 ? 'that mount' : 'those mounts'} first.`);
     if (nodeOf(v) !== from) blockers.push(`${v.name} is stored on ${nodeName(nodeOf(v))}, not on ${fromName} where ${svc.name} runs — fix that first`);
   }
 
