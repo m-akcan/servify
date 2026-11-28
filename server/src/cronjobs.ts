@@ -66,14 +66,15 @@ export function recordSkip(svc: Service, reason: string) {
 }
 
 export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Actor, opts: { catchUp?: CatchUpInfo | null } = {}): Promise<JobRun> {
+  // Loaded before the overlap check: from `running.has` to `running.add` nothing may await.
+  const { isRestoring } = await import('./backups.ts');
   if (running.has(svc.id)) throw new HttpError(409, `${svc.name} is already running`);
   const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
   if (!dep?.image) throw new HttpError(400, `deploy ${svc.name} before running it`);
   if (!deployedSchedule(svc, dep)) throw new HttpError(400, `${svc.name} is not a scheduled job (set a schedule and deploy first)`);
   const project = projectsTable.get(svc.projectId);
   if (!project) throw new HttpError(404, 'project missing');
-  // A restore wipes and refills the owner's volume: a job writing to it (read-and-write share) waits for the next run.
-  const { isRestoring } = await import('./backups.ts');
+  // A restore wipes and refills the owner's volume: a job writing to it (read-and-write share) is skipped meanwhile.
   const restoringOwner = sharedWriteOwners(svc).find((o) => isRestoring(o.id));
   if (restoringOwner) throw new HttpError(409, `${restoringOwner.name} is being restored, and ${svc.name} writes to its volume — not run meanwhile`);
   const docker = dockerFor(nodeOf(svc)); // jobs run on the service's server; throws while it is offline, before anything is marked running

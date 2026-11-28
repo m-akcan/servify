@@ -508,6 +508,7 @@ async function runDeployment(depId: string, actor: Actor) {
         log(`! No safety backup of ${owner.name}'s data (shared read and write): skipped as asked by ${actor.name}`);
         continue;
       }
+      log(`▸ ${svc.name} writes to ${owner.name}'s volume (shared read and write): ${owner.name}'s safety backup first`);
       try {
         const r = await ensureSafetyBackup(owner, { purpose: 'deploy', actor, what: `deploying ${dep.sourceLabel} on ${svc.name}, which writes to its volume`, log });
         if (r.status === 'off') log(`! No safety backup of ${owner.name}'s data, which ${svc.name} writes to: ${r.message}`);
