@@ -1317,6 +1317,7 @@ export function startService(actor: Actor, serviceId: string) {
  */
 export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; deleteVolumes?: boolean; skipSafetyBackup?: boolean; withProject?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
+  assert(!isCopyingData(svc.id), 409, `${svc.name} is moving to another server — wait for the move to finish (or cancel it) before deleting`);
   assert(isOnline(nodeOf(svc)), 409, `${svc.name} runs on ${nodeName(nodeOf(svc))}, which is offline — bring it back online before deleting`);
   // Others writing to its volume would keep changing data nobody owns any more (no backups, no restores): refused.
   // Deleting the whole project takes the writers along, so it goes ahead.

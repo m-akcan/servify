@@ -37,6 +37,7 @@ import { HttpError, id, KeyedLock, secret, shortId, sleep } from './util.ts';
 import { minuteOf } from './cron.ts';
 import { anyPending, dropPending, readBeat, reportOutcome, stepSchedule, writeBeat, type CatchUpInfo } from './schedstate.ts';
 import type { BackupMethod, BackupRecord, BackupTest, DatabaseKind, SafetyBackupConfig, Service, VolumeRecord } from './types.ts';
+import { isCopyingData } from './relocate.ts';
 
 export const HELPER_IMAGE = 'alpine:3.20';
 // Docker's default log driver keeps a copy of everything a container prints. For a helper that prints the archive
@@ -602,6 +603,7 @@ export function restoreBackup(actor: Actor, backupId: string) {
   if (b.method === 'volume' && svc.volumes.some((v) => v.perReplica)) throw new HttpError(400, `${svc.name} keeps one volume per replica — restoring a single archive into it is ambiguous; attach a fresh volume set instead`);
   if (backupMethod(svc) !== b.method) throw new HttpError(400, `this ${b.method} backup doesn't match how ${svc.name} is backed up now (${backupMethod(svc) ?? 'nothing'})`);
   if (restoring.has(svc.id)) throw new HttpError(409, 'a restore is already running');
+  if (isCopyingData(svc.id)) throw new HttpError(409, `${svc.name} is moving to another server — wait for the move to finish`);
   // Services writing to its volumes through read-and-write shares would write into the data while it is wiped and
   // unpacked: they have to be stopped first. Scheduled jobs only while a run is going (their runs wait for the restore).
   const writing = activeWriters(svc);
