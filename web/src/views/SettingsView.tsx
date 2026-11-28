@@ -81,6 +81,7 @@ const SECTIONS: { id: string; label: string; icon: IconName }[] = [
   { id: 'notifications', label: 'Notifications', icon: 'bell' },
   { id: 'backups', label: 'Backup storage', icon: 'archive' },
   { id: 'webhooks', label: 'Git webhooks', icon: 'webhook' },
+  { id: 'registries', label: 'Registry logins', icon: 'key' },
   { id: 'security', label: 'Security', icon: 'shield' },
 ];
 
@@ -131,6 +132,7 @@ export function SettingsView({ section }: { section?: string }) {
                 {active === 'notifications' && <Notifications settings={settings} reload={load} health={health} reloadHealth={loadHealth} />}
                 {active === 'backups' && <Backups settings={settings} reload={load} />}
                 {active === 'webhooks' && <Webhooks settings={settings} reload={load} />}
+                {active === 'registries' && <RegistryLogins />}
                 {active === 'security' && <Security />}
               </>
             )}
@@ -1142,6 +1144,148 @@ function ChannelModal({ channel, onClose, onSaved }: { channel: Channel; onClose
           </Button>
           <Button type="submit" variant="primary" loading={saving} disabled={!c.events.length}>
             {isNew ? 'Add channel' : 'Save'}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ───────────────────────────── registry logins ─────────────────────────────
+
+type RegistryLogin = { id: string; registry: string; username: string; createdAt: number; updatedAt: number };
+type RegistryDraft = { id?: string; registry: string; username: string; password: string };
+
+/** Logins for private image registries (ghcr.io …): used for pulls on every server and for update checks. */
+function RegistryLogins() {
+  const [logins, setLogins] = useState<RegistryLogin[] | null>(null);
+  const [editing, setEditing] = useState<RegistryDraft | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
+  const load = () => api.get<RegistryLogin[]>('/settings/registries').then(setLogins).catch((e) => toastError(e, 'Could not load registry logins'));
+  useEffect(() => {
+    void load();
+  }, []);
+  const test = async (l: RegistryLogin) => {
+    setTesting(l.id);
+    try {
+      const r = await api.post<{ ok: boolean; message: string }>(`/settings/registries/${l.id}/test`);
+      if (r.ok) toast({ title: r.message, tone: 'ok' });
+      else toastError(new Error(r.message), `${l.registry} login failed`);
+    } catch (e) {
+      toastError(e, 'Test failed');
+    } finally {
+      setTesting(null);
+    }
+  };
+  const remove = async (l: RegistryLogin) => {
+    if (!(await confirmDialog({ title: `Remove the login for ${l.registry}?`, body: 'Images already on your servers keep running. New pulls of private images from this registry will fail until you add a login again.', confirm: 'Remove', danger: true }))) return;
+    await api.del(`/settings/registries/${l.id}`).catch((e) => toastError(e));
+    void load();
+  };
+  return (
+    <>
+      <Card
+        title="Registry logins"
+        desc="For private images, such as ghcr.io/you/app:latest. Servify uses them to pull on this machine and on your other servers, and to check for image updates."
+        right={
+          <Button variant="primary" size="sm" icon="plus" onClick={() => setEditing({ registry: 'ghcr.io', username: '', password: '' })}>
+            Add login
+          </Button>
+        }
+      >
+        {logins === null ? (
+          <div className="faint">Loading…</div>
+        ) : logins.length === 0 ? (
+          <div className="faint" style={{ fontSize: 13 }}>
+            No logins yet. Public images need none. Servify also uses a <span className="mono">docker login</span> made on this machine by the user it runs as, but only for pulls on this machine.
+          </div>
+        ) : (
+          <div className="channel-list">
+            {logins.map((l) => (
+              <div className="channel-row" key={l.id}>
+                <div className="channel-icon">
+                  <Icon name={l.registry === 'ghcr.io' ? 'github' : 'box'} size={17} />
+                </div>
+                <div className="grow" style={{ minWidth: 0 }}>
+                  <b className="mono">{l.registry}</b>
+                  <div className="faint truncate" style={{ fontSize: 11.5, marginTop: 2 }}>
+                    {l.username} · token saved {timeAgo(l.updatedAt)}
+                  </div>
+                </div>
+                <Button size="sm" variant="ghost" icon="check" loading={testing === l.id} onClick={() => void test(l)}>
+                  Test
+                </Button>
+                <Tooltip label="Edit">
+                  <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setEditing({ id: l.id, registry: l.registry, username: l.username, password: '' })} aria-label="Edit login">
+                    <Icon name="edit" size={14} />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Remove">
+                  <button className="btn btn-ghost btn-sm btn-icon" onClick={() => void remove(l)} aria-label="Remove login">
+                    <Icon name="trash" size={14} />
+                  </button>
+                </Tooltip>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+      <div className="callout callout-info rise-in">
+        <Icon name="info" size={15} />
+        <div className="grow">
+          For GitHub Container Registry, use your GitHub user name and a personal access token (classic) with only the <span className="mono">read:packages</span> scope. Tokens are encrypted at rest and never shown again. On a remote server the login goes to that server’s Docker for each pull only. To deploy from CI, turn on <b>Pull before every deploy</b> on the service and call its deploy hook after pushing.
+        </div>
+      </div>
+      {editing && (
+        <RegistryModal
+          draft={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            void load();
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function RegistryModal({ draft, onClose, onSaved }: { draft: RegistryDraft; onClose: () => void; onSaved: () => void }) {
+  const [d, setD] = useState<RegistryDraft>(draft);
+  const [saving, setSaving] = useState(false);
+  const isNew = !draft.id;
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await api.post('/settings/registries', { ...d, password: d.password || undefined });
+      toast({ title: isNew ? `Login for ${d.registry} added` : 'Login saved', body: isNew ? 'Use “Test” to check it.' : undefined, tone: 'ok' });
+      onSaved();
+    } catch (err) {
+      toastError(err, 'Could not save');
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal open onClose={onClose} width={500}>
+      <form onSubmit={save} className="modal-body col" style={{ gap: 16 }}>
+        <div className="h2">{isNew ? 'Add a registry login' : `Edit the login for ${draft.registry}`}</div>
+        <Field label="Registry" hint="The host only: ghcr.io, registry.gitlab.com, docker.io, localhost:5000 …">
+          <input className="input mono" required value={d.registry} onChange={(e) => setD({ ...d, registry: e.target.value })} spellCheck={false} />
+        </Field>
+        <Field label="Username" hint={d.registry.includes('ghcr.io') ? 'Your GitHub user name.' : undefined}>
+          <input className="input mono" required autoComplete="off" value={d.username} onChange={(e) => setD({ ...d, username: e.target.value })} spellCheck={false} />
+        </Field>
+        <Field label={d.registry.includes('ghcr.io') ? 'Personal access token' : 'Password or token'} hint={isNew ? (d.registry.includes('ghcr.io') ? 'Classic token with the read:packages scope (github.com → Settings → Developer settings).' : undefined) : 'Leave empty to keep the saved one.'}>
+          <input className="input mono" type="password" autoComplete="new-password" required={isNew} value={d.password} onChange={(e) => setD({ ...d, password: e.target.value })} />
+        </Field>
+        <div className="row" style={{ gap: 8, justifyContent: 'flex-end' }}>
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" variant="primary" loading={saving}>
+            {isNew ? 'Add login' : 'Save'}
           </Button>
         </div>
       </form>

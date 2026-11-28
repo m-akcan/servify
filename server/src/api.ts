@@ -56,6 +56,7 @@ import * as updater from './updater.ts';
 import { testChannel, recentDeliveries } from './notify.ts';
 import { channelHealth, isFailing as isChannelFailing } from './notifyhealth.ts';
 import { recentHookDeliveries, deployHookToken } from './hooks.ts';
+import { listRegistryLogins, upsertRegistryLogin, deleteRegistryLogin, testRegistryLogin } from './registryauth.ts';
 import { listCertificates, retryCertificate, localCaPem } from './certs.ts';
 import { restoreBackup, deleteBackup, openBackupStream, testRestore, publicBackup } from './backups.ts';
 import { backupsTable } from './db.ts';
@@ -1083,6 +1084,24 @@ api.delete('/settings/backups/destinations/:id', (c) => {
   ownerOnly(c);
   settings.deleteDestination(actor(c), c.req.param('id'));
   return c.json({ ok: true });
+});
+// Registry logins (private images, e.g. ghcr.io): the token is write-only, never returned.
+api.get('/settings/registries', (c) => {
+  ownerOnly(c);
+  return c.json(listRegistryLogins());
+});
+api.post('/settings/registries', async (c) => {
+  ownerOnly(c);
+  return c.json(upsertRegistryLogin(actor(c), await jsonBody(c)), 201);
+});
+api.delete('/settings/registries/:id', (c) => {
+  ownerOnly(c);
+  deleteRegistryLogin(actor(c), c.req.param('id'));
+  return c.json({ ok: true });
+});
+api.post('/settings/registries/:id/test', async (c) => {
+  ownerOnly(c);
+  return c.json(await testRegistryLogin(c.req.param('id')));
 });
 api.get('/settings/webhooks/deliveries', (c) => {
   ownerOnly(c);

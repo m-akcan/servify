@@ -595,6 +595,7 @@ export const updateServiceInput = z.object({
     .optional()
     .describe('Router access control. Fields left out stay as they are; null clears them all. IP lists also apply to TCP routes; basic auth and rate limits only to HTTP. Takes effect immediately'),
   imageAutoUpdate: z.boolean().optional().describe('Image services: redeploy automatically when a new image is published under the same tag (not for databases or clusters)'),
+  pullOnDeploy: z.boolean().optional().describe('Image services: pull the image again on every deploy, including deploy hooks (CI pushes a tag, then calls the hook); a failed pull fails the deploy. `:latest` is always pulled'),
   watchPaths: z.array(z.string().min(1).max(200)).max(50).nullable().optional().describe('Git: deploy only when a push changes files matching these globs (e.g. apps/web/**, !**/*.md)'),
   preDeployCommand: z.string().max(2000).nullable().optional().describe('Runs once per new deploy (e.g. migrations) in a one-off container from the new image; a failure stops the deploy'),
   resources: z.object({ cpus: z.number().positive().max(64).nullable().optional(), memoryMb: z.number().int().min(16).nullable().optional() }).optional(),
@@ -785,6 +786,7 @@ export async function updateService(actor: Actor, serviceId: string, raw: Update
     if (!patch.sleepAfterMinutes && svc.sleeping) void wake(svc.id, 'sleeping being turned off');
   }
   if (patch.imageAutoUpdate !== undefined) set('imageAutoUpdate', patch.imageAutoUpdate, 'image auto-update');
+  if (patch.pullOnDeploy !== undefined) set('pullOnDeploy', patch.pullOnDeploy, 'pull before every deploy');
   if (patch.accessLog !== undefined) set('accessLog', patch.accessLog, 'access log');
   let accessPassword: string | null = null;
   if (patch.access !== undefined) {
@@ -1640,7 +1642,7 @@ export type ProjectSpec = {
 
 const SPEC_KEYS = [
   'name', 'icon', 'templateId', 'source', 'protocol', 'port', 'replicas', 'strategy', 'healthcheck', 'autoscale',
-  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'accessLog', 'access', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'scheduleTz', 'scheduleCatchUp', 'backup', 'safetyBackup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
+  'publicHttp', 'domains', 'publicTcpPort', 'volumes', 'ports', 'env', 'secretKeys', 'startCommand', 'preDeployCommand', 'buildCommand', 'buildArgs', 'buildTarget', 'watchPaths', 'imageAutoUpdate', 'pullOnDeploy', 'accessLog', 'access', 'sleepAfterMinutes', 'resources', 'autoDeploy', 'schedule', 'scheduleTz', 'scheduleCatchUp', 'backup', 'safetyBackup', 'aliases', 'cmd', 'entrypoint', 'cluster', 'x', 'y',
 ] as const;
 
 export function exportProject(projectId: string, opts: { secrets?: boolean } = {}): ProjectSpec {
@@ -1726,6 +1728,7 @@ export async function importProject(actor: Actor, spec: ProjectSpec, opts: { dep
       buildTarget: raw.buildTarget ?? null,
       watchPaths: raw.watchPaths ?? null,
       imageAutoUpdate: raw.imageAutoUpdate ?? false,
+      pullOnDeploy: raw.pullOnDeploy ?? false,
       accessLog: raw.accessLog !== false,
       sleepAfterMinutes: raw.sleepAfterMinutes ?? null,
       preDeployCommand: raw.preDeployCommand ?? null,

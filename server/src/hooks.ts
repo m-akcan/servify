@@ -235,6 +235,8 @@ export function handleDeployHook(serviceId: string, token: string): HookResult {
   const svc = servicesTable.get(serviceId);
   if (!svc || !safeEqual(token, deployHookToken(serviceId))) return { status: 404, body: { error: 'not found' } };
   const dep = deployService({ type: 'system', name: 'deploy-hook' }, svc.id, 'manual');
-  record({ provider: 'deploy-hook', event: 'deploy', repo: null, ok: true, result: `deploying ${svc.name}` });
-  return { status: 202, body: { ok: true, deploymentId: dep.id } };
+  // Image services pull a `:latest` tag on every deploy, and any tag with "pull before every deploy" on.
+  const pulls = svc.source.type === 'image' && (!!svc.pullOnDeploy || /:latest$/.test(svc.source.image) || !/:[^/]+$/.test(svc.source.image.replace(/@.*$/, '')));
+  record({ provider: 'deploy-hook', event: 'deploy', repo: null, ok: true, result: `deploying ${svc.name}${pulls ? ' (pulling the image)' : ''}` });
+  return { status: 202, body: { ok: true, deploymentId: dep.id, ...(svc.source.type === 'image' ? { pull: pulls } : {}) } };
 }

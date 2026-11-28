@@ -73,15 +73,16 @@ function cliPull(d: DockerClient, ref: string, log: (l: string) => void): Promis
 }
 
 /**
- * Pull through the Engine API — on this machine with the registry login of the user Servify runs as — then, if that
- * fails, through the docker CLI. Null on success, else the reason. Logins never go to remote servers.
+ * Pull through the Engine API with the saved registry login (Servify's own from Settings → Registry logins, here or
+ * on a remote server for that one pull; or the docker login of the user Servify runs as, on this machine only), then,
+ * if that fails, through the docker CLI. Null on success, else the reason.
  */
 export async function pull(d: DockerClient, ref: string, log: (l: string) => void, local: boolean): Promise<string | null> {
   try {
     const host = parseRepo(ref)?.registry;
-    const auth = local && host ? await engineAuthHeader(host).catch(() => null) : null;
-    if (auth) log(`▸ Using the saved docker login for ${host}`);
-    await d.pullImage(ref, (l) => log(l), auth);
+    const auth = host ? await engineAuthHeader(host, { remote: !local }).catch(() => null) : null;
+    if (auth) log(auth.source === 'servify' ? `▸ Using the registry login for ${host} (Settings → Registry logins)` : `▸ Using the saved docker login for ${host}`);
+    await d.pullImage(ref, (l) => log(l), auth?.header ?? null);
     return null;
   } catch (e) {
     const engine = (e as Error).message;
@@ -370,13 +371,15 @@ async function runDeployment(depId: string, actor: Actor) {
         const ref = normalizeImageRef(src.image);
         const local = await d.inspectImage(ref);
         const update = dep.trigger === 'update';
-        if (local && !update && !pulledFromRegistry(local, ref)) {
+        // "Pull before every deploy": a deploy hook or manual deploy gets the tag's current image (CI pushed it).
+        const pullAgain = !!svc.pullOnDeploy && !!local && !update && !ref.endsWith(':latest');
+        if (local && !update && !pullAgain && !pulledFromRegistry(local, ref)) {
           log(`▸ Using local image ${ref} (made on this server, not pulled from a registry)`);
-        } else if (!local || ref.endsWith(':latest') || update) {
+        } else if (!local || ref.endsWith(':latest') || update || pullAgain) {
           // Low disk space on that server's Docker disk: no download. A restart, rollback or move — or "deploy the
           // cached image" — goes on with the copy already there, as it would when the registry is down.
           const full = diskBlock('pull', node);
-          const raw = full ? full : (log(`▸ Pulling ${ref}${update && local ? ' (update)' : ''}`), await pull(d, ref, log, node === LOCAL));
+          const raw = full ? full : (log(`▸ Pulling ${ref}${update && local ? ' (update)' : pullAgain ? ' (pull before every deploy)' : ''}`), await pull(d, ref, log, node === LOCAL));
           if (raw) {
             const reason = full ? 'low disk space' : pullProblem(raw, ref);
             if (local && !update && !full && notOnDockerHub(raw, ref)) {

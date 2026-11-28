@@ -1753,6 +1753,122 @@ async function notifyChecks() {
   check('a removed channel has no health entry', !(await health())[ntfy.id]);
 }
 
+/**
+ * Registry logins from the dashboard (ONLY=registry): a local registry:2 with htpasswd (servify-acc-ghcr, removed
+ * afterwards) stands in for a private ghcr.io image. Run Servify with DOCKER_CONFIG set to an empty scratch folder so
+ * neither its Engine pull nor the docker CLI retry can fall back to a docker login; this script pushes with its own
+ * throwaway DOCKER_CONFIG. Checks: no login → the deploy fails; a login (token never returned) → the pull uses it;
+ * update checks see a new push; the deploy hook pulls the new push with "pull before every deploy".
+ */
+async function registryLoginChecks(P) {
+  console.log('\n▸ registry logins in the dashboard (a password-protected registry)');
+  const PORT = Number(process.env.SERVIFY_ACC_REGISTRY_PORT ?? 15858);
+  const NAME = 'servify-acc-ghcr';
+  const USER = 'acc';
+  const PW = 'svf-acc-Rq7w-registry';
+  const HASH = '$2y$05$HSSyz7LzJrGSKh3qaewOsuqlyCFzBfBNRDWrjh68PBJ.txKgtIPVy'; // htpasswd -nbB acc <PW>
+  const host = `localhost:${PORT}`;
+  const ref = `${host}/acc/app:main`;
+  const dockerHost = execSync(`docker context inspect --format '{{.Endpoints.docker.Host}}'`).toString().trim();
+  const pushCfg = mkdtempSync(join(tmpdir(), 'servify-pushcfg-'));
+  writeFileSync(join(pushCfg, 'config.json'), JSON.stringify({ auths: { [host]: { auth: Buffer.from(`${USER}:${PW}`).toString('base64') } } }));
+  const sh = (c) => execSync(c, { stdio: 'pipe', env: { ...process.env, DOCKER_CONFIG: pushCfg, DOCKER_HOST: process.env.DOCKER_HOST || dockerHost } }).toString().trim();
+  const authDir = mkdtempSync(join(tmpdir(), 'servify-ghcrauth-'));
+  writeFileSync(join(authDir, 'htpasswd'), `${USER}:${HASH}\n`);
+  sh(`docker rm -f ${NAME} 2>/dev/null || true`);
+  sh(`docker run -d --name ${NAME} -p ${PORT}:5000 -v ${authDir}:/auth -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=acc -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2`);
+  let loginId = null;
+  cleanups.push(async () => {
+    if (loginId) await api('DELETE', `/settings/registries/${loginId}`).catch(() => {});
+    try {
+      sh(`docker rm -f ${NAME}; docker rmi ${ref} || true`);
+    } catch {}
+    rmSync(authDir, { recursive: true, force: true });
+    rmSync(pushCfg, { recursive: true, force: true });
+  });
+  check('the registry refuses anonymous requests', !!(await waitFor(async () => (await fetch(`http://${host}/v2/`).catch(() => null))?.status === 401, 30_000, 'registry')));
+  const push = (from) => sh(`docker tag ${from} ${ref} && docker push -q ${ref} && docker rmi ${ref}`);
+  push('alpine:3.20');
+  const logOf = async (depId) => (await api('GET', `/deployments/${depId}/logs`)).map((l) => (typeof l === 'string' ? l : l.text ?? l.line ?? '')).join('\n');
+  const settle = (depId) => waitFor(async () => ['active', 'failed'].includes((await api('GET', `/deployments/${depId}`)).status) && api('GET', `/deployments/${depId}`), 180_000, 'deployment');
+
+  // Negative control: nothing to log in with.
+  const made = await api('POST', `/projects/${P.id}/services`, { image: ref, name: 'ghcr-app', protocol: 'none', startCommand: 'sleep 1d' });
+  const app = made.service;
+  const d0 = await settle(made.deployment?.id ?? (await api('GET', `/services/${app.id}/deployments`))[0]?.id);
+  check('without a login the pull is refused and the deploy fails', d0?.status === 'failed' && /pull failed: (unauthorized|not found or private)/.test(d0.error ?? ''), d0?.error);
+
+  // Add a login: the token is write-only.
+  const bad = await api('POST', '/settings/registries', { registry: `http://${host}/`, username: USER, password: 'wrong-password' });
+  loginId = bad.id;
+  check('the registry host is normalized', bad.registry === host, bad.registry);
+  check('the API never returns the token', !('password' in bad) && !JSON.stringify(await api('GET', '/settings/registries')).includes('wrong-password'));
+  const t0 = await api('POST', `/settings/registries/${bad.id}/test`);
+  check('Test: a wrong password is refused', t0.ok === false && /refused/.test(t0.message), JSON.stringify(t0));
+  let dup = '';
+  await api('POST', '/settings/registries', { registry: host, username: 'other', password: 'x' }).catch((e) => (dup = e.message));
+  check('one login per registry', /→ 409/.test(dup), dup);
+  await api('POST', '/settings/registries', { id: bad.id, username: USER, password: PW });
+  const t1 = await api('POST', `/settings/registries/${bad.id}/test`);
+  check('Test: the right password is accepted', t1.ok === true, JSON.stringify(t1));
+  const kept = await api('POST', '/settings/registries', { id: bad.id, username: USER });
+  check('saving without a token keeps the stored one', (await api('POST', `/settings/registries/${kept.id}/test`)).ok === true);
+
+  const d1 = await api('POST', `/services/${app.id}/deploy`);
+  const dep1 = await settle(d1.id);
+  const log1 = await logOf(d1.id);
+  check('with the login the private image deploys', dep1?.status === 'active', dep1?.error ?? '');
+  check('pulled through the Engine API with the dashboard login (no CLI retry)', log1.includes(`Using the registry login for ${host} (Settings → Registry logins)`) && !/Retrying pull with the docker CLI/.test(log1), log1.split('\n').filter((l) => /pull|login|Retrying/i.test(l)).join(' | '));
+  check('it runs the first image', (await exec(app.id, 'test -f /etc/alpine-release && echo alpine || echo other')).output.trim() === 'alpine');
+  let st = await api('POST', `/services/${app.id}/image-check`);
+  check('the update check signs in with the login', st?.status === 'current', JSON.stringify(st));
+
+  // CI pushes a new image under the same tag, then calls the deploy hook.
+  push('busybox:1.36');
+  sh(`docker tag alpine:3.20 ${ref}`); // the copy on the server stays the old image, as after a real pull
+  st = await api('POST', `/services/${app.id}/image-check`);
+  check('the update check sees the new push', st?.status === 'changed', JSON.stringify(st));
+  const { path } = await api('GET', `/services/${app.id}/deploy-hook`);
+  const callHook = async () => {
+    const r = await fetch(`http://127.0.0.1:${PROXY}${path}`, { method: 'POST', headers: { host: 'ci.example' } });
+    return r.json();
+  };
+  const h1 = await callHook();
+  check('without "pull before every deploy" the hook says it will not pull a fixed tag', h1.ok === true && h1.pull === false, JSON.stringify(h1));
+  const dep2 = await settle(h1.deploymentId);
+  const log2 = await logOf(h1.deploymentId);
+  const ran2 = (await exec(app.id, 'test -f /etc/alpine-release && echo alpine || echo other')).output.trim();
+  check('…and redeploys the copy on the server', dep2?.status === 'active' && !/Pulling/.test(log2) && ran2 === 'alpine', `${dep2?.status} ${ran2} ${log2.split('\n').filter((l) => /image|pull/i.test(l)).join(' | ')}`);
+  await api('PATCH', `/services/${app.id}`, { pullOnDeploy: true });
+  check('the service setting is saved', (await api('GET', `/services/${app.id}`)).pullOnDeploy === true);
+  const h2 = await callHook();
+  check('with it the hook pulls', h2.ok === true && h2.pull === true, JSON.stringify(h2));
+  const dep3 = await settle(h2.deploymentId);
+  const log3 = await logOf(h2.deploymentId);
+  check('the hook deploy pulled the new push with the login', dep3?.status === 'active' && /Pulling .*\(pull before every deploy\)/.test(log3) && log3.includes(`Using the registry login for ${host}`), dep3?.error ?? log3.split('\n').filter((l) => /pull|login/i.test(l)).join(' | '));
+  check('and now runs the new image', (await exec(app.id, 'test -f /etc/alpine-release && echo alpine || echo other')).output.trim() === 'other');
+  st = await api('POST', `/services/${app.id}/image-check`);
+  check('the update check is current again', st?.status === 'current', JSON.stringify(st));
+
+  // The token is nowhere it shouldn't be.
+  const b64 = Buffer.from(`${USER}:${PW}`).toString('base64');
+  if (DATA) {
+    const hits = execSync(`grep -rlaF -e '${PW}' -e '${b64}' ${JSON.stringify(DATA)} || true`).toString().trim();
+    check('the token is nowhere in the data folder in plain text (database, logs)', hits === '', hits);
+  }
+  const acts = JSON.stringify(await api('GET', '/activity').catch(() => []));
+  check('nor in the activity or deployment logs', ![log1, log3, acts].some((t) => t.includes(PW) || t.includes(b64)));
+
+  // Removing the login: a forced pull is refused again.
+  await api('DELETE', `/settings/registries/${loginId}`);
+  loginId = null;
+  check('the login is removed', (await api('GET', '/settings/registries')).length === 0);
+  const d4 = await api('POST', `/services/${app.id}/deploy`);
+  const dep4 = await settle(d4.id);
+  check('without it, "pull before every deploy" fails the deploy and the running version stays', dep4?.status === 'failed' && (await api('GET', `/services/${app.id}`)).activeDeploymentId === h2.deploymentId, dep4?.error);
+  await api('DELETE', `/services/${app.id}?deleteVolumes=1&skipSafetyBackup=1`).catch(() => {});
+}
+
 async function main() {
   const settings = await api('GET', '/settings');
   const secret = settings.webhooks.secret;
@@ -1769,6 +1885,7 @@ async function main() {
   if (process.env.ONLY === 'access') return accessChecks(P);
   if (process.env.ONLY === 'cli') return cliParityChecks(P);
   if (process.env.ONLY === 'mobileapp') return mobileAppChecks();
+  if (process.env.ONLY === 'registry') return registryLoginChecks(P);
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ secrets at rest');
