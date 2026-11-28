@@ -13,6 +13,7 @@ import { Home } from './views/Home.tsx';
 import { ProjectView } from './views/Project.tsx';
 import { ServiceView } from './views/Service.tsx';
 import { Settings } from './views/Settings.tsx';
+import { Traffic } from './views/Traffic.tsx';
 import { UpdateBanner } from './views/UpdateBanner.tsx';
 import { resetOffer } from './lib/appupdate.ts';
 import type { ServerEvent } from '../../server/src/types.ts';
@@ -356,6 +357,7 @@ function SignedIn({
           {top.name === 'home' && <Home />}
           {top.name === 'project' && <ProjectView id={top.id} title={top.title} />}
           {top.name === 'service' && <ServiceView id={top.id} title={top.title} />}
+          {top.name === 'traffic' && <Traffic />}
           {top.name === 'settings' && (
             <Settings
               onSwitch={onSwitch}

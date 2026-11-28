@@ -56,9 +56,14 @@ export function Home() {
           </span>
         }
         right={
-          <button className="icon-btn" onClick={() => nav.push({ name: 'settings' })} aria-label="Settings">
-            <Icon name="gear" size={20} />
-          </button>
+          <>
+            <button className="icon-btn" onClick={() => nav.push({ name: 'traffic' })} aria-label="Traffic">
+              <Icon name="pulse" size={20} />
+            </button>
+            <button className="icon-btn" onClick={() => nav.push({ name: 'settings' })} aria-label="Settings">
+              <Icon name="gear" size={20} />
+            </button>
+          </>
         }
       />
       <PullScroll onRefresh={load}>
@@ -82,13 +87,16 @@ export function Home() {
                   <small>/{deployed}</small>
                 </div>
               </div>
-              <div className="card stat">
-                <div className="label">Requests</div>
+              <button className="card stat stat-link" onClick={() => nav.push({ name: 'traffic' })} aria-label="Open traffic">
+                <div className="label row" style={{ justifyContent: 'space-between' }}>
+                  Requests
+                  <Icon name="chevronRight" size={12} />
+                </div>
                 <div className="v">
                   {overview ? num(overview.servify.rps) : '–'}
                   <small>/s</small>
                 </div>
-              </div>
+              </button>
               <div className="card stat">
                 <div className="label">Servers</div>
                 <div className="v">

@@ -48,7 +48,8 @@ export type Route =
   | { name: 'home' }
   | { name: 'project'; id: string; title: string }
   | { name: 'service'; id: string; title: string }
-  | { name: 'settings' };
+  | { name: 'settings' }
+  | { name: 'traffic' };
 
 export type Nav = { push: (r: Route) => void; back: () => void; reset: (r?: Route) => void };
 export const NavContext = createContext<Nav | null>(null);
