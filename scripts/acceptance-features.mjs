@@ -476,6 +476,38 @@ async function moveProjectChecks() {
   check('its deploy history is kept', depsBefore.every((id) => depsAfter.includes(id)) && depsAfter.length > depsBefore.length);
   const logsAfter = await api('GET', `/services/${mover.id}/logs?tail=500`);
   check('its logs from before the move are kept', logsAfter.length >= logsBefore.length && logsAfter.some((x) => x.ts === logsBefore[0].ts && x.text === logsBefore[0].text));
+
+  // A reference through a shared variable of the old project counts too.
+  const cache = (await api('POST', `/projects/${A.id}/services`, { name: 'cache', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', deploy: false })).service;
+  await api('PATCH', `/projects/${A.id}`, { variables: { CACHE_URL: 'redis://cache:6379' } });
+  const reader = (await api('POST', `/projects/${A.id}/services`, { name: 'reader', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { URL: '${{shared.CACHE_URL}}' }, deploy: false })).service;
+  const viaShared = (await api('POST', `/services/${cache.id}/move-project`, { dryRun: true, project: Bp.id })).warnings.find((w) => w.code === 'used_by')?.services ?? [];
+  check('dry run: a sibling reading a shared variable that names it is listed', viaShared.some((x) => x.id === reader.id && x.keys.some((k) => /^URL \(via shared\.CACHE_URL\)/.test(k))), JSON.stringify(viaShared));
+
+  // Moved under another name while running: reachable by the new host name, data intact.
+  await api('POST', `/projects/${A.id}/services`, { name: 'keeper', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', deploy: false });
+  const back = await raw(`/services/${mover.id}/move-project`, { project: A.id, name: 'vault' });
+  check('moved back under another name (its old name is taken there)', back.status === 200 && back.body.name === 'vault' && back.body.slug === 'vault', JSON.stringify(back.body).slice(0, 160));
+  const renamedUp = await waitFor(async () => {
+    const s = await api('GET', `/services/${mover.id}`);
+    if (s.status !== 'running') return null;
+    const r = await exec(mover.id, 'cat /data/file').catch(() => null);
+    return r?.output.trim() === 'moved-data' && s.projectId === A.id;
+  }, 120_000, 'renamed service running');
+  const probe = (await api('POST', `/projects/${A.id}/services`, { name: 'probe', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d' })).service;
+  await waitFor(async () => (await api('GET', `/services/${probe.id}`)).status === 'running', 120_000, 'probe running');
+  const dns = await waitFor(async () => ((await exec(probe.id, 'getent hosts vault').catch(() => null))?.exitCode === 0 ? true : null), 30_000, 'vault resolves');
+  check('it runs under the new name with its data, and siblings reach it by that name', !!renamedUp && !!dns);
+
+  // Moved while stopped: the next start runs with variables resolved in the new project.
+  await api('POST', `/services/${probe.id}/stop`);
+  await api('POST', `/services/${probe.id}/move-project`, { project: Bp.id });
+  await api('POST', `/services/${probe.id}/start`);
+  const name = await waitFor(async () => {
+    const r = await exec(probe.id, 'echo $SERVIFY_PROJECT_NAME').catch(() => null);
+    return r?.exitCode === 0 ? r.output.trim() : null;
+  }, 120_000, 'probe started in B');
+  check('a service moved while stopped starts with the new project’s variables', name === Bp.name, name);
 }
 
 async function hungReplicaChecks(P) {

@@ -22,7 +22,7 @@ import type { MoveIssue, MovePlan, Project, Service } from './types.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { HttpError, slugify } from './util.ts';
 import { getServiceOrThrow, getProjectOrThrow, serializeService, restartService, placeNear } from './ops.ts';
-import { sharedVariables, publicUrl } from './vars.ts';
+import { sharedVariables, publicUrl, resolveEnv } from './vars.ts';
 import { borrowersOf } from './volumes.ts';
 import { isRoute } from './external.ts';
 import { deployPending } from './deployer.ts';
@@ -158,8 +158,23 @@ export function planMove(serviceId: string, targetRef?: string | null, opts: { n
 
   // References that stop working: the private network and ${{…}} only reach services of the same project.
   const siblings = servicesTable.all('WHERE project_id = ?', from.id).filter((s) => s.id !== svc.id);
+  // Shared variables go through the same resolver: one that names it (DB_URL=${{svc.URL}}, or its host name) breaks
+  // every sibling that reads it.
+  const sharedVia = Object.entries(sharedVariables(from))
+    .filter(([k, v]) => {
+      const r = referencesTo({ ...svc, env: { [k]: String(v) }, startCommand: null, id: '' } as Service, svc);
+      return r.vars.length || r.hosts.length;
+    })
+    .map(([k]) => k);
   const inbound = siblings
-    .map((s) => ({ s, r: referencesTo(s, svc) }))
+    .map((s) => {
+      const r = referencesTo(s, svc);
+      for (const [k, v] of Object.entries(s.env)) {
+        const via = [...String(v).matchAll(REF)].find((m) => m[1] === 'shared' && m[2] && sharedVia.includes(m[2]));
+        if (via && !r.vars.includes(k) && !r.hosts.includes(k)) r.vars.push(`${k} (via shared.${via[2]})`);
+      }
+      return { s, r };
+    })
     .filter(({ r }) => r.vars.length || r.hosts.length)
     .map(({ s, r }) => refEntry(s, r));
   if (inbound.length)
@@ -256,6 +271,15 @@ export function moveServiceToProject(actor: Actor, serviceId: string, targetRef:
     for (const b of backupsTable.all('WHERE service_id = ?', svc.id)) backupsTable.put({ ...b, projectId: target.id });
     for (const r of runsTable.all('WHERE service_id = ?', svc.id)) runsTable.put({ ...r, projectId: target.id });
     servicesTable.put(moved);
+    // A stopped service isn't restarted now: its next start recreates replicas from the active deployment, so that
+    // deployment's variables are resolved again here, against the new project (as a restart would).
+    if (!isRoute(moved) && moved.activeDeploymentId && moved.stopped) {
+      const active = deploymentsTable.get(moved.activeDeploymentId);
+      if (active) {
+        const { env: resolved } = resolveEnv(moved, active.config.env, target, servicesTable.all('WHERE project_id = ?', target.id), active.port);
+        deploymentsTable.put({ ...active, resolvedEnv: resolved } as typeof active);
+      }
+    }
     db.exec('COMMIT');
   } catch (e) {
     db.exec('ROLLBACK');
