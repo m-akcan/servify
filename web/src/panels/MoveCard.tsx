@@ -127,7 +127,7 @@ export function MoveStatus({ service: s }: { service: ServiceView }) {
   return (
     <>
       {m && <MoveProgress service={s} />}
-      {(!m || m.phase === 'done' || m.phase === 'failed') && copies.map((v) => <SourceCopyOffer key={v.id} volume={v} />)}
+      {(!m || m.phase === 'done' || m.phase === 'failed') && copies.map((v) => <SourceCopyOffer key={v.id} volume={v} service={s} />)}
     </>
   );
 }
@@ -177,8 +177,11 @@ function MoveProgress({ service: s }: { service: ServiceView }) {
   );
 }
 
-function SourceCopyOffer({ volume: v }: { volume: VolumeRecord }) {
+function SourceCopyOffer({ volume: v, service: s }: { volume: VolumeRecord; service: ServiceView }) {
   const [busy, setBusy] = useState(false);
+  // Deleting is offered only once the service has started healthy on the new server (the server checks the same).
+  const live = useStore((st) => (s.activeDeploymentId ? st.current?.deployments[s.activeDeploymentId] : null));
+  const proven = !!v.moveCopy!.provenAt || (!!live && live.status === 'active' && (live.nodeId ?? null) === v.moveCopy!.toNodeId && (s.nodeId ?? null) === v.moveCopy!.toNodeId);
   const discard = async () => {
     const yes = await confirmDialog({
       title: `Delete ${v.name}?`,
@@ -202,15 +205,20 @@ function SourceCopyOffer({ volume: v }: { volume: VolumeRecord }) {
     <div className="callout">
       <Icon name="archive" size={14} />
       <span className="grow">
-        The data from before the move is still on the old server as <b className="mono">{v.name}</b> ({bytes(v.sizeBytes)}). Once you’re happy with the move, delete it — or keep it a while as a safety copy (it stays on the canvas as a detached volume).
+        The data from before the move is still on the old server as <b className="mono">{v.name}</b> ({bytes(v.sizeBytes)}).{' '}
+        {proven
+          ? 'Once you’re happy with the move, delete it — or keep it a while as a safety copy (it stays on the canvas as a detached volume).'
+          : `${s.name} hasn’t started on its new server yet, so this copy stays until it has.`}
       </span>
       <div className="row" style={{ gap: 6, flex: 'none' }}>
         <Button size="sm" variant="ghost" onClick={keep}>
           Keep
         </Button>
-        <Button size="sm" variant="danger" icon="trash" loading={busy} onClick={() => void discard()}>
-          Delete
-        </Button>
+        {proven && (
+          <Button size="sm" variant="danger" icon="trash" loading={busy} onClick={() => void discard()}>
+            Delete
+          </Button>
+        )}
       </div>
     </div>
   );

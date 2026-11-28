@@ -14,9 +14,9 @@
  * The move is written to the service record before anything happens, so a restart in the middle rolls it back at boot.
  */
 import { Transform } from 'node:stream';
-import { services as servicesTable, volumesTable, deployments as deploymentsTable, projects as projectsTable, kv } from './db.ts';
+import { services as servicesTable, volumesTable, deployments as deploymentsTable, projects as projectsTable, nodesTable, kv } from './db.ts';
 import type { Service, ServiceMove, VolumeRecord } from './types.ts';
-import { dockerFor, isOnline, nodeName, nodeOf, LOCAL, onNodeChange } from './nodes.ts';
+import { dockerFor, isOnline, nodeName, nodeOf, LOCAL, onNodeChange, AGENT_VERSION } from './nodes.ts';
 import { busy, drainAndRemove, replicasOf, requestReconcile, refreshServiceStatus, INSTANCE_ID, LABEL } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
@@ -81,6 +81,11 @@ export async function movePlan(svc: Service, target: string): Promise<MovePlan> 
   if (isMoving(svc)) blockers.push(`${svc.name} is already moving`);
   else if (deployPending(svc.id)) blockers.push(`${svc.name} is deploying — move it when that's done`);
   if (backupLockHeld(svc.id) || isRestoring(svc.id)) blockers.push(`a backup or restore of ${svc.name} is running — move it when that's done`);
+  // Agents before 0.2.1 could drop the end of a long stream: a copy through them would fail every time.
+  for (const n of new Set([from, target])) {
+    const v = n === LOCAL ? null : nodesTable.get(n)?.info?.agentVersion;
+    if (v && v !== AGENT_VERSION) blockers.push(`the agent on ${nodeName(n)} is version ${v}, too old to stream volume data reliably — update it first (Servers → ${nodeName(n)} → Update agent)`);
+  }
   if (isJobRunning(svc.id)) warnings.push(`a scheduled run of ${svc.name} is in progress: it is stopped for the move`);
 
   for (const m of svc.volumes) {
@@ -142,14 +147,17 @@ export async function movePlan(svc: Service, target: string): Promise<MovePlan> 
 
 // ───────────────────────────── state ─────────────────────────────
 
-let lastPublish = 0;
-/** Update the move on the service record (persisted: boot recovery reads it) and tell the dashboards. */
+const lastWrite = new Map<string, number>();
+/**
+ * Update the move on the service record (persisted: boot recovery reads it) and tell the dashboards. Progress
+ * updates (`force` false) are dropped within a second of the last write; the next forced one carries the total.
+ */
 function setMove(serviceId: string, patch: Partial<ServiceMove>, force = true) {
+  if (!force && Date.now() - (lastWrite.get(serviceId) ?? 0) < 1000) return;
   const s = servicesTable.get(serviceId);
   if (!s?.move) return;
   s.move = { ...s.move, ...patch };
-  if (!force && Date.now() - lastPublish < 1000) return void servicesTable.put(s);
-  lastPublish = Date.now();
+  lastWrite.set(serviceId, Date.now());
   servicesTable.put(s);
   bus.publish({ type: 'service.updated', service: s });
 }
@@ -279,6 +287,11 @@ async function runMove(actor: Actor, serviceId: string) {
       const err = deploymentsTable.get(dep.id)?.error;
       throw new Error(status === 'cancelled' ? `the deploy on ${m.toName} was cancelled` : ['queued', 'building', 'deploying'].includes(status) ? `${svc.name} didn't come up on ${m.toName} within ${DEPLOY_WAIT_MS / 60_000} minutes` : `it didn't start healthy on ${m.toName}: ${err ?? 'the deploy failed'}`);
     }
+    // A healthy start there: from now on the copies left behind may be deleted.
+    for (const v of servicesTable.get(serviceId)?.move?.volumes ?? []) {
+      const c = v.copyId ? volumesTable.get(v.copyId) : null;
+      if (c?.moveCopy) saveVolume({ ...c, moveCopy: { ...c.moveCopy, provenAt: Date.now() } });
+    }
     finish(actor, serviceId, `${svc.name} runs on ${m.toName} with its data. The old data stays on ${m.fromName} as a copy until you delete it.`);
   } catch (e) {
     await rollBack(actor, serviceId, switched, (e as Error).message || String(e));
@@ -331,7 +344,7 @@ async function copyVolume(from: string, to: string, src: string, dst: string, on
 }
 
 async function countEntries(node: string, volume: string): Promise<number> {
-  const r = await cliText({ nodeId: nid(node) }, ['run', '--rm', '--log-driver', 'none', '--network', 'none', '-v', `${volume}:/v:ro`, HELPER_IMAGE, 'sh', '-c', 'find /v | wc -l']);
+  const r = await cliText({ nodeId: nid(node) }, ['run', '--rm', '--log-driver', 'none', '--network', 'none', '-v', `${volume}:/v:ro`, HELPER_IMAGE, 'sh', '-c', 'find /v ! -type s | wc -l']); // tar skips sockets
   if (r.code !== 0) throw new Error(`could not check ${volume} on ${nodeName(node)}: ${r.stderr.slice(-200)}`);
   return Number(r.stdout.trim());
 }
@@ -538,6 +551,18 @@ export function dismissMove(svc: Service) {
   return fresh;
 }
 
+/**
+ * Whether the move that left this copy has been proven: the service's live deployment started healthy on the new
+ * server (a stopped or never-deployed service hasn't, until it is started there). A deleted service has nothing to prove.
+ */
+export function moveProven(copy: VolumeRecord): boolean {
+  if (copy.moveCopy?.provenAt) return true;
+  const svc = copy.moveCopy ? servicesTable.get(copy.moveCopy.serviceId) : null;
+  if (!svc) return true;
+  const dep = svc.activeDeploymentId ? deploymentsTable.get(svc.activeDeploymentId) : null;
+  return !!dep && dep.status === 'active' && (dep.nodeId ?? null) === copy.moveCopy!.toNodeId && (svc.nodeId ?? null) === copy.moveCopy!.toNodeId;
+}
+
 function copyOrThrow(ref: string): VolumeRecord[] {
   const v = volumesTable.get(ref);
   assert(v, 404, 'volume not found');
@@ -553,6 +578,8 @@ function copyOrThrow(ref: string): VolumeRecord[] {
 export async function discardMoveCopy(actor: Actor, ref: string) {
   const members = copyOrThrow(ref);
   const leader = members.find((x) => !x.setId || x.setId === x.id) ?? members[0];
+  const owner = servicesTable.get(leader.moveCopy!.serviceId);
+  assert(moveProven(leader), 409, `${owner?.name ?? 'The service'} hasn't started healthy on ${nodeName(leader.moveCopy!.toNodeId ?? LOCAL)} yet — until it has, this copy is the data it had before the move. Start it there first.`);
   const node = nodeOf(leader);
   assert(isOnline(node), 409, `${nodeName(node)} is offline — delete the copy once it's back`);
   for (const x of members) {

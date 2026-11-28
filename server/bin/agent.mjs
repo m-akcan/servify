@@ -117,7 +117,7 @@ function connectTarget(target) {
  * it doesn't drain within 30 s, it is destroyed.
  */
 function closeAfter(b, hadError) {
-  if (hadError || b.destroyed) return b.destroy();
+  if (hadError || b.destroyed || b.writableFinished) return b.destroy(); // nothing left to deliver
   const t = setTimeout(() => b.destroy(), 30_000);
   t.unref?.();
   b.once('close', () => clearTimeout(t));

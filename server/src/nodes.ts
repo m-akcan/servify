@@ -154,7 +154,7 @@ export function openStream(nodeId: string, target: 'docker' | number): Promise<D
  * error, or if it doesn't drain within 30 s, it is destroyed.
  */
 function closeAfter(s: Duplex, hadError: boolean) {
-  if (hadError || s.destroyed) return void s.destroy();
+  if (hadError || s.destroyed || s.writableFinished) return void s.destroy(); // nothing left to deliver
   const t = setTimeout(() => s.destroy(), 30_000);
   t.unref();
   s.once('close', () => clearTimeout(t));

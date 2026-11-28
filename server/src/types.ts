@@ -92,6 +92,8 @@ export interface MoveCopy {
   movedAt: number;
   /** Someone chose to keep it (the offer to delete it is no longer shown). */
   keptAt?: number | null;
+  /** When the service started healthy on the new server after this move (the copy may be deleted from then on). */
+  provenAt?: number | null;
 }
 
 /** A service moving to another server with its volumes' data (relocate.ts). The last outcome stays until dismissed. */
