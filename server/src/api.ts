@@ -62,6 +62,7 @@ import { s3Test } from './s3.ts';
 import { keySource, keyPath } from './crypto.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume, unmanagedDockerVolumes, adoptVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, rebuildMember } from './pgcluster.ts';
+import { planMove, moveServiceToProject } from './moveproject.ts';
 import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 import { queryAccessLog, accessSummary, recentAccess, accessTotals } from './accesslog.ts';
 import { ROUTE_POLICIES, type Policy, type TargetKind } from './policy.ts';
@@ -811,9 +812,13 @@ api.post('/services/:id/update-image', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   return c.json(dep(c, await ops.updateServiceImage(actor(c), c.req.param('id'), typeof body?.tag === 'string' ? body.tag : null, { skipSafetyBackup: body?.skipSafetyBackup === true })), 202);
 });
+// Move to another project. dryRun: what it would do (blockers, references that break, the restart), `project` optional
+// (a project still to be created). Broken references are refused unless force; `name` moves it under another name.
 api.post('/services/:id/move-project', async (c) => {
-  const { project } = await jsonBody<{ project: string }>(c);
-  return c.json(ops.moveServiceToProject(actor(c), c.req.param('id'), project ?? ''));
+  const { project, dryRun, force, name } = await jsonBody<{ project?: string; dryRun?: boolean; force?: boolean; name?: string }>(c);
+  if (name !== undefined && (typeof name !== 'string' || name.trim().length > 64)) throw new HttpError(400, 'name must be a string of at most 64 characters');
+  if (dryRun === true) return c.json(planMove(c.req.param('id'), project || null, { name }));
+  return c.json(moveServiceToProject(actor(c), c.req.param('id'), project ?? '', { force: force === true, name }).service);
 });
 api.post('/services/:id/move', async (c) => {
   const { server } = await jsonBody<{ server: string }>(c);

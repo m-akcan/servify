@@ -671,3 +671,35 @@ export interface Overview {
     backups24h: { succeeded: number; failed: number };
   };
 }
+
+/** Something about moving a service to another project ("Move to project…", see moveproject.ts). */
+export interface MoveIssue {
+  /** Blockers: same_project, environment, environment_target, cluster, borrows_volume, shared_volume, busy, name_taken.
+   * Warnings: used_by, uses, shared_missing (these break something: refused unless forced), url_changes, renamed, environments. */
+  code: string;
+  message: string;
+  /** References: the services on the other end and their variables that name it (`how`: ${{…}}, a host name, or both). */
+  services?: { id: string; name: string; keys: string[]; how: 'variable' | 'hostname' | 'both' }[];
+}
+
+/** What a move would do, before it happens (POST /services/:id/move-project with dryRun). */
+export interface MovePlan {
+  service: { id: string; name: string; slug: string };
+  from: { id: string; name: string; slug: string };
+  /** null: a project still to be created for it. */
+  target: { id: string; name: string; slug: string } | null;
+  /** The name (and private host name) it would have there. */
+  name: string;
+  slug: string;
+  /** When the name is taken there: a free one. */
+  suggestedName: string | null;
+  blockers: MoveIssue[];
+  warnings: MoveIssue[];
+  /** Its containers are recreated on the new project's network (a brief restart). */
+  restart: boolean;
+  /** Its generated address now and after the move (null after: not known until the project exists). */
+  url: { before: string; after: string | null } | null;
+  volumes: string[];
+  deployments: number;
+  backups: number;
+}

@@ -16,6 +16,7 @@ import { environmentsOf, createEnvironment, setPreviews } from './envs.ts';
 import { listCertificates } from './certs.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, deleteVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, clusterStatus } from './pgcluster.ts';
+import { planMove, moveServiceToProject } from './moveproject.ts';
 import { listServers } from './nodes.ts';
 import { queryAccessLog, accessSummary } from './accesslog.ts';
 import { TOOL_POLICIES, type TargetKind } from './policy.ts';
@@ -678,6 +679,28 @@ export function buildMcpServer(principal: Principal): McpServer {
     },
     wrap(async ({ service, server: target }: { service: string; server: string }) => {
       return ops.moveService(actor, service, target);
+    }),
+  );
+
+  tool(
+    'move_service_to_project',
+    {
+      description:
+        'Move a service to another project (create_project first for a new one). It keeps its id, deploy history, variables, domains, volumes (same data, no copy), backups, job runs, logs and metrics; a running service restarts briefly on the new project\'s private network. Always call with dry_run: true first and tell the user its warnings: services left behind that reference it (${{svc.VAR}} or its host name) and services it references stop reaching each other, missing shared variables, its generated URL changes. Blockers (environments, clusters, volume shares, a name already taken there, a deploy or backup in progress) are never overridden; for a taken name pass name (it moves under that name). References that would break are refused unless force: true.',
+      inputSchema: {
+        service: svcRef,
+        project: projRef.describe('The project to move it to (id or slug); not an environment or preview'),
+        name: z.string().max(64).optional().describe('Move it under this name (when its name is taken there)'),
+        dry_run: z.boolean().optional().describe('Only report what would happen'),
+        force: z.boolean().optional().describe('Go ahead although references would break (after telling the user)'),
+      },
+      annotations: { destructiveHint: true },
+    },
+    wrap(({ service, project, name, dry_run, force }: { service: string; project: string; name?: string; dry_run?: boolean; force?: boolean }) => {
+      const id = ops.getServiceOrThrow(service).id;
+      if (dry_run) return planMove(id, project, { name });
+      const r = moveServiceToProject(actor, id, project, { force: force === true, name });
+      return { service: ops.serviceSummary(ops.getServiceOrThrow(id)), restarted: r.restarted, warnings: r.plan?.warnings.map((w) => w.message) ?? [] };
     }),
   );
 

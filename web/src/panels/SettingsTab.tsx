@@ -4,6 +4,7 @@ import { api } from '../lib/api.ts';
 import { Button, Segmented, Switch, Field, Stepper, toastError, toast, Tooltip, CopyButton, confirmDialog } from '../components/ui.tsx';
 import { navigate } from '../lib/router.ts';
 import { openVolumeDialog, detachVolume, bytes } from '../lib/volumes.tsx';
+import { openMoveDialog } from '../lib/moveproject.tsx';
 import { Icon } from '../components/Icon.tsx';
 import { remove, stop, start } from '../lib/actions.ts';
 import { useStore } from '../lib/store.ts';
@@ -157,52 +158,20 @@ function ScheduleField({ service: s }: { service: ServiceView }) {
 }
 const id = (s: ServiceView) => s.id;
 
-/** Which project the service belongs to; moving takes its volumes and history along. */
+/** Which project the service belongs to; "Move to project…" takes its history, volumes and backups along. */
 function ServiceProject({ service: s }: { service: ServiceView }) {
-  const projects = useStore((st) => st.projects);
-  const others = projects.filter((p) => p.id !== s.projectId);
-  const [target, setTarget] = useState('');
-  const [busy, setBusy] = useState(false);
-  if (!others.length) return null;
-  const move = async () => {
-    const to = others.find((p) => p.id === target);
-    if (!to) return;
-    const yes = await confirmDialog({
-      title: `Move ${s.name} to ${to.parentId ? `${projects.find((p) => p.id === to.parentId)?.name ?? ''} · ${to.envName ?? to.name}` : to.name}?`,
-      body: `Its volumes, deploy history and backups go along, and its containers restart on that project's private network (a few seconds). Domains and ports stay the same.`,
-      confirm: 'Move',
-    });
-    if (!yes) return;
-    setBusy(true);
-    try {
-      await api.post(`/services/${s.id}/move-project`, { project: target });
-      toast({ title: `Moved ${s.name} to ${to.name}`, tone: 'ok' });
-      navigate(`/p/${to.slug}`);
-    } catch (e) {
-      toastError(e, 'Could not move the service');
-    } finally {
-      setBusy(false);
-    }
-  };
+  const project = useStore((st) => st.projects.find((p) => p.id === s.projectId));
+  // Environments and previews are copies of their production project: their services don't move.
+  if (project?.parentId) return null;
   return (
     <div className="setting-row">
       <div className="grow">
         <div className="title">Project</div>
-        <div className="desc">Move it to another project. Services that use its variables (or whose variables it uses) have to change those references first.</div>
+        <div className="desc">Move it to another project, or a new one. It keeps its deploy history, variables, domains, volumes and backups; Servify lists what would stop working first.</div>
       </div>
-      <div className="row" style={{ gap: 6 }}>
-        <select className="select" value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Target project">
-          <option value="">Choose a project…</option>
-          {others.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.parentId ? `${projects.find((x) => x.id === p.parentId)?.name ?? ''} · ${p.envName ?? p.name}` : p.name}
-            </option>
-          ))}
-        </select>
-        <Button icon="arrowRight" loading={busy} disabled={!target} onClick={() => void move()}>
-          Move
-        </Button>
-      </div>
+      <Button icon="arrowRight" onClick={() => openMoveDialog(s.id)}>
+        Move to project…
+      </Button>
     </div>
   );
 }

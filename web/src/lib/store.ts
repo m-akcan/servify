@@ -273,7 +273,12 @@ function applyEvent(ev: ServerEvent) {
       // keep project list summaries fresh
       store.set({
         projects: s.projects.map((p) => {
-          if (p.id !== svc.projectId) return p;
+          if (p.id !== svc.projectId) {
+            // Moved to another project: it leaves this one's summary.
+            if (!p.services.some((x) => x.id === svc.id)) return p;
+            const services = p.services.filter((x) => x.id !== svc.id);
+            return { ...p, services, serviceCount: services.length, running: services.filter((x) => x.status === 'running').length };
+          }
           const others = p.services.filter((x) => x.id !== svc.id);
           const services = [
             ...others,
@@ -293,6 +298,13 @@ function applyEvent(ev: ServerEvent) {
           return { ...p, services, serviceCount: services.length, running: services.filter((x) => x.status === 'running').length };
         }),
       });
+      if (cur && cur.project.id !== svc.projectId && cur.services[svc.id]) {
+        // Moved out of the open project.
+        const services = { ...cur.services };
+        delete services[svc.id];
+        store.set({ current: { ...cur, services, order: cur.order.filter((x) => x !== svc.id), edges: computeEdges(services) } });
+        return;
+      }
       if (!cur || cur.project.id !== svc.projectId) return;
       const services = { ...cur.services, [svc.id]: svc };
       const order = cur.order.includes(svc.id) ? cur.order : [...cur.order, svc.id];
@@ -312,6 +324,13 @@ function applyEvent(ev: ServerEvent) {
       return;
     }
     case 'volume.updated': {
+      if (cur && cur.project.id !== ev.volume.projectId && cur.volumes[ev.volume.id]) {
+        // Moved to another project with its service.
+        const volumes = { ...cur.volumes };
+        delete volumes[ev.volume.id];
+        store.set({ current: { ...cur, volumes } });
+        return;
+      }
       if (!cur || cur.project.id !== ev.volume.projectId) return;
       store.set({ current: { ...cur, volumes: { ...cur.volumes, [ev.volume.id]: ev.volume } } });
       return;

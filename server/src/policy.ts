@@ -152,6 +152,7 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   'POST /services/:id/backups': { level: 'write', params: S },
   'POST /services/:id/add-connected': { level: 'write', params: S },
   'POST /services/:id/track-image': { level: 'write', params: S },
+  // Also its dry run (dryRun: true, `project` optional): both ends must be in reach.
   'POST /services/:id/move-project': { level: 'write', params: S, body: { project: 'project' } },
   'POST /services/:id/move': { level: 'write', params: S },
   'POST /services/:id/cluster/switchover': { level: 'write', params: S },
@@ -279,6 +280,8 @@ export const TOOL_POLICIES: Record<string, Policy> = {
   unmount: { level: 'write', params: svc },
   switchover: { level: 'write', params: svc },
   move_service: { level: 'write', params: svc },
+  // Both ends must be in reach (the service's project and the one it moves to).
+  move_service_to_project: { level: 'write', params: { service: 'service', project: 'project' } },
   restore_backup: { level: 'write', params: { backup_id: 'backup' } },
   test_restore: { level: 'write', params: { backup_id: 'backup' } },
   attach_volume: { level: 'write', params: { volume: 'volume', service: 'service' } },

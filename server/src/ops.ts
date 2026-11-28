@@ -348,7 +348,7 @@ function iconFor(input: CreateServiceInput): string {
 }
 
 /** First free grid slot spiralling out from (ox, oy). */
-function placeNear(projectId: string, ox: number, oy: number): { x: number; y: number } {
+export function placeNear(projectId: string, ox: number, oy: number): { x: number; y: number } {
   const svcs = servicesTable.all('WHERE project_id = ?', projectId);
   const W = 300;
   const H = 220;
@@ -1229,44 +1229,6 @@ export async function checkServiceImage(serviceId: string) {
 }
 
 /** Zero-downtime restart: roll the current image onto fresh replicas. */
-/**
- * Move a service to another project: its volumes, deploy history and backups go with it, and its containers are
- * recreated on the new project's private network. Refused when the move would break something (references either
- * way, shared volumes, a cluster, a name already taken there).
- */
-export function moveServiceToProject(actor: Actor, serviceId: string, targetRef: string) {
-  const svc = getServiceOrThrow(serviceId);
-  const target = getProjectOrThrow(targetRef);
-  if (target.id === svc.projectId) return serializeService(svc);
-  const from = getProjectOrThrow(svc.projectId);
-  assert(!svc.cluster, 409, `${svc.name} is a database cluster — clusters stay in their project`);
-  assert(!svc.volumes.some((m) => m.borrowed), 409, `${svc.name} reads another service's volume — remove that share first`);
-  const siblings = servicesTable.all('WHERE project_id = ?', svc.projectId);
-  const usedBy = siblings.filter((s) => s.id !== svc.id && referencedServices(s, siblings).includes(svc.id));
-  assert(!usedBy.length, 409, `${usedBy.map((s) => s.name).join(', ')} use${usedBy.length === 1 ? 's' : ''} ${svc.name}'s variables (\${{${svc.slug}.…}}) — that would break after the move; change those references first`);
-  const uses = referencedServices(svc, siblings).map((id) => siblings.find((s) => s.id === id)?.name ?? id);
-  assert(!uses.length, 409, `${svc.name} uses variables of ${uses.join(', ')}, which stay in ${from.name} — change those references first`);
-  const vols = volumesTable.all('WHERE project_id = ?', from.id).filter((v) => v.serviceId === svc.id);
-  const shared = vols.flatMap((v) => borrowersOf(v).filter((s) => s.id !== svc.id).map((s) => s.name));
-  assert(!shared.length, 409, `${shared.join(', ')} read${shared.length === 1 ? 's' : ''} ${svc.name}'s volume — remove that share first`);
-  const taken = servicesTable.all('WHERE project_id = ?', target.id).find((s) => s.slug === svc.slug || s.name.toLowerCase() === svc.name.toLowerCase());
-  assert(!taken, 409, `${target.name} already has a service called ${taken?.name} — rename one of them first`);
-
-  for (const v of vols) volumesTable.put({ ...v, projectId: target.id, updatedAt: Date.now() });
-  for (const d of deploymentsTable.all('WHERE service_id = ?', svc.id)) deploymentsTable.put({ ...d, projectId: target.id });
-  for (const b of backupsTable.all('WHERE service_id = ?', svc.id)) backupsTable.put({ ...b, projectId: target.id });
-  const pos = placeNear(target.id, 0, 0);
-  const moved: Service = { ...svc, projectId: target.id, x: pos.x, y: pos.y, updatedAt: Date.now() };
-  servicesTable.put(moved);
-  bus.publish({ type: 'service.deleted', serviceId: svc.id, projectId: from.id });
-  bus.publish({ type: 'service.updated', service: moved });
-  recordActivity(actor, 'service.moved', `Moved ${svc.name} from ${from.name} to ${target.name}`, target.id, svc.id);
-  recordActivity(actor, 'service.moved', `Moved ${svc.name} to ${target.name}`, from.id, null);
-  // Containers live on their project's network: recreate them there (the image is unchanged, no pre-deploy).
-  if (!isRoute(moved) && moved.activeDeploymentId && !moved.stopped) restartService(actor, moved.id);
-  return serializeService(moved);
-}
-
 /** Restarts bring back the running image (no safety backup needed) — unless it has to be built again. */
 export function restartService(actor: Actor, serviceId: string, opts: { skipSafetyBackup?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);

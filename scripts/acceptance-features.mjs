@@ -428,6 +428,56 @@ async function streamingBackupChecks(P) {
  * SERVIFY_RESTART_AFTER_SECONDS=8 SERVIFY_RESTART_MAX=2 SERVIFY_RESTART_BACKOFF_SECONDS=3 SERVIFY_RESTART_RESET_SECONDS=15
  * SERVIFY_RESTART_CHECK_MS=1000 (and SERVIFY_SLEEP_UNIT_MS=2000 for the sleeping case); pass the same to this script.
  */
+/**
+ * "Move to project…" (ONLY=moveproject; also part of a full run): the dry run lists what breaks (references both ways,
+ * by ${{…}} and by host name) and the name clash; broken references are refused unless forced, a taken name always;
+ * the service keeps its id, deploy history, volume data and logs, and runs on the new project's network.
+ */
+async function moveProjectChecks() {
+  console.log('\n▸ moving a service to another project');
+  const raw = (path, body) => fetch(`${BASE}/api${path}`, { method: 'POST', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }));
+  const A = await api('POST', '/projects', { name: `move-a-${Date.now().toString(36)}` });
+  const Bp = await api('POST', '/projects', { name: `move-b-${Date.now().toString(36)}` });
+  projectsToDelete.push(A.id, Bp.id);
+  const mover = (await api('POST', `/projects/${A.id}/services`, { name: 'keeper', image: 'alpine:3.20', protocol: 'none', startCommand: 'echo keeper-started; exec sleep 1d', env: { SECRET_WORD: 'kept' } })).service;
+  await waitFor(async () => (await api('GET', `/services/${mover.id}`)).status === 'running', 120_000, 'keeper running');
+  await api('POST', `/projects/${A.id}/volumes`, { name: 'keeper-data', serviceId: mover.id, mountPath: '/data' });
+  await waitFor(async () => (await exec(mover.id, "grep -q ' /data ' /proc/mounts").catch(() => null))?.exitCode === 0, 120_000, 'keeper running with its volume');
+  await exec(mover.id, 'echo moved-data > /data/file');
+  const depsBefore = (await api('GET', `/services/${mover.id}/deployments?limit=100`)).map((d) => d.id);
+  const logsBefore = await waitFor(async () => {
+    const l = await api('GET', `/services/${mover.id}/logs?tail=500`);
+    return l.some((x) => /keeper-started/.test(x.text ?? '')) ? l : null;
+  }, 30_000, 'keeper logged');
+  const user = (await api('POST', `/projects/${A.id}/services`, { name: 'user', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { WORD: '${{keeper.SECRET_WORD}}', KEEPER: 'tcp://keeper:9000', NAME: 'keeper' }, deploy: false })).service;
+  const clash = (await api('POST', `/projects/${Bp.id}/services`, { name: 'keeper', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', deploy: false })).service;
+
+  const plan = await api('POST', `/services/${mover.id}/move-project`, { dryRun: true, project: Bp.id });
+  const used = plan.warnings.find((w) => w.code === 'used_by')?.services?.[0];
+  check('dry run: lists the service left behind and its keys (by reference and by host name, not a plain word)', used?.id === user.id && used.keys.includes('WORD') && used.keys.includes('KEEPER') && !used.keys.includes('NAME'), JSON.stringify(used));
+  check('dry run: a taken name is a blocker, with a free one suggested', plan.blockers.some((b) => b.code === 'name_taken') && plan.suggestedName === 'keeper-2' && plan.restart === true);
+  const taken = await raw(`/services/${mover.id}/move-project`, { project: Bp.id, force: true });
+  check('a taken name is refused even with force', taken.status === 409 && taken.body.code === 'name_taken');
+  await api('DELETE', `/services/${clash.id}`);
+  const refused = await raw(`/services/${mover.id}/move-project`, { project: Bp.id });
+  check('a move that would break references is refused without force', refused.status === 409 && refused.body.code === 'move_breaks_references' && /user/.test(refused.body.error ?? ''));
+  await api('POST', `/services/${mover.id}/move-project`, { project: Bp.id, force: true });
+  const inB = await api('GET', `/projects/${Bp.id}`);
+  check('the service and its volume are in the new project', inB.services.some((x) => x.id === mover.id) && inB.volumes.some((v) => v.serviceId === mover.id));
+  check('and gone from the old one', !(await api('GET', `/projects/${A.id}`)).services.some((x) => x.id === mover.id));
+  const restarted = await waitFor(async () => {
+    const s = await api('GET', `/services/${mover.id}`);
+    if (s.status !== 'running' || depsBefore.includes(s.activeDeploymentId)) return null;
+    const r = await exec(mover.id, 'cat /data/file').catch(() => null);
+    return r && r.output.trim() === 'moved-data';
+  }, 120_000, 'moved service running');
+  check('it restarts in the new project with its data', !!restarted);
+  const depsAfter = (await api('GET', `/services/${mover.id}/deployments?limit=100`)).map((d) => d.id);
+  check('its deploy history is kept', depsBefore.every((id) => depsAfter.includes(id)) && depsAfter.length > depsBefore.length);
+  const logsAfter = await api('GET', `/services/${mover.id}/logs?tail=500`);
+  check('its logs from before the move are kept', logsAfter.length >= logsBefore.length && logsAfter.some((x) => x.ts === logsBefore[0].ts && x.text === logsBefore[0].text));
+}
+
 async function hungReplicaChecks(P) {
   console.log('\n▸ restarting hung replicas');
   const AFTER = Number(process.env.SERVIFY_RESTART_AFTER_SECONDS);
@@ -859,7 +909,7 @@ async function tokenChecks(A) {
     const extra = {
       scale_service: { replicas: 1 }, set_variables: { variables: {} }, delete_variable: { key: 'PLAIN' }, exec_command: { command: 'true' }, rollback_service: { deploymentId: F.prevDep.id },
       create_environment: { name: 'x' }, set_previews: { enabled: false }, create_volume: { name: 'x' }, attach_volume: { mount_path: '/x' }, share_volume: { mount_path: '/x' }, unmount: { mount_path: '/x' },
-      move_service: { server: 'local' }, import_project: { spec: { servify: 1, name: 'x', services: [] } }, import_compose: { yaml: 'services: {}', dry_run: true }, create_project: { name: 'x' }, wait_for_deployment: { timeoutSec: 1 },
+      move_service: { server: 'local' }, move_service_to_project: { dry_run: true }, import_project: { spec: { servify: 1, name: 'x', services: [] } }, import_compose: { yaml: 'services: {}', dry_run: true }, create_project: { name: 'x' }, wait_for_deployment: { timeoutSec: 1 },
     }[name];
     return { ...a, ...(extra ?? {}) };
   };
@@ -1632,6 +1682,7 @@ async function main() {
   if (process.env.ONLY === 'access') return accessChecks(P);
   if (process.env.ONLY === 'cli') return cliParityChecks(P);
   if (process.env.ONLY === 'mobileapp') return mobileAppChecks();
+  if (process.env.ONLY === 'moveproject') return moveProjectChecks();
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ secrets at rest');
@@ -2526,31 +2577,7 @@ async function main() {
   await diskChecks();
   await hungReplicaChecks(P);
 
-  // ─────────────────────────────────────────────────────────────
-  console.log('\n▸ moving a service to another project');
-  {
-    const A = await api('POST', '/projects', { name: `move-a-${Date.now().toString(36)}` });
-    const Bp = await api('POST', '/projects', { name: `move-b-${Date.now().toString(36)}` });
-    projectsToDelete.push(A.id, Bp.id);
-    const mover = (await api('POST', `/projects/${A.id}/services`, { name: 'keeper', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { SECRET_WORD: 'kept' } })).service;
-    await waitFor(async () => (await api('GET', `/services/${mover.id}`)).status === 'running', 120_000, 'keeper running');
-    await api('POST', `/projects/${A.id}/volumes`, { name: 'keeper-data', serviceId: mover.id, mountPath: '/data' });
-    await waitFor(async () => (await exec(mover.id, "grep -q ' /data ' /proc/mounts").catch(() => null))?.exitCode === 0, 120_000, 'keeper running with its volume');
-    await exec(mover.id, 'echo moved-data > /data/file');
-    const user = (await api('POST', `/projects/${A.id}/services`, { name: 'user', image: 'alpine:3.20', protocol: 'none', startCommand: 'sleep 1d', env: { WORD: '${{keeper.SECRET_WORD}}' }, deploy: false })).service;
-    const refused = await fetch(`${BASE}/api/services/${mover.id}/move-project`, { method: 'POST', headers: { 'content-type': 'application/json', ...(COOKIE ? { cookie: COOKIE } : {}) }, body: JSON.stringify({ project: Bp.id }) });
-    check('a move that would break references is refused', refused.status === 409 && /user/.test((await refused.json()).error ?? ''));
-    await api('DELETE', `/services/${user.id}`);
-    await api('POST', `/services/${mover.id}/move-project`, { project: Bp.id });
-    const inB = await api('GET', `/projects/${Bp.id}`);
-    check('the service and its volume are in the new project', inB.services.some((x) => x.id === mover.id) && inB.volumes.some((v) => v.serviceId === mover.id));
-    check('and gone from the old one', !(await api('GET', `/projects/${A.id}`)).services.some((x) => x.id === mover.id));
-    const restarted = await waitFor(async () => {
-      const r = await exec(mover.id, 'cat /data/file').catch(() => null);
-      return r && r.output.trim() === 'moved-data' && (await api('GET', `/services/${mover.id}`)).status === 'running';
-    }, 120_000, 'moved service running');
-    check('it runs in the new project with its data', !!restarted);
-  }
+  await moveProjectChecks();
 
   // ─────────────────────────────────────────────────────────────
   console.log('\n▸ volumes (attach / detach)');

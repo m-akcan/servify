@@ -13,6 +13,7 @@ import { Shortcuts } from './components/Shortcuts.tsx';
 import { SettingsView } from './views/SettingsView.tsx';
 import { ServersView } from './views/Servers.tsx';
 import { TrafficView } from './views/Traffic.tsx';
+import { MoveProjectDialogHost } from './lib/moveproject.tsx';
 
 export function App() {
   const auth = useStore((s) => s.auth);
@@ -47,6 +48,7 @@ export function App() {
       </Shell>
       <CommandPalette />
       <MenuHost />
+      <MoveProjectDialogHost />
       <ConfirmHost />
       <ToastHost />
       <EventToasts />

@@ -2,6 +2,7 @@ import { api } from './api.ts';
 import { toast, toastError, confirmDialog, type MenuItem } from '../components/ui.tsx';
 import type { Deployment, ServiceView } from './types.ts';
 import { openVolumeDialog } from './volumes.tsx';
+import { openMoveDialog } from './moveproject.tsx';
 import { navigate, projectPath } from './router.ts';
 import { store } from './store.ts';
 
@@ -165,6 +166,7 @@ export function serviceMenu(s: ServiceView, opts: { open: (tab?: string) => void
   if (deployed) items.push(s.stopped ? { label: 'Start', icon: 'play', onSelect: () => void start(s) } : { label: 'Stop', icon: 'stop', onSelect: () => void stop(s) });
   items.push({ label: 'Duplicate', icon: 'copy', onSelect: () => void duplicate(s) });
   items.push({ label: 'Attach volume…', icon: 'database', onSelect: () => openVolumeDialog({ kind: 'attach', serviceId: s.id }) });
+  items.push({ label: 'Move to project…', icon: 'arrowRight', onSelect: () => openMoveDialog(s.id) });
   items.push({ type: 'sep' });
   items.push({ label: 'Delete service', icon: 'trash', danger: true, kbd: '⌫', onSelect: () => void remove(s) });
   return items;
