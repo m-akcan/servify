@@ -214,6 +214,8 @@ export interface Service {
   sleeping?: boolean;
   /** Image services: redeploy automatically when a new image is published under the same tag. */
   imageAutoUpdate?: boolean;
+  /** Image services: pull the tag again on every deploy (deploy hooks, manual deploys), not only for `:latest`. */
+  pullOnDeploy?: boolean;
   /** Record the router's HTTP access log for this service (on unless set to false; no IPs, only a daily-salted visitor key). */
   accessLog?: boolean;
   /** Router access control: IP allow/deny lists, basic auth, rate limit (unset = open to anyone). */

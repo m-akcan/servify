@@ -66,6 +66,7 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   'GET /overview': { level: 'read' },
   'GET /settings': { level: 'read' },
   'GET /settings/autostart': { level: 'read' },
+  'GET /settings/notifications/health': { level: 'read' },
   'GET /certs': { level: 'read' },
   // The phone app mirrored from the signed release (public on GitHub too, but not an open file server). Instance-wide,
   // like /system: phones (device tokens act as the owner) and the dashboard use it, agents limited to some projects
@@ -207,6 +208,10 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   'POST /settings/backups/destinations/:id/test': { level: 'owner', ownerMessage: SETTINGS },
   'DELETE /settings/backups/destinations/:id': { level: 'owner', ownerMessage: SETTINGS },
   'GET /settings/webhooks/deliveries': { level: 'owner', ownerMessage: SETTINGS },
+  'GET /settings/registries': { level: 'owner', ownerMessage: SETTINGS },
+  'POST /settings/registries': { level: 'owner', ownerMessage: SETTINGS },
+  'DELETE /settings/registries/:id': { level: 'owner', ownerMessage: SETTINGS },
+  'POST /settings/registries/:id/test': { level: 'owner', ownerMessage: SETTINGS },
   'POST /settings/webhooks/rotate': { level: 'owner', ownerMessage: SETTINGS },
   'POST /certs/:host/retry': { level: 'owner', ownerMessage: SETTINGS },
   'GET /tokens': { level: 'owner', ownerMessage: TOKENS },

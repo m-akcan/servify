@@ -149,7 +149,7 @@ async function registryFetch(r: Repo, url: string, init: RequestInit = {}): Prom
 async function remoteDigest(r: Repo): Promise<string> {
   const url = `${r.base}/manifests/${encodeURIComponent(r.tag)}`;
   let res = await registryFetch(r, url, { method: 'HEAD', headers: { accept: ACCEPT } });
-  if (res.status === 401 || res.status === 403) throw new Error(savedLoginHosts().has(r.registry) ? `${r.registry} refused the saved login` : `the registry needs credentials (no docker login for ${r.registry})`);
+  if (res.status === 401 || res.status === 403) throw new Error(savedLoginHosts().has(r.registry) ? `${r.registry} refused the saved login` : `the registry needs credentials (add a login for ${r.registry} in Settings → Registry logins)`);
   if (res.status === 404) throw new Error(`the tag ${r.tag} is no longer in the registry`);
   if (!res.ok) throw new Error(`the registry answered ${res.status}`);
   const header = res.headers.get('docker-content-digest');

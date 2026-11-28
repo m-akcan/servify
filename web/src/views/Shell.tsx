@@ -87,6 +87,22 @@ function LowDiskBanner({ connected }: { connected: boolean }) {
   );
 }
 
+/** Notification channels that keep failing (checked every minute): a dot on the settings button. */
+function useFailingChannels(): number {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const load = () =>
+      api
+        .get<Record<string, { failing: boolean }>>('/settings/notifications/health')
+        .then((h) => setN(Object.values(h).filter((x) => x.failing).length))
+        .catch(() => {});
+    void load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, []);
+  return n;
+}
+
 export function Shell({ children }: { children: ReactNode }) {
   const route = useRoute();
   const projects = useStore((s) => s.projects);
@@ -95,6 +111,7 @@ export function Shell({ children }: { children: ReactNode }) {
   const current = route.name === 'project' ? projects.find((p) => p.slug === route.project || p.id === route.project) : null;
   const base = current?.parentId ? projects.find((p) => p.id === current.parentId) ?? current : current;
   const [theme, setTheme] = useState(getThemePref());
+  const failingChannels = useFailingChannels();
 
   const switchProject = (el: HTMLElement) =>
     openMenuAt(el, [
@@ -166,9 +183,10 @@ export function Shell({ children }: { children: ReactNode }) {
               Agents
             </button>
           </Tooltip>
-          <Tooltip label="Settings — HTTPS, notifications, backups, webhooks" side="bottom">
-            <button className={`btn btn-ghost btn-sm btn-icon ${route.name === 'settings' ? 'active' : ''}`} onClick={() => navigate('/settings')} aria-label="Settings">
+          <Tooltip label={failingChannels ? 'A notification channel keeps failing — Settings → Notifications' : 'Settings — HTTPS, notifications, backups, webhooks'} side="bottom">
+            <button className={`btn btn-ghost btn-sm btn-icon ${route.name === 'settings' ? 'active' : ''}`} style={{ position: 'relative' }} onClick={() => navigate(failingChannels ? '/settings/notifications' : '/settings')} aria-label="Settings">
               <Icon name="gear" size={15} />
+              {failingChannels > 0 && <span className="tls-dot" data-tls="failed" data-testid="notify-failing-dot" style={{ position: 'absolute', top: 3, right: 3, width: 7, height: 7 }} />}
             </button>
           </Tooltip>
           <Tooltip label={theme === 'dark' ? 'Light theme' : 'Dark theme'} side="bottom">

@@ -280,7 +280,7 @@ export function createDockerClient(target: DockerTarget) {
         throw e;
       }
     },
-    /** `auth`: an X-Registry-Auth value (only ever passed for this machine's daemon, never a remote server's). */
+    /** `auth`: an X-Registry-Auth value for this one pull (a remote server's daemon only ever gets Servify's own logins). */
     async pullImage(ref: string, onLine?: (line: string) => void, auth?: string | null): Promise<void> {
       let [image, tag] = splitImageRef(ref);
       const res = await stream('POST', '/images/create', { query: { fromImage: image, tag }, ...(auth ? { headers: { 'X-Registry-Auth': auth } } : {}) });

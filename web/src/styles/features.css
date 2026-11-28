@@ -1590,3 +1590,30 @@
     display: none;
   }
 }
+/* Notification channel: the last delivery failed — the problem in plain words and what to do. */
+.channel-problem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 2px 12px 48px;
+  padding: 9px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid color-mix(in srgb, var(--err) 35%, transparent);
+  background: var(--err-soft);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+  white-space: normal;
+}
+.channel-problem b {
+  color: var(--text);
+  font-weight: 600;
+}
+.channel-problem .mono {
+  font-size: 11px;
+}
+@media (max-width: 640px) {
+  .channel-problem {
+    margin-left: 2px;
+  }
+}

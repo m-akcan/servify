@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useState, type ReactNode } from 'react';
 import { api } from '../lib/api.ts';
 import { useStore } from '../lib/store.ts';
 import { navigate } from '../lib/router.ts';
@@ -57,13 +57,15 @@ type Settings = {
 };
 type DiskSettings = { warnPct: number | null; warnGb: number | null; protectPct: number | null; protectGb: number | null; autoClean: boolean | null };
 type Alerts = { enabled: boolean; diskPct: number; memPct: number; cpuPct: number; failureRemindHours?: number };
-type Delivery = { ts: number; channelId: string; event: string; ok: boolean; error?: string };
+type Delivery = { ts: number; channelId: string; event: string; ok: boolean; error?: string; problem?: string; fix?: string };
+/** GET /settings/notifications/health: the last result per enabled channel (problem/fix/detail for the owner only). */
+type ChannelHealth = { ts: number; ok: boolean; failures: number; failing: boolean; problem?: string | null; fix?: string | null; detail?: string | null; lastOkTs?: number | null };
 type HookDelivery = { ts: number; provider: string; event: string; repo: string | null; ok: boolean; result: string };
 
 const CHANNEL_META: Record<ChannelType, { label: string; brand?: string; icon?: IconName; hint: string }> = {
   slack: { label: 'Slack', icon: 'hash', hint: 'Incoming webhook URL from a Slack app (api.slack.com/apps → Incoming Webhooks).' },
   discord: { label: 'Discord', brand: 'discord', hint: 'Channel settings → Integrations → Webhooks → Copy URL.' },
-  telegram: { label: 'Telegram', brand: 'telegram', hint: 'A bot token from @BotFather and the chat id to post to.' },
+  telegram: { label: 'Telegram', brand: 'telegram', hint: 'A bot token from @BotFather and the chat id to post to: yours or a group’s, never the bot’s own. Message the bot first, then find your chat id at api.telegram.org/bot<token>/getUpdates.' },
   ntfy: { label: 'ntfy', icon: 'bell', hint: 'Push to your phone via ntfy.sh or a self-hosted ntfy server.' },
   email: { label: 'Email', icon: 'mail', hint: 'Any SMTP server — your provider, Gmail app password, Postmark, Resend…' },
   webhook: { label: 'Webhook', icon: 'webhook', hint: 'POSTs JSON to your URL, signed with HMAC-SHA256 when you set a secret.' },
@@ -81,6 +83,7 @@ const SECTIONS: { id: string; label: string; icon: IconName }[] = [
   { id: 'backups', label: 'Backup storage', icon: 'archive' },
   { id: 'webhooks', label: 'Git webhooks', icon: 'webhook' },
   { id: 'reclaim', label: 'Reclaim space', icon: 'layers' },
+  { id: 'registries', label: 'Registry logins', icon: 'key' },
   { id: 'security', label: 'Security', icon: 'shield' },
 ];
 
@@ -89,10 +92,16 @@ const SECTIONS: { id: string; label: string; icon: IconName }[] = [
 export function SettingsView({ section }: { section?: string }) {
   const active = SECTIONS.some((s) => s.id === section) ? section! : 'general';
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [health, setHealth] = useState<Record<string, ChannelHealth>>({});
   const load = () => api.get<Settings>('/settings').then(setSettings).catch((e) => toastError(e, 'Could not load settings'));
+  const loadHealth = () => api.get<Record<string, ChannelHealth>>('/settings/notifications/health').then(setHealth).catch(() => {});
   useEffect(() => {
     void load();
+    void loadHealth();
+    const t = setInterval(loadHealth, 30_000);
+    return () => clearInterval(t);
   }, []);
+  const failingChannels = Object.values(health).filter((h) => h.failing).length;
 
   return (
     <div className="page">
@@ -109,6 +118,7 @@ export function SettingsView({ section }: { section?: string }) {
               <button key={s.id} className={active === s.id ? 'on' : ''} onClick={() => navigate(`/settings/${s.id}`, { replace: true })}>
                 <Icon name={s.icon} size={15} />
                 {s.label}
+                {s.id === 'notifications' && failingChannels > 0 && <span className="tls-dot" data-tls="failed" style={{ marginLeft: 'auto' }} aria-label={`${failingChannels} failing`} />}
               </button>
             ))}
           </nav>
@@ -121,10 +131,11 @@ export function SettingsView({ section }: { section?: string }) {
               <>
                 {active === 'general' && <General settings={settings} reload={load} />}
                 {active === 'https' && <Https settings={settings} reload={load} />}
-                {active === 'notifications' && <Notifications settings={settings} reload={load} />}
+                {active === 'notifications' && <Notifications settings={settings} reload={load} health={health} reloadHealth={loadHealth} />}
                 {active === 'backups' && <Backups settings={settings} reload={load} />}
                 {active === 'webhooks' && <Webhooks settings={settings} reload={load} />}
                 {active === 'reclaim' && <ReclaimSpace />}
+                {active === 'registries' && <RegistryLogins />}
                 {active === 'security' && <Security />}
               </>
             )}
@@ -673,7 +684,7 @@ function DashboardDomain({ settings, reload, httpsPort }: { settings: Settings; 
 
 // ───────────────────────────── notifications ─────────────────────────────
 
-function Notifications({ settings, reload }: { settings: Settings; reload: () => void }) {
+function Notifications({ settings, reload, health, reloadHealth }: { settings: Settings; reload: () => void; health: Record<string, ChannelHealth>; reloadHealth: () => void }) {
   const [editing, setEditing] = useState<Channel | null>(null);
   const [deliveries, setDeliveries] = useState<Delivery[]>([]);
   const [testing, setTesting] = useState<string | null>(null);
@@ -688,6 +699,7 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
     try {
       await api.post('/settings/notifications/channels', { ...c, enabled });
       reload();
+      reloadHealth();
     } catch (e) {
       toastError(e, 'Could not update');
     }
@@ -697,19 +709,22 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
     try {
       const r = await api.post<Delivery>(`/settings/notifications/channels/${c.id}/test`);
       if (r.ok) toast({ title: `Test sent to ${c.name}`, tone: 'ok' });
-      else toastError(new Error(r.error ?? 'failed'), `${c.name} rejected the test`);
+      else toastError(new Error(r.problem ?? r.error ?? 'failed'), `${c.name} rejected the test`);
     } catch (e) {
       toastError(e, 'Test failed');
     } finally {
       setTesting(null);
       void loadDeliveries();
+      reloadHealth();
     }
   };
   const remove = async (c: Channel) => {
     if (!(await confirmDialog({ title: `Remove ${c.name}?`, body: 'Servify stops sending notifications there.', confirm: 'Remove', danger: true }))) return;
     await api.del(`/settings/notifications/channels/${c.id}`).catch((e) => toastError(e));
     reload();
+    reloadHealth();
   };
+  const failing = channels.filter((c) => health[c.id!]?.failing);
 
   return (
     <>
@@ -722,6 +737,15 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
           </Button>
         }
       >
+        {failing.length > 0 && (
+          <div className="callout callout-err" style={{ marginBottom: 12 }} data-testid="channels-failing">
+            <Icon name="alert" size={15} />
+            <div className="grow">
+              {failing.length === 1 ? <b>{failing[0].name}</b> : <b>{failing.length} channels</b>} keep{failing.length === 1 ? 's' : ''} failing, so {failing.length === 1 ? 'its' : 'their'} notifications don’t arrive.
+              {channels.some((c) => c.enabled && !health[c.id!]?.failing) ? ' Servify told your other channels.' : ' No other channel can tell you, so check here.'}
+            </div>
+          </div>
+        )}
         {channels.length === 0 ? (
           <div className="channel-picker">
             {(Object.keys(CHANNEL_META) as ChannelType[]).map((t) => (
@@ -734,7 +758,8 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
         ) : (
           <div className="channel-list">
             {channels.map((c) => (
-              <div className="channel-row" key={c.id}>
+              <Fragment key={c.id}>
+              <div className="channel-row">
                 <div className="channel-icon">
                   <ChannelIcon type={c.type} />
                 </div>
@@ -748,9 +773,10 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
                   <div className="faint truncate" style={{ fontSize: 11.5, marginTop: 2 }}>
                     {c.events.map((e) => EVENTS.find((x) => x[0] === e)?.[1] ?? e).join(' · ')}
                   </div>
+                  {health[c.id!]?.ok && <ChannelState h={health[c.id!]} />}
                 </div>
                 <Button size="sm" variant="ghost" icon="send" loading={testing === c.id} onClick={() => void test(c)}>
-                  Test
+                  Send test
                 </Button>
                 <Tooltip label="Edit">
                   <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setEditing(c)} aria-label="Edit channel">
@@ -764,6 +790,8 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
                 </Tooltip>
                 <Switch checked={c.enabled} onChange={(v) => void toggle(c, v)} label={`${c.name} enabled`} />
               </div>
+              {health[c.id!] && !health[c.id!].ok && <ChannelState h={health[c.id!]} />}
+              </Fragment>
             ))}
           </div>
         )}
@@ -783,7 +811,9 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
                 <span style={{ width: 120 }} className="truncate">
                   {byId[d.channelId]?.name ?? 'removed'}
                 </span>
-                <span className="mono faint truncate grow">{d.ok ? d.event : `${d.event} — ${d.error}`}</span>
+                <span className="mono faint truncate grow" title={d.ok ? undefined : d.problem}>
+                  {d.ok ? d.event : `${d.event} — ${d.problem ?? d.error}`}
+                </span>
               </div>
             ))}
           </div>
@@ -800,6 +830,32 @@ function Notifications({ settings, reload }: { settings: Settings; reload: () =>
         />
       )}
     </>
+  );
+}
+
+/** The last delivery on a channel: a quiet "delivered" line, or the problem in plain words with what to do. */
+function ChannelState({ h }: { h: ChannelHealth }) {
+  if (h.ok)
+    return (
+      <div className="row faint" style={{ gap: 6, fontSize: 11.5, marginTop: 4 }}>
+        <span className="tls-dot" data-tls="issued" />
+        Delivered {timeAgo(h.ts)}
+      </div>
+    );
+  return (
+    <div className="channel-problem" data-testid="channel-problem">
+      <div className="row" style={{ gap: 8 }}>
+        <span className="tls-dot" data-tls="failed" />
+        <b className="grow">{h.problem ?? 'Delivery failed'}</b>
+        {h.failing && <Badge tone="err">Failing</Badge>}
+      </div>
+      {h.fix && <div>{h.fix}</div>}
+      <div className="faint" style={{ fontSize: 11.5 }}>
+        {h.failures === 1 ? 'Failed' : `${h.failures} failures in a row, last`} {timeAgo(h.ts)}
+        {h.lastOkTs ? ` · last delivered ${timeAgo(h.lastOkTs)}` : ''}
+        {h.detail ? <span className="mono"> · {h.detail}</span> : null}
+      </div>
+    </div>
   );
 }
 
@@ -980,7 +1036,7 @@ function ChannelModal({ channel, onClose, onSaved }: { channel: Channel; onClose
     setSaving(true);
     try {
       await api.post('/settings/notifications/channels', { ...c, smtp: c.type === 'email' ? smtp : undefined });
-      toast({ title: isNew ? `${c.name} added` : 'Channel saved', body: isNew ? 'Use “Test” to check it end to end.' : undefined, tone: 'ok' });
+      toast({ title: isNew ? `${c.name} added` : 'Channel saved', body: isNew ? 'Use “Send test” to check it end to end.' : undefined, tone: 'ok' });
       onSaved();
     } catch (err) {
       toastError(err, 'Could not save');
@@ -1091,6 +1147,148 @@ function ChannelModal({ channel, onClose, onSaved }: { channel: Channel; onClose
           </Button>
           <Button type="submit" variant="primary" loading={saving} disabled={!c.events.length}>
             {isNew ? 'Add channel' : 'Save'}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ───────────────────────────── registry logins ─────────────────────────────
+
+type RegistryLogin = { id: string; registry: string; username: string; createdAt: number; updatedAt: number };
+type RegistryDraft = { id?: string; registry: string; username: string; password: string };
+
+/** Logins for private image registries (ghcr.io …): used for pulls on every server and for update checks. */
+function RegistryLogins() {
+  const [logins, setLogins] = useState<RegistryLogin[] | null>(null);
+  const [editing, setEditing] = useState<RegistryDraft | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
+  const load = () => api.get<RegistryLogin[]>('/settings/registries').then(setLogins).catch((e) => toastError(e, 'Could not load registry logins'));
+  useEffect(() => {
+    void load();
+  }, []);
+  const test = async (l: RegistryLogin) => {
+    setTesting(l.id);
+    try {
+      const r = await api.post<{ ok: boolean; message: string }>(`/settings/registries/${l.id}/test`);
+      if (r.ok) toast({ title: r.message, tone: 'ok' });
+      else toastError(new Error(r.message), `${l.registry} login failed`);
+    } catch (e) {
+      toastError(e, 'Test failed');
+    } finally {
+      setTesting(null);
+    }
+  };
+  const remove = async (l: RegistryLogin) => {
+    if (!(await confirmDialog({ title: `Remove the login for ${l.registry}?`, body: 'Images already on your servers keep running. New pulls of private images from this registry will fail until you add a login again.', confirm: 'Remove', danger: true }))) return;
+    await api.del(`/settings/registries/${l.id}`).catch((e) => toastError(e));
+    void load();
+  };
+  return (
+    <>
+      <Card
+        title="Registry logins"
+        desc="For private images, such as ghcr.io/you/app:latest. Servify uses them to pull on this machine and on your other servers, and to check for image updates."
+        right={
+          <Button variant="primary" size="sm" icon="plus" onClick={() => setEditing({ registry: 'ghcr.io', username: '', password: '' })}>
+            Add login
+          </Button>
+        }
+      >
+        {logins === null ? (
+          <div className="faint">Loading…</div>
+        ) : logins.length === 0 ? (
+          <div className="faint" style={{ fontSize: 13 }}>
+            No logins yet. Public images need none. Servify also uses a <span className="mono">docker login</span> made on this machine by the user it runs as, but doesn’t send it to your other servers itself.
+          </div>
+        ) : (
+          <div className="channel-list">
+            {logins.map((l) => (
+              <div className="channel-row" key={l.id}>
+                <div className="channel-icon">
+                  <Icon name={l.registry === 'ghcr.io' ? 'github' : 'box'} size={17} />
+                </div>
+                <div className="grow" style={{ minWidth: 0 }}>
+                  <b className="mono">{l.registry}</b>
+                  <div className="faint truncate" style={{ fontSize: 11.5, marginTop: 2 }}>
+                    {l.username} · token saved {timeAgo(l.updatedAt)}
+                  </div>
+                </div>
+                <Button size="sm" variant="ghost" icon="check" loading={testing === l.id} onClick={() => void test(l)}>
+                  Test
+                </Button>
+                <Tooltip label="Edit">
+                  <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setEditing({ id: l.id, registry: l.registry, username: l.username, password: '' })} aria-label="Edit login">
+                    <Icon name="edit" size={14} />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Remove">
+                  <button className="btn btn-ghost btn-sm btn-icon" onClick={() => void remove(l)} aria-label="Remove login">
+                    <Icon name="trash" size={14} />
+                  </button>
+                </Tooltip>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+      <div className="callout callout-info rise-in">
+        <Icon name="info" size={15} />
+        <div className="grow">
+          For GitHub Container Registry, use your GitHub user name and a personal access token (classic) with only the <span className="mono">read:packages</span> scope. Tokens are encrypted at rest and never shown again. On a remote server the login goes to that server’s Docker for each pull only. To deploy from CI, turn on <b>Pull before every deploy</b> on the service and call its deploy hook after pushing.
+        </div>
+      </div>
+      {editing && (
+        <RegistryModal
+          draft={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            void load();
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+function RegistryModal({ draft, onClose, onSaved }: { draft: RegistryDraft; onClose: () => void; onSaved: () => void }) {
+  const [d, setD] = useState<RegistryDraft>(draft);
+  const [saving, setSaving] = useState(false);
+  const isNew = !draft.id;
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await api.post('/settings/registries', { ...d, password: d.password || undefined });
+      toast({ title: isNew ? `Login for ${d.registry} added` : 'Login saved', body: isNew ? 'Use “Test” to check it.' : undefined, tone: 'ok' });
+      onSaved();
+    } catch (err) {
+      toastError(err, 'Could not save');
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal open onClose={onClose} width={500}>
+      <form onSubmit={save} className="modal-body col" style={{ gap: 16 }}>
+        <div className="h2">{isNew ? 'Add a registry login' : `Edit the login for ${draft.registry}`}</div>
+        <Field label="Registry" hint="The host only: ghcr.io, registry.gitlab.com, docker.io, localhost:5000 …">
+          <input className="input mono" required value={d.registry} onChange={(e) => setD({ ...d, registry: e.target.value })} spellCheck={false} />
+        </Field>
+        <Field label="Username" hint={d.registry.includes('ghcr.io') ? 'Your GitHub user name.' : undefined}>
+          <input className="input mono" required autoComplete="off" value={d.username} onChange={(e) => setD({ ...d, username: e.target.value })} spellCheck={false} />
+        </Field>
+        <Field label={d.registry.includes('ghcr.io') ? 'Personal access token' : 'Password or token'} hint={isNew ? (d.registry.includes('ghcr.io') ? 'Classic token with the read:packages scope (github.com → Settings → Developer settings).' : undefined) : 'Leave empty to keep the saved one.'}>
+          <input className="input mono" type="password" autoComplete="new-password" required={isNew} value={d.password} onChange={(e) => setD({ ...d, password: e.target.value })} />
+        </Field>
+        <div className="row" style={{ gap: 8, justifyContent: 'flex-end' }}>
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" variant="primary" loading={saving}>
+            {isNew ? 'Add login' : 'Save'}
           </Button>
         </div>
       </form>

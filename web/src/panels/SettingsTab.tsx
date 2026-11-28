@@ -1002,6 +1002,21 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
           </>
         )}
         <DeployHook serviceId={s.id} />
+        {src.type === 'image' && !src.image.includes('@') && (
+          <div className="setting-row">
+            <div className="grow">
+              <div className="title">Pull before every deploy</div>
+              <div className="desc">
+                Every deploy, including the deploy hook, pulls {src.image} again, so CI can push the tag and call the hook. A failed pull fails the deploy. <span className="mono">:latest</span> is always pulled. Private registry? Add a{' '}
+                <button className="link" onClick={() => navigate('/settings/registries')}>
+                  registry login
+                </button>
+                .
+              </div>
+            </div>
+            <Switch checked={!!s.pullOnDeploy || /:latest$/.test(src.image) || !/:[^/]+$/.test(src.image)} disabled={/:latest$/.test(src.image) || !/:[^/]+$/.test(src.image)} onChange={(v) => void patch(id, { pullOnDeploy: v })} />
+          </div>
+        )}
         {src.type === 'local' && (
           <div className="ns-grid">
             <Field label="Path">
