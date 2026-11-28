@@ -8,8 +8,8 @@
  *  - the service (or project) it belonged to no longer exists in the database;
  *  - no container uses it, running or stopped (a stopped container of a deleted service is listed itself, first);
  *  - for volumes: not adopted (that data predates Servify), not forgotten-with-its-data-kept, not mounted read-only by
- *    another service, not a backup's scratch volume, and not merely parked (detached from a service that still exists,
- *    or never attached): only volumes left behind by a deleted service or project;
+ *    another service, not a backup's scratch volume, and not parked next to a live service (detached from a service
+ *    that still exists, or never attached): only volumes whose last service, or whose project, was deleted;
  *  - for images: no deployment or image source of an existing service names it (that covers the ones kept for
  *    rollbacks), and it has no tag other than Servify's own;
  *  - Docker-level leftovers are at least a couple of minutes old (nothing mid-creation).
@@ -157,7 +157,7 @@ export async function scanNode(nodeId: string): Promise<ReclaimItem[]> {
         createdAt: v.createdAt ?? tsOf(byName.get(v.dockerName)?.CreatedAt),
         project: projectName(v.projectId),
         service: serviceName(v.lastServiceId),
-        note: projectGone ? 'Its project was deleted' : `Kept when ${serviceName(v.lastServiceId)} was deleted; detached since`,
+        note: projectGone ? 'Its project was deleted' : `Detached; last attached to ${serviceName(v.lastServiceId)}, which was deleted`,
       },
     });
   }

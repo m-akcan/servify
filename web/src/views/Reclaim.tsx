@@ -131,7 +131,7 @@ export function ReclaimSpace() {
           <div className="grow">
             <div className="h3">Reclaim space</div>
             <div className="s-card-desc">
-              What Servify created and nothing uses any more: volumes kept when their service or project was deleted, built images and stopped containers of deleted services, networks of deleted projects. Only this Servify's own leftovers are listed — never anything a service still uses (stopped ones included), volumes taken over from the host, volumes you detached on purpose, backups, the images kept for rollbacks, or images pulled from a registry.
+              What Servify created and nothing uses any more: volumes kept when their service or project was deleted, built images and stopped containers of deleted services, networks of deleted projects. Only this Servify's own leftovers are listed — never anything a service still uses (stopped ones included), volumes taken over from the host, volumes detached from a service that still exists (or never attached), backups, the images kept for rollbacks, or images pulled from a registry.
             </div>
           </div>
           <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void load()}>
