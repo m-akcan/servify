@@ -1775,13 +1775,13 @@ async function registryLoginChecks(P) {
   const sh = (c) => execSync(c, { stdio: 'pipe', env: { ...process.env, DOCKER_CONFIG: pushCfg, DOCKER_HOST: process.env.DOCKER_HOST || dockerHost } }).toString().trim();
   const authDir = mkdtempSync(join(tmpdir(), 'servify-ghcrauth-'));
   writeFileSync(join(authDir, 'htpasswd'), `${USER}:${HASH}\n`);
-  sh(`docker rm -f ${NAME} 2>/dev/null || true`);
+  sh(`docker rm -fv ${NAME} 2>/dev/null || true`);
   sh(`docker run -d --name ${NAME} -p ${PORT}:5000 -v ${authDir}:/auth -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=acc -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2`);
   let loginId = null;
   cleanups.push(async () => {
     if (loginId) await api('DELETE', `/settings/registries/${loginId}`).catch(() => {});
     try {
-      sh(`docker rm -f ${NAME}; docker rmi ${ref} || true`);
+      sh(`docker rm -fv ${NAME}; docker rmi ${ref} || true`);
     } catch {}
     rmSync(authDir, { recursive: true, force: true });
     rmSync(pushCfg, { recursive: true, force: true });
