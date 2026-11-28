@@ -10,7 +10,7 @@ import { networkName, volumeName, LABEL, INSTANCE_ID, deployedSchedule } from '.
 /** A run that outlives this is killed (a long-lived server image armed as a job by mistake, a hang…). */
 const MAX_RUNTIME_MS = Number(process.env.SERVIFY_JOB_MAX_SECONDS ?? 3600) * 1000;
 import { minuteOf } from './cron.ts';
-import { mountsFor, hostMountsFor } from './volumes.ts';
+import { mountsFor, hostMountsFor, sharedWriteOwners } from './volumes.ts';
 import { anyPending, dropPending, pruneSchedState, readBeat, reportOutcome, stepSchedule, writeBeat, type CatchUpInfo } from './schedstate.ts';
 
 const running = new Set<string>();
@@ -72,6 +72,10 @@ export async function runJob(svc: Service, trigger: JobRun['trigger'], actor: Ac
   if (!deployedSchedule(svc, dep)) throw new HttpError(400, `${svc.name} is not a scheduled job (set a schedule and deploy first)`);
   const project = projectsTable.get(svc.projectId);
   if (!project) throw new HttpError(404, 'project missing');
+  // A restore wipes and refills the owner's volume: a job writing to it (read-and-write share) waits for the next run.
+  const { isRestoring } = await import('./backups.ts');
+  const restoringOwner = sharedWriteOwners(svc).find((o) => isRestoring(o.id));
+  if (restoringOwner) throw new HttpError(409, `${restoringOwner.name} is being restored, and ${svc.name} writes to its volume — not run meanwhile`);
   const docker = dockerFor(nodeOf(svc)); // jobs run on the service's server; throws while it is offline, before anything is marked running
   running.add(svc.id);
   const run: JobRun = {

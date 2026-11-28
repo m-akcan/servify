@@ -309,7 +309,7 @@ function ServiceVolumes({ service: s }: { service: ServiceView }) {
           <span className="mono truncate" style={{ minWidth: 0, maxWidth: '45%' }} title={m.hostPath ?? undefined}>{m.hostPath ?? (m.volumeId && vols?.[m.volumeId]?.name) ?? m.name}</span>
           <Icon name="arrowRight" size={12} className="faint" />
           <span className="mono grow truncate">{m.mountPath}</span>
-          <span className="badge" data-tone="idle">{m.hostPath ? 'host folder' : 'shared'}{m.readOnly || m.borrowed ? ' · read-only' : ''}{m.selinux ? ` · :${m.selinux}` : ''}</span>
+          <span className="badge" data-tone={m.borrowed && m.writable ? 'warn' : 'idle'}>{m.hostPath ? 'host folder' : 'shared'}{m.borrowed ? (m.writable ? ' · read and write' : ' · read-only') : m.readOnly ? ' · read-only' : ''}{m.selinux ? ` · :${m.selinux}` : ''}</span>
           <Button size="sm" variant="ghost" icon="x" onClick={() => void unmount(m.mountPath)}>
             Remove
           </Button>
@@ -1308,7 +1308,7 @@ export function SettingsTab({ service: s }: { service: ServiceView }) {
         <div className="setting-row">
           <div className="grow">
             <div className="title">Delete service</div>
-            <div className="desc">Permanently remove the service, its images{s.volumes.length ? ' and volume data' : ''}.</div>
+            <div className="desc">Permanently remove the service, its images{s.volumes.some((m) => !m.borrowed && !m.hostPath) ? ' and volume data' : ''}.</div>
           </div>
           <Button variant="danger" icon="trash" onClick={() => void remove(s)}>
             Delete

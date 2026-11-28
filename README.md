@@ -252,7 +252,31 @@ For moving existing Docker setups onto Servify (all owner-only — agent tokens 
 
 - **Take over a Docker volume** ("An existing Docker volume…" when attaching, or `docker compose` import with *Take over the existing Docker volumes*): the Servify volume points at the same Docker volume, nothing is copied. It's refused while any container outside Servify — running or stopped — still references the volume, so stop the old setup first (`docker compose down`, without `-v`). Adopted volumes are never deleted implicitly (deleting their service or project only forgets them); **Forget (keep the data)** hands any volume back.
 - **Host folders** ("Host folder" in a service's volumes): a folder of the server mounted live, for media libraries or files you edit in place. Off until you start Servify with `SERVIFY_HOST_MOUNTS=/srv/media,/home/me/game` — only folders under those paths, never system folders, the Docker socket or Servify's own data. The folder must exist (Docker would silently create a missing one), symlinks are resolved before checking, and it can be read-only. On SELinux machines (Fedora, RHEL) pick a relabel (`z` shared, `Z` private) only if the container gets "permission denied" — relabelling a folder other programs use can break them. Host folders are never backed up, wiped by a restore or deleted.
-- **Read-only shares** ("Share read-only with…" on a volume): another service of the project reads the volume — say a backup container reading a game server's world. It can't write, doesn't own it, and its backups, restores and deletes never touch it; the volume can't be deleted while it's shared.
+- **Shares** ("Share with another service…" on a volume): another service of the project, on the same server, mounts the volume. **Read-only** (the default) suits a backup container reading a game server's world: it can't write. **Read and write** suits a worker or scheduled job of the same app, the way Compose services share a volume: both services write the same files. That is only safe when the app is designed for it, and a database's files are never shared this way (refused). Either way the volume stays its owner's: the sharing service's backups, restores and deletes never touch it (deleting it, even with its volumes, leaves the volume). The volume can't be deleted while it's shared, and its owner can't be deleted while another service writes to it (remove that share or make it read-only first; deleting the whole project is fine). A writer runs as one replica; it has to be stopped before the owner is restored, and a scheduled writer's runs wait while the owner is restored. A new image on a writer takes the owner's safety backup first, by the owner's settings. Shares never cross servers or projects, and a service with shares can't move to another server or project. API: `POST /api/volumes/:id/share {"serviceId", "mountPath", "writable": true}` (MCP `share_volume` with `writable`). To switch between read-only and read and write, remove the share (`POST /api/services/:id/unmount {"mountPath"}`) and share it again.
+
+### Nextcloud background jobs as a Servify job
+
+Nextcloud wants `cron.php` run every 5 minutes as `www-data`, in a container that sees the app's files. As a Servify job:
+
+1. Add the job: a new service from the **same image** as Nextcloud (e.g. `nextcloud:31-apache`), named `nextcloud-cron`, as a background worker (no web port).
+2. On the job, set **Settings → Start command** to `su -s /bin/sh www-data -c 'php -f /var/www/html/cron.php'`. A start command replaces the image's entrypoint, so the job never runs Nextcloud's install or upgrade step.
+3. Give it the variables the config reads at runtime, like `REDIS_HOST` and `REDIS_HOST_PASSWORD`, as references: `${{nextcloud.REDIS_HOST}}`. The database settings come from `config.php` on the shared volume, and the job runs on the project's network, so `db` or `redis` resolve as they do for Nextcloud.
+4. On Nextcloud's volume (the one at `/var/www/html`), pick **Share with another service…**, then choose `nextcloud-cron`, mount path `/var/www/html` and **Read and write**.
+5. Set **Settings → Schedule** to `*/5 * * * *`, deploy, then use **Run now** and check the run's output and exit code.
+6. In Nextcloud, set **Administration → Basic settings → Background jobs** to *Cron*, or run `php occ background:cron` as `www-data`, and remove the old systemd timer or host crontab.
+
+The same with the API (`-H "Authorization: Bearer $TOKEN"` on each call):
+
+```bash
+curl -X POST $SERVIFY/api/projects/cloud/services -d '{"name":"nextcloud-cron","image":"nextcloud:31-apache","protocol":"none","deploy":false,
+  "startCommand":"su -s /bin/sh www-data -c '\''php -f /var/www/html/cron.php'\''","env":{"REDIS_HOST":"${{nextcloud.REDIS_HOST}}"}}'
+curl -X PATCH $SERVIFY/api/services/<job id> -d '{"schedule":"*/5 * * * *"}'
+curl -X POST $SERVIFY/api/volumes/<nextcloud volume id>/share -d '{"serviceId":"<job id>","mountPath":"/var/www/html","writable":true}'
+curl -X POST $SERVIFY/api/services/<job id>/deploy
+curl -X POST $SERVIFY/api/services/<job id>/run   # run once now; history: GET /api/services/<job id>/runs
+```
+
+When you update Nextcloud's image, update the job's to the same tag. The new image on the job takes Nextcloud's safety backup first, like Nextcloud's own deploy does.
 
 ## Published ports
 
