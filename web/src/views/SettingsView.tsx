@@ -7,6 +7,7 @@ import { Button, Switch, Badge, Empty, Modal, CopyButton, Field, confirmDialog, 
 import { Icon, BrandMark, type IconName } from '../components/Icon.tsx';
 import { timeAgo } from '../lib/format.ts';
 import { SignInCards } from './SecuritySignIn.tsx';
+import { ReclaimSpace } from './Reclaim.tsx';
 
 // ───────────────────────────── types ─────────────────────────────
 
@@ -79,6 +80,7 @@ const SECTIONS: { id: string; label: string; icon: IconName }[] = [
   { id: 'notifications', label: 'Notifications', icon: 'bell' },
   { id: 'backups', label: 'Backup storage', icon: 'archive' },
   { id: 'webhooks', label: 'Git webhooks', icon: 'webhook' },
+  { id: 'reclaim', label: 'Reclaim space', icon: 'layers' },
   { id: 'security', label: 'Security', icon: 'shield' },
 ];
 
@@ -122,6 +124,7 @@ export function SettingsView({ section }: { section?: string }) {
                 {active === 'notifications' && <Notifications settings={settings} reload={load} />}
                 {active === 'backups' && <Backups settings={settings} reload={load} />}
                 {active === 'webhooks' && <Webhooks settings={settings} reload={load} />}
+                {active === 'reclaim' && <ReclaimSpace />}
                 {active === 'security' && <Security />}
               </>
             )}

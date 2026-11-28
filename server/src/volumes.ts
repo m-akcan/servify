@@ -6,7 +6,7 @@
  * Attach and detach take effect immediately (the service is redeployed) so a volume is never mounted by two
  * services at once, and replicas only ever mount volumes currently attached to their own service.
  */
-import { volumesTable, services as servicesTable, projects as projectsTable } from './db.ts';
+import { volumesTable, services as servicesTable, projects as projectsTable, kv } from './db.ts';
 import type { Service, Volume, VolumeRecord } from './types.ts';
 import type { SafetyOutcome } from './backups.ts';
 import { dockerFor, nodeOf, nodeName, onlineNodes } from './nodes.ts';
@@ -495,6 +495,7 @@ export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keep
     if (opts.skipSafetyBackup) recordActivity(actor, 'backup.skipped', `Deleting volume ${v.name} without a safety backup (skipped by ${actor.name})`, v.projectId);
     else safety = await (await import('./backups.ts')).ensureVolumeSafetyBackup(v, { actor, what: `deleting volume ${v.name}` });
   }
+  if (opts.keepData) noteKeptVolumes(membersOf(v).map((m) => `${nodeOf(m)}:${m.dockerName}`));
   for (const m of membersOf(v)) {
     if (!opts.keepData) {
       const d = dockerFor(m.nodeId);
@@ -509,6 +510,21 @@ export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keep
   recordActivity(actor, 'volume.deleted', opts.keepData ? `Forgot volume ${v.name} (the Docker volume ${v.dockerName} and its data stay)` : `Deleted volume ${v.name} and its data${kept}`, v.projectId);
   const b = safety?.backup;
   return { safetyBackup: b ? { id: b.id, status: safety!.status, destinationName: b.destinationName, key: b.key, sizeBytes: b.sizeBytes, startedAt: b.startedAt } : null };
+}
+
+/** Docker volumes ("node:name") whose data the owner chose to keep when forgetting them: never offered as reclaimable. */
+const KEPT_KEY = 'reclaim_kept_volumes';
+export function keptVolumes(): Set<string> {
+  try {
+    return new Set(JSON.parse(kv.get(KEPT_KEY) ?? '[]'));
+  } catch {
+    return new Set();
+  }
+}
+function noteKeptVolumes(names: string[]) {
+  const all = keptVolumes();
+  for (const n of names) all.add(n);
+  kv.set(KEPT_KEY, JSON.stringify([...all].slice(-2000)));
 }
 
 /**
@@ -684,6 +700,7 @@ export async function deleteProjectVolumes(projectId: string) {
     if (v.adopted) {
       // Its data predates Servify: forget it, never delete it implicitly.
       console.log(`[volumes] forgot adopted volume ${v.name}; the Docker volume ${v.dockerName} and its data stay`);
+      noteKeptVolumes([`${nodeOf(v)}:${v.dockerName}`]);
       volumesTable.delete(v.id);
       continue;
     }

@@ -349,6 +349,16 @@ export function createDockerClient(target: DockerTarget) {
       return p;
     },
     removeNetwork: (name: string) => call('DELETE', `/networks/${name}`).catch(() => {}),
+    listNetworks: (labels: string[] = []) => call<any[]>('GET', '/networks', { query: { filters: filtersParam({ label: labels }) } }),
+    /** A network with its attached containers, or null when it doesn't exist. */
+    async inspectNetwork(idOrName: string): Promise<any | null> {
+      try {
+        return await call('GET', `/networks/${encodeURIComponent(idOrName)}`);
+      } catch (e) {
+        if (e instanceof DockerError && e.status === 404) return null;
+        throw e;
+      }
+    },
     disconnectNetwork: (network: string, container: string) =>
       call('POST', `/networks/${network}/disconnect`, { body: { Container: container, Force: true } }).catch((e) => {
         if (e instanceof DockerError && (e.status === 404 || /is not connected/.test(e.message))) return;

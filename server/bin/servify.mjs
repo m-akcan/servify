@@ -14,6 +14,9 @@
  *                              locked out? On the Servify machine (needs the data folder): set a new owner password,
  *                              allow password sign-in everywhere again and end every dashboard session
  *   servify auth status        the password policy, passkeys, sessions and signed-in phones (local)
+ *   servify reclaim [--dry-run] [--yes] [--skip-safety-backup]   on the Servify machine: list what Servify left behind
+ *                              here that nothing uses (volumes of deleted services, their images, stopped containers,
+ *                              networks of deleted projects) and delete it after a confirmation; --dry-run only lists
  *
  * From your own machine, against a Servify here or on a server (SERVIFY_URL + SERVIFY_TOKEN, or `servify login`):
  *   servify login [url] [--token t] · logout      save (or forget) the URL and an API token
@@ -152,6 +155,8 @@ if (CLIENT.includes(cmd) || (cmd === 'help' && CLIENT.includes(rest[0]))) {
   }
 } else if (cmd === 'auth') {
   await authCommand(rest);
+} else if (cmd === 'reclaim') {
+  await reclaimCommand(rest);
 } else if (cmd === 'agent') {
   await import(pathToFileURL(join(here, 'agent.mjs')).href);
 } else if (cmd === 'service') {
@@ -160,6 +165,63 @@ if (CLIENT.includes(cmd) || (cmd === 'help' && CLIENT.includes(rest[0]))) {
 } else {
   console.log('usage: servify <command> — run `servify help` for the list');
   process.exit(cmd === 'help' || cmd === '--help' ? 0 : 1);
+}
+
+/**
+ * `servify reclaim [--dry-run] [--yes] [--skip-safety-backup]`: on the Servify machine (needs the data folder), list
+ * what Servify left behind on this machine that nothing uses any more, then delete it after a confirmation. Same
+ * rules as Settings → Reclaim space (which also covers added servers); every item is checked again before deleting.
+ */
+async function reclaimCommand(args) {
+  const flags = new Set(args);
+  const known = ['--dry-run', '--yes', '--skip-safety-backup'];
+  if ([...flags].some((f) => !known.includes(f))) {
+    console.error('usage: servify reclaim [--dry-run] [--yes] [--skip-safety-backup]');
+    process.exit(1);
+  }
+  const { existsSync } = await import('node:fs');
+  const { config } = await import(pathToFileURL(join(here, '../src/config.ts')).href);
+  if (!existsSync(config.dbPath)) {
+    console.error(`No Servify data in ${config.dataDir} (set SERVIFY_DATA_DIR to the folder Servify runs with).`);
+    process.exit(1);
+  }
+  const { scanReclaimable, reclaimItems } = await import(pathToFileURL(join(here, '../src/reclaim.ts')).href);
+  const size = (n) => (n == null ? '?' : n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${(n / 1e3).toFixed(0)} kB` : `${n} B`);
+  const report = await scanReclaimable({ localOnly: true });
+  const items = report.machines[0]?.items ?? [];
+  if (report.machines[0]?.error) {
+    console.error(`Could not scan this machine: ${report.machines[0].error}`);
+    process.exit(1);
+  }
+  console.log(`data ${config.dataDir} · instance ${report.instanceId} · this machine only (added servers: use the dashboard)`);
+  if (!items.length) {
+    console.log('Nothing to reclaim.');
+    process.exit(0);
+  }
+  for (const i of items) {
+    const from = [i.project && `project ${i.project}`, i.service && `service ${i.service}`].filter(Boolean).join(', ');
+    console.log(`  ${i.kind.padEnd(9)} ${i.name.padEnd(48)} ${size(i.sizeBytes).padStart(9)}  ${i.note}${from ? ` (${from})` : ''}`);
+  }
+  console.log(`${items.length} item(s), ${size(report.totalBytes)} reclaimable`);
+  if (flags.has('--dry-run')) process.exit(0);
+  if (!flags.has('--yes')) {
+    if (!process.stdin.isTTY) {
+      console.error('Not a terminal: pass --yes to delete these, or --dry-run to only list them.');
+      process.exit(1);
+    }
+    const { createInterface } = await import('node:readline/promises');
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await rl.question(`Delete all ${items.length}? Volume data is deleted for good${flags.has('--skip-safety-backup') ? ', without a safety backup' : ' (after a safety backup)'}; this can't be undone. Type "delete" to go ahead: `);
+    rl.close();
+    if (answer.trim() !== 'delete') {
+      console.log('Nothing deleted.');
+      process.exit(0);
+    }
+  }
+  const r = await reclaimItems({ type: 'user', name: 'owner (command line)' }, items.map((i) => i.key), { skipSafetyBackup: flags.has('--skip-safety-backup') });
+  for (const x of r.results) console.log(`  ${x.ok ? 'deleted' : 'kept   '} ${x.name ?? x.key}${x.ok ? '' : `: ${x.error}`}`);
+  console.log(`Freed about ${size(r.freedBytes)}.`);
+  process.exit(r.results.every((x) => x.ok) ? 0 : 1);
 }
 
 /**

@@ -60,6 +60,7 @@ import { restoreBackup, deleteBackup, openBackupStream, testRestore, publicBacku
 import { backupsTable } from './db.ts';
 import { s3Test } from './s3.ts';
 import { keySource, keyPath } from './crypto.ts';
+import { scanReclaimable, reclaimItems } from './reclaim.ts';
 import { listVolumes, createVolume, attachVolume, detachVolume, updateVolume, deleteVolume, unmanagedDockerVolumes, adoptVolume, shareVolume, removeMount } from './volumes.ts';
 import { switchover, rebuildMember } from './pgcluster.ts';
 import { planMove, moveServiceToProject } from './moveproject.ts';
@@ -557,6 +558,16 @@ api.get('/servers/:id/docker-volumes', async (c) => {
   ops.requireOwner(actor(c), 'Listing other Docker volumes');
   const id = c.req.param('id');
   return c.json(await unmanagedDockerVolumes(id === 'local' ? null : id));
+});
+// Reclaim space: what Servify left behind that nothing uses (owner only; the delete re-checks every item).
+api.get('/reclaim', async (c) => {
+  ops.requireOwner(actor(c), 'Reclaiming space');
+  return c.json(await scanReclaimable());
+});
+api.post('/reclaim/delete', async (c) => {
+  ops.requireOwner(actor(c), 'Reclaiming space');
+  const body = await jsonBody<{ keys: string[]; skipSafetyBackup?: boolean }>(c);
+  return c.json(await reclaimItems(actor(c), body.keys, { skipSafetyBackup: body.skipSafetyBackup === true }));
 });
 api.post('/projects/:id/volumes/adopt', async (c) => {
   ops.requireOwner(actor(c), 'Taking over an existing Docker volume');
