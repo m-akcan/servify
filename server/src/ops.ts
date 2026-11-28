@@ -24,7 +24,7 @@ import { isLocalHost } from './certs.ts';
 import { getSettings, destinationById } from './settings.ts';
 import { backupMethod, backupService, listBackups, isRestoring, ensureSafetyBackup, safetyPolicy, publicBackup } from './backups.ts';
 import { queryLogs, subscribeLogs, type LogLine } from './logstore.ts';
-import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume, borrowersOf } from './volumes.ts';
+import { syncServiceVolumes, releaseServiceVolumes, deleteProjectVolumes, listVolumes, hasSharedVolume, checkHostPath, adoptable, adoptVolume, borrowersOf, writersOf } from './volumes.ts';
 import { planCompose, planToSpec } from './compose.ts';
 import { clusterStatus } from './pgcluster.ts';
 import { autoRestartInfo } from './autorestart.ts';
@@ -260,7 +260,7 @@ export async function deleteProject(actor: Actor, projectId: string) {
   if (!p.parentId) for (const env of projectsTable.all().filter((x) => x.parentId === p.id)) await deleteProject(actor, env.id);
   // A project goes with its data. Deleting a whole project is unchanged by safety backups (it is the cleanup path of
   // every script); deleting a service's volumes or a volume on its own is where they apply.
-  for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true, deleteVolumes: true, skipSafetyBackup: true });
+  for (const s of servicesTable.all('WHERE project_id = ?', p.id)) await deleteService(actor, s.id, { quiet: true, deleteVolumes: true, skipSafetyBackup: true, withProject: true });
   await deleteProjectVolumes(p.id);
   projectsTable.delete(p.id);
   bus.publish({ type: 'project.deleted', projectId: p.id });
@@ -560,6 +560,7 @@ export const updateServiceInput = z.object({
         selinux: z.enum(['z', 'Z']).nullable().optional(),
         readOnly: z.boolean().optional(),
         borrowed: z.boolean().optional(),
+        writable: z.boolean().optional(),
       }),
     )
     .optional()
@@ -900,7 +901,7 @@ function checkMounts(actor: Actor, svc: Service, mounts: NonNullable<UpdateServi
     }
     if (m.borrowed) {
       const had = svc.volumes.find((x) => x.borrowed && x.volumeId === m.volumeId);
-      if (!had) throw new HttpError(400, 'add read-only shares with share_volume (or the volume’s “Share read-only”)');
+      if (!had) throw new HttpError(400, 'add shares with share_volume (or the volume’s “Share with…”); to change read-only ↔ read and write, remove the share and share it again');
       return had;
     }
     if (m.selinux) throw new HttpError(400, 'SELinux relabelling only applies to host folders');
@@ -963,7 +964,7 @@ function portablePorts(actor: Actor, ports: Service['ports'], dropped: string[])
 function portableMounts(actor: Actor, nodeId: string | null | undefined, mounts: Service['volumes'], dropped: string[]) {
   return (mounts ?? []).filter((m) => {
     if (m.borrowed) {
-      dropped.push(`read-only share ${m.mountPath}`);
+      dropped.push(`${m.writable ? 'read-and-write' : 'read-only'} share ${m.mountPath}`);
       return false;
     }
     if (!m.hostPath) return true;
@@ -1309,9 +1310,18 @@ export function startService(actor: Actor, serviceId: string) {
  * backup of their data must exist, or is taken first (refused, with nothing deleted, when it can't be); `skipSafetyBackup`
  * goes ahead without one. It never implies `deleteVolumes`.
  */
-export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; deleteVolumes?: boolean; skipSafetyBackup?: boolean } = {}) {
+export async function deleteService(actor: Actor, serviceId: string, opts: { quiet?: boolean; deleteVolumes?: boolean; skipSafetyBackup?: boolean; withProject?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   assert(isOnline(nodeOf(svc)), 409, `${svc.name} runs on ${nodeName(nodeOf(svc))}, which is offline — bring it back online before deleting`);
+  // Others writing to its volume would keep changing data nobody owns any more (no backups, no restores): refused.
+  // Deleting the whole project takes the writers along, so it goes ahead.
+  if (!opts.withProject) {
+    const writers = volumesTable
+      .all('WHERE project_id = ?', svc.projectId)
+      .filter((v) => v.serviceId === svc.id)
+      .flatMap((v) => writersOf(v).filter((w) => w.id !== svc.id).map((w) => `${w.name} (${v.name})`));
+    assert(!writers.length, 409, `${writers.join(', ')} write${writers.length === 1 ? 's' : ''} to ${svc.name}'s volume through a read-and-write share — remove ${writers.length === 1 ? 'that share' : 'those shares'} (or share read-only instead) before deleting ${svc.name}`);
+  }
   // Only volumes that really go: adopted ones and ones others still read are kept as detached volumes anyway.
   const doomed = opts.deleteVolumes
     ? svc.volumes.some((m) => {

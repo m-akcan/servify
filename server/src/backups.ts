@@ -26,7 +26,8 @@ import { dockerFor, dockerForContainer, isOnline, LOCAL, nodeName, nodeOf } from
 import { busy, drainAndRemove, INSTANCE_ID, LABEL, replicasOf, requestReconcile, volumeName, refreshServiceStatus } from './engine.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
 import { notify } from './notify.ts';
-import { dockerVolumeFor, knownVolumeSize, measureVolumes, membersOf, ownedMounts } from './volumes.ts';
+import { dockerVolumeFor, knownVolumeSize, measureVolumes, membersOf, ownedMounts, writersOf } from './volumes.ts';
+import { isJobRunning } from './cronjobs.ts';
 import { assertDisk, backupDiskBlock, diskBlock, DiskFullError, restoreFitProblem } from './diskguard.ts';
 import { destinationById, type Destination } from './settings.ts';
 import { s3AbortUpload, s3Delete, s3Get, s3Size, s3Upload } from './s3.ts';
@@ -574,6 +575,20 @@ async function waitReady(svc: Service, method: BackupMethod, timeoutMs = 240_000
 
 const restoring = new Set<string>();
 export const isRestoring = (serviceId: string) => restoring.has(serviceId);
+/** Writers of the service's volumes (read-and-write shares) that are running now: a long-lived service, or a job mid-run. */
+function activeWriters(svc: Service): string[] {
+  const vols = volumesTable.all('WHERE project_id = ?', svc.projectId).filter((v) => v.serviceId === svc.id);
+  const out = new Set<string>();
+  for (const v of vols) {
+    for (const w of writersOf(v)) {
+      if (w.id === svc.id) continue;
+      const busyNow = w.schedule ? isJobRunning(w.id) : !!w.activeDeploymentId && (!w.stopped || replicasOf(w.id).length > 0);
+      if (busyNow) out.add(w.schedule ? `${w.name} (a run is going)` : w.name);
+    }
+  }
+  return [...out];
+}
+
 /** Restores running anywhere right now. */
 export const restoresRunning = () => restoring.size;
 
@@ -587,6 +602,10 @@ export function restoreBackup(actor: Actor, backupId: string) {
   if (b.method === 'volume' && svc.volumes.some((v) => v.perReplica)) throw new HttpError(400, `${svc.name} keeps one volume per replica — restoring a single archive into it is ambiguous; attach a fresh volume set instead`);
   if (backupMethod(svc) !== b.method) throw new HttpError(400, `this ${b.method} backup doesn't match how ${svc.name} is backed up now (${backupMethod(svc) ?? 'nothing'})`);
   if (restoring.has(svc.id)) throw new HttpError(409, 'a restore is already running');
+  // Services writing to its volumes through read-and-write shares would write into the data while it is wiped and
+  // unpacked: they have to be stopped first. Scheduled jobs only while a run is going (their runs wait for the restore).
+  const writing = activeWriters(svc);
+  if (writing.length) throw new HttpError(409, `${writing.join(', ')} write${writing.length === 1 ? 's' : ''} to ${svc.name}'s volume through a read-and-write share — stop ${writing.length === 1 ? 'it' : 'them'} first, then restore`);
   // A restore replaces the data, so it is allowed on a low disk — unless it clearly can't fit: the stored backup
   // (compressed: a lower bound of what it unpacks to) against the free space plus what wiping the current data frees.
   const tooBig = restoreFitProblem(svc.nodeId, b.sizeBytes ?? 0, currentDataSize(svc), `restoring this ${formatSize(b.sizeBytes ?? 0)} backup`);

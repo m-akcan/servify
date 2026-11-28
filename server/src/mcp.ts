@@ -631,17 +631,17 @@ export function buildMcpServer(principal: Principal): McpServer {
   tool(
     'share_volume',
     {
-      description: 'Mount a volume read-only into another service of the same project (e.g. a backup sidecar reading a game server\'s data). The service redeploys. Remove with unmount.',
-      inputSchema: { volume: z.string().describe('Volume id or "project/volume"'), service: svcRef, mount_path: z.string() },
+      description: 'Mount a volume into another service of the same project and server: read-only by default (e.g. a backup sidecar reading a game server\'s data), or read and write with writable: true (e.g. a scheduled job of the same app, like Nextcloud\'s cron.php). Read and write means both services write the same files: only safe when the app is designed for it; never for a database\'s files. The volume stays its owner\'s (backups, restores, deletes). The service redeploys. Remove with unmount.',
+      inputSchema: { volume: z.string().describe('Volume id or "project/volume"'), service: svcRef, mount_path: z.string(), writable: z.boolean().optional().describe('Mount read and write instead of read-only') },
     },
-    wrap(async ({ volume, service, mount_path }: { volume: string; service: string; mount_path: string }) => {
-      return shareVolume(actor, volume, ops.getServiceOrThrow(service).id, mount_path);
+    wrap(async ({ volume, service, mount_path, writable }: { volume: string; service: string; mount_path: string; writable?: boolean }) => {
+      return shareVolume(actor, volume, ops.getServiceOrThrow(service).id, mount_path, { writable: writable === true });
     }),
   );
 
   tool(
     'unmount',
-    { description: 'Remove a read-only share or a host folder from a service (nothing is deleted). The service redeploys.', inputSchema: { service: svcRef, mount_path: z.string() } },
+    { description: 'Remove a share or a host folder from a service (nothing is deleted). The service redeploys.', inputSchema: { service: svcRef, mount_path: z.string() } },
     wrap(async ({ service, mount_path }: { service: string; mount_path: string }) => {
       return removeMount(actor, ops.getServiceOrThrow(service).id, mount_path);
     }),

@@ -62,12 +62,14 @@ export async function scale(s: ServiceView, replicas: number) {
 }
 
 export async function remove(s: ServiceView) {
-  const keepVolumes = s.volumes.length > 0;
-  if (s.volumes.length) {
+  // Shares and host folders aren't its own: never deleted with it.
+  const own = s.volumes.filter((v) => !v.borrowed && !v.hostPath);
+  const keepVolumes = own.length > 0;
+  if (own.length) {
     // Volumes outlive services: keep them as detached volumes unless asked otherwise.
     const keep = await confirmDialog({
       title: `Delete ${s.name}?`,
-      body: `Its ${s.volumes.length === 1 ? 'volume' : `${s.volumes.length} volumes`} (${s.volumes.map((v) => v.name).join(', ')}) will stay on the canvas as detached volumes with the data intact. Replicas and built images are removed.`,
+      body: `Its ${own.length === 1 ? 'volume' : `${own.length} volumes`} (${own.map((v) => v.name).join(', ')}) will stay on the canvas as detached volumes with the data intact. Replicas and built images are removed.`,
       confirm: 'Delete, keep the data',
       danger: true,
       typeToConfirm: s.name,

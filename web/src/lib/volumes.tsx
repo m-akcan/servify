@@ -135,7 +135,7 @@ export function volumeMenu(v: VolumeRecord): MenuItem[] {
   const items: MenuItem[] = [{ type: 'label', label: `${v.name} · ${bytes(v.sizeBytes)}` }];
   if (svc) items.push({ label: `Detach from ${svc.name}`, icon: 'link', onSelect: () => void detachVolume(v) });
   else items.push({ label: 'Attach to a service…', icon: 'link', onSelect: () => openVolumeDialog({ kind: 'attach', volumeId: v.id }) });
-  if (!v.setId) items.push({ label: 'Share read-only with…', icon: 'eye', onSelect: () => openVolumeDialog({ kind: 'share', volumeId: v.id }) });
+  if (!v.setId) items.push({ label: 'Share with another service…', icon: 'eye', onSelect: () => openVolumeDialog({ kind: 'share', volumeId: v.id }) });
   items.push({ label: 'Rename', icon: 'edit', onSelect: () => openVolumeDialog({ kind: 'rename', volumeId: v.id }) });
   items.push({ type: 'sep' });
   if (!svc) items.push({ label: 'Forget (keep the data)', icon: 'eyeOff', onSelect: () => void forgetVolume(v) });
@@ -379,21 +379,24 @@ function HostFolderDialog({ serviceId, onClose }: { serviceId: string; onClose: 
   );
 }
 
-/** Mount a volume read-only into another service of the project (e.g. a backup sidecar). */
+/** Mount a volume into another service of the project: read-only (a backup sidecar) or read and write (a worker or job of the same app). */
 function ShareDialog({ volumeId, onClose }: { volumeId: string; onClose: () => void }) {
   const cur = useStore((s) => s.current);
   const v = cur?.volumes[volumeId];
   const services = cur ? cur.order.map((id) => cur.services[id]).filter((x) => x && x.id !== v?.serviceId && x.source.type !== 'external' && x.source.type !== 'redirect') : [];
   const [target, setTarget] = useState(services[0]?.id ?? '');
   const [path, setPath] = useState(v?.mountPath ?? '/data');
+  const [mode, setMode] = useState<'ro' | 'rw'>('ro');
   const [busy, setBusy] = useState(false);
   if (!v) return null;
+  const owner = v.serviceId ? cur?.services[v.serviceId] : undefined;
+  const picked = cur?.services[target];
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     try {
-      await api.post(`/volumes/${v.id}/share`, { serviceId: target, mountPath: path });
-      toast({ title: `${cur?.services[target]?.name} reads ${v.name}`, body: `Mounted read-only at ${path}.`, tone: 'ok' });
+      await api.post(`/volumes/${v.id}/share`, { serviceId: target, mountPath: path, writable: mode === 'rw' });
+      toast({ title: `${picked?.name} ${mode === 'rw' ? 'writes to' : 'reads'} ${v.name}`, body: `Mounted ${mode === 'rw' ? 'read and write' : 'read-only'} at ${path}.`, tone: 'ok' });
       onClose();
     } catch (err) {
       toastError(err, 'Could not share it');
@@ -405,8 +408,8 @@ function ShareDialog({ volumeId, onClose }: { volumeId: string; onClose: () => v
     <Modal open onClose={onClose} width={480}>
       <form onSubmit={submit} className="modal-body col" style={{ gap: 16 }}>
         <div>
-          <h2 className="h2">Share {v.name} read-only</h2>
-          <p className="muted" style={{ margin: '4px 0 0' }}>Another service can read this volume — say a backup container reading a game server’s world — but never change it. It isn’t backed up, wiped or deleted from there.</p>
+          <h2 className="h2">Share {v.name}</h2>
+          <p className="muted" style={{ margin: '4px 0 0' }}>Another service on the same server mounts this volume. It stays {owner ? `${owner.name}’s` : 'where it is'}: it isn’t backed up, restored, wiped or deleted from the other service.</p>
         </div>
         <Field label="Service">
           <div className="vol-choices">
@@ -421,12 +424,30 @@ function ShareDialog({ volumeId, onClose }: { volumeId: string; onClose: () => v
         <Field label="Mount path">
           <input className="input mono" value={path} onChange={(e) => setPath(e.target.value)} />
         </Field>
+        <Field label="Access" hint={mode === 'ro' ? 'It can read the files but never change them — say a backup container reading a game server’s world.' : 'It reads and writes the same files — say a scheduled job of the same app, like Nextcloud’s cron.php.'}>
+          <Segmented
+            value={mode}
+            onChange={setMode}
+            options={[
+              { value: 'ro', label: 'Read-only' },
+              { value: 'rw', label: 'Read and write' },
+            ]}
+          />
+        </Field>
+        {mode === 'rw' && (
+          <div className="callout callout-warn">
+            <Icon name="alert" size={15} />
+            <div className="grow">
+              {owner ? owner.name : 'The owner'} and {picked?.name ?? 'the other service'} will both write the same files. That is only safe when the app is designed for it (its own workers or background jobs); two programs that don’t expect it can corrupt the data. Never share a database’s files this way. {picked?.name ?? 'It'} runs as one replica, and has to be stopped before {owner?.name ?? 'the owner'} is restored.
+            </div>
+          </div>
+        )}
         <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" variant="primary" icon="eye" loading={busy} disabled={!target || !path.startsWith('/')}>
-            Share read-only
+          <Button type="submit" variant={mode === 'rw' ? 'danger' : 'primary'} icon={mode === 'rw' ? 'edit' : 'eye'} loading={busy} disabled={!target || !path.startsWith('/')}>
+            {mode === 'rw' ? 'Share read and write' : 'Share read-only'}
           </Button>
         </div>
       </form>

@@ -37,7 +37,7 @@ import {
 import { buildSource, imageTag } from './builder.ts';
 import { nextRun } from './cron.ts';
 import { notify } from './notify.ts';
-import { hasSharedVolume, mountsFor, hostMountsFor } from './volumes.ts';
+import { hasSharedVolume, mountsFor, hostMountsFor, sharedWriteOwners } from './volumes.ts';
 
 /** Order to roll per-replica services in (clusters override: standbys first, primary last). */
 let rollingOrderHook: ((svc: Service, want: number) => number[] | null) | null = null;
@@ -312,7 +312,13 @@ export function queueDeployment(
 async function runDeployment(depId: string, actor: Actor) {
   // A restore owns the service's data until it is done (it wipes the volumes): the deploy stays queued meanwhile,
   // and can still be cancelled.
-  while (isRestoring(deploymentsTable.get(depId)?.serviceId ?? '')) await sleep(1000);
+  // The same for the owners of volumes it writes to through read-and-write shares.
+  const restoringNow = () => {
+    const sid = deploymentsTable.get(depId)?.serviceId ?? '';
+    const s = servicesTable.get(sid);
+    return isRestoring(sid) || (!!s && sharedWriteOwners(s).some((o) => isRestoring(o.id)));
+  };
+  while (restoringNow()) await sleep(1000);
   // A cluster failover, switchover or rebuild holds members back while it works on them: let it finish first (the
   // deploy isn't marked as running yet, so the cluster keeps looking after itself meanwhile).
   const clusterId = deploymentsTable.get(depId)?.serviceId ?? '';
@@ -491,6 +497,24 @@ async function runDeployment(depId: string, actor: Actor) {
           if (e instanceof SafetyBackupError) dep.safetyRefused = true;
           throw e;
         }
+      }
+    }
+    // A new image writing to other services' volumes (read-and-write shares) can change their data too: the owners'
+    // safety backups, by their own settings. Scheduled jobs included — they start nothing long-lived, but they write.
+    const writesTo = !!prevDep?.image && prevImageId !== img.Id ? sharedWriteOwners(svc) : [];
+    for (const owner of writesTo) {
+      if (preTaken?.status === 'succeeded' && preTaken.serviceId === owner.id) continue;
+      if (dep.skipSafetyBackup) {
+        log(`! No safety backup of ${owner.name}'s data (shared read and write): skipped as asked by ${actor.name}`);
+        continue;
+      }
+      log(`▸ ${svc.name} writes to ${owner.name}'s volume (shared read and write): ${owner.name}'s safety backup first`);
+      try {
+        const r = await ensureSafetyBackup(owner, { purpose: 'deploy', actor, what: `deploying ${dep.sourceLabel} on ${svc.name}, which writes to its volume`, log });
+        if (r.status === 'off') log(`! No safety backup of ${owner.name}'s data, which ${svc.name} writes to: ${r.message}`);
+      } catch (e) {
+        if (e instanceof SafetyBackupError) dep.safetyRefused = true;
+        throw e;
       }
     }
 

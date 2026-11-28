@@ -49,6 +49,8 @@ export interface Volume {
   readOnly?: boolean;
   /** Another service's volume, mounted read-only (e.g. a backup sidecar). Never wiped, backed up or deleted from here. */
   borrowed?: boolean;
+  /** A share (`borrowed`) mounted read and write: both services write the same files. Without it a share is read-only. */
+  writable?: boolean;
 }
 
 /** A persistent volume. Lives in a project; attached to at most one service at a time. */

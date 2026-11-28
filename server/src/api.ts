@@ -563,8 +563,8 @@ api.post('/projects/:id/volumes/adopt', async (c) => {
   return c.json(await adoptVolume(actor(c), ops.getProjectOrThrow(c.req.param('id')).id, await jsonBody(c)), 201);
 });
 api.post('/volumes/:id/share', async (c) => {
-  const { serviceId, mountPath } = await jsonBody<{ serviceId: string; mountPath: string }>(c);
-  return c.json(await shareVolume(actor(c), c.req.param('id'), serviceId, mountPath));
+  const { serviceId, mountPath, writable } = await jsonBody<{ serviceId: string; mountPath: string; writable?: boolean }>(c);
+  return c.json(await shareVolume(actor(c), c.req.param('id'), serviceId, mountPath, { writable: writable === true }));
 });
 api.post('/services/:id/unmount', async (c) => {
   const { mountPath } = await jsonBody<{ mountPath: string }>(c);

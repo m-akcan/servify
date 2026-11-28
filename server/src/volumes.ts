@@ -26,6 +26,10 @@ export const isHostMount = (m: Volume) => !!m.hostPath;
 export const isBorrowed = (m: Volume) => !!m.borrowed;
 /** Mounts whose volume this service owns (backed up, wiped on restore, deleted with it). */
 export const ownedMounts = (mounts: Volume[] | undefined) => (mounts ?? []).filter((m) => !m.hostPath && !m.borrowed);
+/** A share of another service's volume mounted read and write. */
+export const isWritableShare = (m: Volume) => !!m.borrowed && !!m.writable;
+/** "read-only" / "read and write" for a share. */
+export const shareMode = (m: Volume) => (isWritableShare(m) ? 'read and write' : 'read-only');
 
 const DENY = ['/etc', '/proc', '/sys', '/dev', '/boot', '/root', '/run', '/var/run', '/var/lib/docker', '/usr', '/bin', '/sbin', '/lib', '/lib64'];
 const under = (p: string, dir: string) => p === dir || p.startsWith(dir.endsWith('/') ? dir : `${dir}/`);
@@ -156,13 +160,27 @@ export function dockerVolumeFor(serviceId: string, mount: Volume, index = 0): st
   return legacy;
 }
 
-/** Docker mounts for replica `index`, skipping volumes that moved away. */
+/**
+ * Docker mounts for replica `index`, skipping volumes that moved away. Shares are checked against the service's
+ * current settings, not only the deployment's snapshot: a share removed since (a scheduled job's next run, a restart)
+ * isn't mounted, and one switched to read-only since is mounted read-only. Read and write needs both to say so.
+ */
 export function mountsFor(serviceId: string, mounts: Volume[], index = 0) {
   const out: { Type: 'volume'; Source: string; Target: string; ReadOnly?: boolean }[] = [];
+  const live = servicesTable.get(serviceId);
   for (const m of mounts) {
     if (m.hostPath) continue; // host folders: hostMountsFor()
+    let readOnly = !!m.readOnly || (!!m.borrowed && !m.writable);
+    if (m.borrowed) {
+      const now = live?.volumes.find((x) => x.borrowed && x.volumeId === m.volumeId);
+      if (!now) {
+        console.warn(`[volumes] ${serviceId} no longer shares ${m.name} — not mounting it`);
+        continue;
+      }
+      if (!isWritableShare(now)) readOnly = true;
+    }
     const src = dockerVolumeFor(serviceId, m, index);
-    if (src) out.push({ Type: 'volume', Source: src, Target: m.mountPath, ...(m.borrowed || m.readOnly ? { ReadOnly: true } : {}) });
+    if (src) out.push({ Type: 'volume', Source: src, Target: m.mountPath, ...(readOnly ? { ReadOnly: true } : {}) });
     else console.warn(`[volumes] ${m.name} is no longer attached to ${serviceId} — not mounting it`);
   }
   return out;
@@ -170,8 +188,35 @@ export function mountsFor(serviceId: string, mounts: Volume[], index = 0) {
 
 /** Shared (single) volumes force one replica; per-replica sets don't. */
 export function hasSharedVolume(mounts: Volume[] | undefined) {
-  // Writable shared data forces one replica; read-only shares and per-replica sets don't.
-  return (mounts ?? []).some((m) => (m.hostPath ? !m.readOnly : m.borrowed ? false : !m.perReplica));
+  // Writable shared data (own volumes, read-and-write shares) forces one replica; read-only shares and per-replica sets don't.
+  return (mounts ?? []).some((m) => (m.hostPath ? !m.readOnly : m.borrowed ? !!m.writable : !m.perReplica));
+}
+
+/** Services of the project that write to this volume through a read-and-write share. */
+export function writersOf(v: VolumeRecord): Service[] {
+  return servicesTable.all('WHERE project_id = ?', v.projectId).filter((s) => s.volumes.some((m) => isWritableShare(m) && m.volumeId === v.id));
+}
+
+/** The services owning the volumes this service writes to through read-and-write shares (attached volumes only). */
+export function sharedWriteOwners(svc: Service): Service[] {
+  const out = new Map<string, Service>();
+  for (const m of svc.volumes) {
+    if (!isWritableShare(m) || !m.volumeId) continue;
+    const rec = volumesTable.get(m.volumeId);
+    const owner = rec?.serviceId ? servicesTable.get(rec.serviceId) : null;
+    if (owner && owner.id !== svc.id) out.set(owner.id, owner);
+  }
+  return [...out.values()];
+}
+
+/**
+ * A writer's share went away (unmounted, or the writer deleted): a detached volume's data changed until now, so a
+ * backup taken since it was detached no longer counts as holding its current data.
+ */
+function writerGone(m: Volume) {
+  if (!isWritableShare(m) || !m.volumeId) return;
+  const rec = volumesTable.get(m.volumeId);
+  if (rec && !rec.serviceId && rec.detachedAt) save({ ...rec, detachedAt: Date.now() });
 }
 
 export async function ensureDockerVolume(v: VolumeRecord) {
@@ -418,7 +463,7 @@ export function updateVolume(actor: Actor, volumeRef: string, patch: { name?: st
   return withSize(save(v));
 }
 
-/** Services that mount this volume read-only (shares). */
+/** Services that mount this volume as a share (read-only or read and write). */
 export function borrowersOf(v: VolumeRecord): Service[] {
   return servicesTable.all('WHERE project_id = ?', v.projectId).filter((s) => s.volumes.some((m) => m.borrowed && m.volumeId === v.id));
 }
@@ -437,7 +482,7 @@ export async function deleteVolume(actor: Actor, volumeRef: string, opts: { keep
   const v = getVolumeOrThrow(volumeRef);
   if (v.serviceId) throw new HttpError(409, `${v.name} is attached to ${servicesTable.get(v.serviceId)?.name ?? 'a service'} — detach it first`);
   const borrowers = borrowersOf(v);
-  if (borrowers.length) throw new HttpError(409, `${borrowers.map((b) => b.name).join(', ')} mount${borrowers.length === 1 ? 's' : ''} ${v.name} read-only — remove that first`);
+  if (borrowers.length) throw new HttpError(409, `${borrowers.map((b) => `${b.name} (${shareMode(b.volumes.find((m) => m.borrowed && m.volumeId === v.id)!)})`).join(', ')} mount${borrowers.length === 1 ? 's' : ''} ${v.name} as a share — remove that first`);
   if (!opts.keepData) {
     for (const m of membersOf(v)) {
       const foreign = await foreignUsers(dockerFor(m.nodeId), m.dockerName);
@@ -544,8 +589,12 @@ export async function adoptVolume(actor: Actor, projectId: string, input: { dock
   return withSize(v);
 }
 
-/** Mount another service's volume read-only into a service (same project and server), e.g. a backup sidecar. */
-export async function shareVolume(actor: Actor, volumeRef: string, serviceId: string, mountPath: string) {
+/**
+ * Mount another service's volume into a service (same project and server): read-only (a backup sidecar) or, with
+ * `writable`, read and write (a worker or scheduled job of the same app, like Compose's shared volumes). The volume
+ * stays its owner's: backed up, restored and deleted only from there. A writer runs as one replica.
+ */
+export async function shareVolume(actor: Actor, volumeRef: string, serviceId: string, mountPath: string, opts: { writable?: boolean } = {}) {
   const v = getVolumeOrThrow(volumeRef);
   const svc = servicesTable.get(serviceId) ?? servicesTable.all().find((s) => s.projectId === v.projectId && (s.slug === serviceId || s.name === serviceId));
   if (!svc) throw new HttpError(404, `service not found: ${serviceId}`);
@@ -557,16 +606,29 @@ export async function shareVolume(actor: Actor, volumeRef: string, serviceId: st
   checkMountPath(path);
   if (svc.volumes.some((m) => m.mountPath === path)) throw new HttpError(409, `${svc.name} already mounts something at ${path}`);
   if (svc.volumes.some((m) => m.borrowed && m.volumeId === v.id)) throw new HttpError(409, `${svc.name} already mounts ${v.name}`);
-  svc.volumes = [...svc.volumes, { name: v.name, mountPath: path, volumeId: v.id, borrowed: true, readOnly: true }];
+  const writable = !!opts.writable;
+  let scaledDown = false;
+  if (writable) {
+    // Two database servers on the same files corrupt them: a database's data is never shared for writing.
+    const owner = v.serviceId ? servicesTable.get(v.serviceId) : null;
+    const { backupMethod } = await import('./backups.ts');
+    const method = owner ? backupMethod(owner) : null;
+    if (owner && method && method !== 'volume') throw new HttpError(400, `${owner.name} is a database: a second container writing its files would corrupt them — connect to it over the network instead (or share it read-only)`);
+    if (svc.cluster) throw new HttpError(400, `${svc.name} is a database cluster — it can't write to another service's volume`);
+    scaledDown = svc.replicas > 1;
+    if (scaledDown) svc.replicas = 1; // shared data → one replica
+    if (svc.autoscale.enabled) svc.autoscale = { ...svc.autoscale, enabled: false };
+  }
+  svc.volumes = [...svc.volumes, writable ? { name: v.name, mountPath: path, volumeId: v.id, borrowed: true, writable: true } : { name: v.name, mountPath: path, volumeId: v.id, borrowed: true, readOnly: true }];
   svc.updatedAt = Date.now();
   servicesTable.put(svc);
   bus.publish({ type: 'service.updated', service: svc });
-  recordActivity(actor, 'volume.shared', `${svc.name} mounts ${v.name} read-only at ${path}`, svc.projectId, svc.id);
+  recordActivity(actor, 'volume.shared', `${svc.name} mounts ${v.name} ${writable ? 'read and write' : 'read-only'} at ${path}${scaledDown ? ' (scaled to 1 replica)' : ''}`, svc.projectId, svc.id);
   const deployment = svc.activeDeploymentId && !svc.stopped ? await redeploy(actor, svc.id) : null;
   return { volume: withSize(v), deployment };
 }
 
-/** Remove a read-only share or a host folder from a service (nothing is deleted). */
+/** Remove a share or a host folder from a service (nothing is deleted). */
 export async function removeMount(actor: Actor, serviceId: string, mountPath: string) {
   const svc = servicesTable.get(serviceId);
   if (!svc) throw new HttpError(404, 'service not found');
@@ -577,6 +639,7 @@ export async function removeMount(actor: Actor, serviceId: string, mountPath: st
   svc.updatedAt = Date.now();
   servicesTable.put(svc);
   bus.publish({ type: 'service.updated', service: svc });
+  writerGone(m);
   recordActivity(actor, 'volume.unmounted', `${svc.name} no longer mounts ${m.hostPath ?? m.name} at ${mountPath}`, svc.projectId, svc.id);
   const deployment = svc.activeDeploymentId && !svc.stopped ? await redeploy(actor, svc.id) : null;
   return { deployment };
@@ -584,6 +647,8 @@ export async function removeMount(actor: Actor, serviceId: string, mountPath: st
 
 /** Service deleted: its volumes are deleted too, or kept as detached volumes. */
 export async function releaseServiceVolumes(svc: Service, keep: boolean) {
+  // Shares belong to their owner: never deleted from here, only noted as no longer written to.
+  for (const m of svc.volumes) writerGone(m);
   for (const m of ownedMounts(svc.volumes)) {
     const rec = m.volumeId ? volumesTable.get(m.volumeId) : volumesTable.all().find((r) => r.dockerName === legacyDockerName(svc.id, m.name));
     if (!rec) {
