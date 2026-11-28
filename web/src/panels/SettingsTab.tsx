@@ -8,6 +8,7 @@ import { Icon } from '../components/Icon.tsx';
 import { remove, stop, start } from '../lib/actions.ts';
 import { useStore } from '../lib/store.ts';
 import { describeCron, timeAgo } from '../lib/format.ts';
+import { MoveStatus, MoveWithDataDialog } from './MoveCard.tsx';
 
 async function patch(id: string, body: Record<string, unknown>, quiet = false) {
   try {
@@ -207,11 +208,12 @@ function ServiceProject({ service: s }: { service: ServiceView }) {
   );
 }
 
-/** Which machine runs the service; moving redeploys it there. */
+/** Which machine runs the service; moving redeploys it there (with volumes: stops it and copies the data along). */
 function ServiceServer({ service: s }: { service: ServiceView }) {
   const [servers, setServers] = useState<PublicServer[]>([]);
   const [target, setTarget] = useState(s.server?.id ?? 'local');
   const [busy, setBusy] = useState(false);
+  const [withData, setWithData] = useState<PublicServer | null>(null);
   useEffect(() => {
     api
       .get<PublicServer[]>('/servers')
@@ -220,9 +222,12 @@ function ServiceServer({ service: s }: { service: ServiceView }) {
   }, []);
   useEffect(() => setTarget(s.server?.id ?? 'local'), [s.server?.id]);
   const current = s.server?.id ?? 'local';
+  const hasData = s.volumes.length > 0;
+  const moving = !!s.move && !['done', 'failed'].includes(s.move.phase);
   const move = async () => {
     const to = servers.find((x) => x.id === target);
     if (!to) return;
+    if (hasData) return setWithData(to);
     const yes = await confirmDialog({
       title: `Move ${s.name} to ${to.name}?`,
       body: `Servify deploys ${s.name} on ${to.name} (building or pulling the image there), switches traffic once it is healthy, then removes the old replicas.`,
@@ -248,16 +253,16 @@ function ServiceServer({ service: s }: { service: ServiceView }) {
             {s.server && !s.server.online && <span className="badge" data-tone="err" style={{ marginLeft: 8 }}>offline</span>}
           </div>
           <div className="desc">
-            {s.volumes.length
-              ? 'Its volumes live on this server, so it stays here. To move it: back it up, then restore into a service on the other server.'
-              : servers.length > 1
-                ? 'Moving redeploys it on the other server with no downtime, then retires the old replicas.'
-                : 'Add a server to run services on other machines.'}
+            {servers.length <= 1
+              ? 'Add a server to run services on other machines.'
+              : hasData
+                ? 'Moving stops it, copies its volumes to the other server and starts it there — it is down while the data copies. If it doesn’t start healthy there, it goes back.'
+                : 'Moving redeploys it on the other server with no downtime, then retires the old replicas.'}
           </div>
         </div>
-        {servers.length > 1 && !s.volumes.length ? (
+        {servers.length > 1 ? (
           <div className="row" style={{ gap: 6 }}>
-            <select className="select" value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Server">
+            <select className="select" value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Server" disabled={moving}>
               {servers.map((x) => (
                 <option key={x.id} value={x.id} disabled={x.status !== 'online'}>
                   {x.name}
@@ -265,18 +270,18 @@ function ServiceServer({ service: s }: { service: ServiceView }) {
                 </option>
               ))}
             </select>
-            <Button icon="arrowRight" loading={busy} disabled={target === current} onClick={() => void move()}>
-              Move
+            <Button icon="arrowRight" loading={busy || moving} disabled={target === current || moving} onClick={() => void move()}>
+              {hasData ? 'Move…' : 'Move'}
             </Button>
           </div>
         ) : (
-          servers.length <= 1 && (
-            <Button variant="ghost" icon="server" onClick={() => navigate('/servers')}>
-              Servers
-            </Button>
-          )
+          <Button variant="ghost" icon="server" onClick={() => navigate('/servers')}>
+            Servers
+          </Button>
         )}
       </div>
+      <MoveStatus service={s} />
+      {withData && <MoveWithDataDialog service={s} target={withData} onClose={() => setWithData(null)} />}
       {!!s.crossServerRefs?.length && (
         <div className="callout">
           <Icon name="link" size={14} />

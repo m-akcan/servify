@@ -148,6 +148,7 @@ async function main() {
   });
 
   recoverInterrupted();
+  (await import('./relocate.ts')).recoverMoves(); // before the reconciler: a move cut short goes back to its old server
   (await import('./ops.ts')).upgradeIcons();
   const proxyPort = await startProxy();
   await startEngine();

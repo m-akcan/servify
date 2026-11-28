@@ -49,6 +49,7 @@ function rollingOrder(svc: Service, want: number): number[] {
 }
 import { iconForStack, referencedServicesOn } from './ops.ts';
 import { betterIcon } from './icons.ts';
+import { isCopyingData } from './relocate.ts';
 
 const lock = new KeyedLock();
 
@@ -312,7 +313,8 @@ export function queueDeployment(
 async function runDeployment(depId: string, actor: Actor) {
   // A restore owns the service's data until it is done (it wipes the volumes): the deploy stays queued meanwhile,
   // and can still be cancelled.
-  while (isRestoring(deploymentsTable.get(depId)?.serviceId ?? '')) await sleep(1000);
+  // Likewise a move to another server while it copies the data (relocate.ts).
+  while (isRestoring(deploymentsTable.get(depId)?.serviceId ?? '') || isCopyingData(deploymentsTable.get(depId)?.serviceId ?? '')) await sleep(1000);
   // A cluster failover, switchover or rebuild holds members back while it works on them: let it finish first (the
   // deploy isn't marked as running yet, so the cluster keeps looking after itself meanwhile).
   const clusterId = deploymentsTable.get(depId)?.serviceId ?? '';

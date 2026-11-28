@@ -123,7 +123,7 @@ try {
   await waitFor(async () => (await api('POST', `/services/${db.id}/exec`, { command: 'pg_isready -q -U postgres' })).exitCode === 0, 60_000);
   await api('POST', `/services/${db.id}/exec`, { command: `psql -U postgres -d app -qc "create table t(x int); insert into t values (7)"` });
   const mv = await api('POST', `/services/${db.id}/move`, { server: 'local' });
-  check('a service with volumes refuses to move', /data can't move/.test(mv.__error ?? ''), mv.__error);
+  check('a service with volumes only moves when asked to take its data along', /confirm with \{"withData": true\}/.test(mv.__error ?? ''), mv.__error);
   await api('POST', `/services/${db.id}/backups`, {});
   const bak = await waitFor(async () => {
     const list = await api('GET', `/services/${db.id}/backups`);

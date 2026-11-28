@@ -37,6 +37,7 @@ import { config } from './config.ts';
 import { assertDisk } from './diskguard.ts';
 import { validateCron, nextRun, validTimeZone } from './cron.ts';
 import { runJob, listRuns, isJobRunning, killJobs } from './cronjobs.ts';
+import { startDataMove } from './relocate.ts';
 import { scheduleInfo } from './schedstate.ts';
 
 const PROJECT_COLORS = ['#d4f25a', '#7ce0c3', '#f2a65a', '#9fb4ff', '#f27a9b', '#c9a7ff', '#5ad1f2'];
@@ -996,13 +997,17 @@ export function referencedServicesOn(s: Service): string[] {
 }
 
 /** Run a service on another server: redeploy there (zero downtime for stateless services), then retire the old replicas. */
-export async function moveService(actor: Actor, serviceId: string, serverRef: string) {
+export async function moveService(actor: Actor, serviceId: string, serverRef: string, opts: { withData?: boolean } = {}) {
   const svc = getServiceOrThrow(serviceId);
   notExternal(svc, 'move');
   const target = resolveServer(serverRef);
   const from = nodeOf(svc);
   if (target === from) return serializeService(svc);
-  assert(!svc.volumes.length, 409, `${svc.name} has volumes, and data can't move between servers — back it up, detach the volumes, then move it (or restore the backup on the new server)`);
+  // With volumes the data goes along, and the service is down while it copies: only when asked for (relocate.ts).
+  if (svc.volumes.length) {
+    assert(opts.withData, 409, `${svc.name} has volumes: moving it copies their data to ${nodeName(target)} and stops ${svc.name} while it copies — confirm with {"withData": true} (GET /api/services/${svc.id}/move-plan?server=… shows the size, free space and anything in the way)`);
+    return serializeService(await startDataMove(actor, svc, target));
+  }
   assert(isOnline(target), 409, `${nodeName(target)} is offline`);
   svc.nodeId = target === LOCAL ? null : target;
   svc.updatedAt = Date.now();
