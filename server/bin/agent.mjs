@@ -17,7 +17,7 @@ import os from 'node:os';
 import { readFileSync, statfsSync } from 'node:fs';
 import http from 'node:http';
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 // Live usage of this machine for Servify's overview (same fields as server/src/hoststats.ts). Inside the agent's
 // container /proc/meminfo and the CPU counters are the host's; the disk is the one Docker stores containers on.
@@ -111,6 +111,20 @@ function connectTarget(target) {
   });
 }
 
+/**
+ * One side of a stream is gone: the other gets what is still queued for it before it closes (destroying it at once
+ * would drop the tail of a long output, e.g. a `docker run … tar cf -` that has just exited). After an error, or if
+ * it doesn't drain within 30 s, it is destroyed.
+ */
+function closeAfter(b, hadError) {
+  if (hadError || b.destroyed) return b.destroy();
+  const t = setTimeout(() => b.destroy(), 30_000);
+  t.unref?.();
+  b.once('close', () => clearTimeout(t));
+  b.once('finish', () => b.destroy());
+  b.end();
+}
+
 async function openStream(control, id, target) {
   let local;
   try {
@@ -127,7 +141,7 @@ async function openStream(control, id, target) {
       [remote, local],
     ]) {
       a.on('error', () => b.destroy());
-      a.on('close', () => b.destroy());
+      a.on('close', (hadError) => closeAfter(b, hadError));
       a.pipe(b);
     }
     local.resume();
