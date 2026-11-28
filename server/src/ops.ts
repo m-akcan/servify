@@ -37,7 +37,7 @@ import { config } from './config.ts';
 import { assertDisk } from './diskguard.ts';
 import { validateCron, nextRun, validTimeZone } from './cron.ts';
 import { runJob, listRuns, isJobRunning, killJobs } from './cronjobs.ts';
-import { startDataMove } from './relocate.ts';
+import { startDataMove, isCopyingData } from './relocate.ts';
 import { scheduleInfo } from './schedstate.ts';
 
 const PROJECT_COLORS = ['#d4f25a', '#7ce0c3', '#f2a65a', '#9fb4ff', '#f27a9b', '#c9a7ff', '#5ad1f2'];
