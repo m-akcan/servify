@@ -8,6 +8,7 @@ import { getSettings, type Channel, type NotifyEvent } from './settings.ts';
 import { projects as projectsTable, services as servicesTable } from './db.ts';
 import { config } from './config.ts';
 import { HttpError } from './util.ts';
+import { recordHealth, channelHealth, isFailing, SendError, scrub } from './notifyhealth.ts';
 
 export type Notice = {
   event: NotifyEvent;
@@ -24,7 +25,7 @@ export type Notice = {
   dedupeMs?: number;
 };
 
-export type Delivery = { ts: number; channelId: string; event: string; ok: boolean; error?: string };
+export type Delivery = { ts: number; channelId: string; event: string; ok: boolean; error?: string; problem?: string; fix?: string };
 const deliveries: Delivery[] = [];
 const recent = new Map<string, number>();
 
@@ -58,7 +59,10 @@ async function post(url: string, body: unknown, headers: Record<string, string> 
     body: typeof body === 'string' ? body : JSON.stringify(body),
     signal: AbortSignal.timeout(10_000),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text().catch(() => '')).slice(0, 160)}`);
+  if (!res.ok) {
+    const body = (await res.text().catch(() => '')).slice(0, 600);
+    throw new SendError(`HTTP ${res.status} ${body.slice(0, 160)}`, { status: res.status, body });
+  }
 }
 
 async function send(ch: Channel, n: Notice) {
@@ -138,7 +142,8 @@ async function send(ch: Channel, n: Notice) {
         greetingTimeout: 10_000,
       });
       const linkList = [...links, { label: 'Open in Servify', url: link }];
-      await transport.sendMail({
+      try {
+        await transport.sendMail({
         from: s.from,
         to: s.to,
         subject: `[Servify] ${n.title}`,
@@ -146,25 +151,53 @@ async function send(ch: Channel, n: Notice) {
         html: `<div style="font-family:system-ui,sans-serif;font-size:14px;color:#1a1b16"><h2 style="font-size:16px;margin:0 0 8px">${escapeHtml(n.title)}</h2><p style="white-space:pre-wrap;margin:0 0 14px">${escapeHtml(n.message)}</p><p>${linkList
           .map((l) => `<a href="${escapeHtml(l.url)}">${escapeHtml(l.label)}</a>`)
           .join(' · ')}</p></div>`,
-      });
-      transport.close();
+        });
+      } finally {
+        transport.close();
+      }
       return;
     }
   }
 }
 
-async function deliver(ch: Channel, n: Notice) {
+async function deliver(ch: Channel, n: Notice | (Omit<Notice, 'event'> & { event: 'notify.failing' })) {
   const rec: Delivery = { ts: Date.now(), channelId: ch.id, event: n.event, ok: true };
+  let err: unknown = null;
   try {
-    await send(ch, n);
+    await send(ch, n as Notice);
   } catch (e) {
+    err = e;
+  }
+  const { health, becameFailing } = recordHealth(ch, err);
+  if (err) {
     rec.ok = false;
-    rec.error = (e as Error).message.slice(0, 240);
-    console.error(`[notify] ${ch.name} (${ch.type}): ${rec.error}`);
+    rec.error = health.detail ?? scrub(ch, String((err as Error).message)).slice(0, 240);
+    rec.problem = health.problem ?? undefined;
+    rec.fix = health.fix ?? undefined;
+    console.error(`[notify] ${ch.name} (${ch.type}): ${health.problem} — ${rec.error}`);
   }
   deliveries.push(rec);
   if (deliveries.length > 300) deliveries.splice(0, deliveries.length - 300);
+  if (becameFailing) warnOthers(ch, health.problem ?? 'deliveries keep failing');
   return rec;
+}
+
+/**
+ * A channel just failed several times in a row: it can't report that itself, so tell the other enabled channels that
+ * still work (whatever events they follow), once per streak.
+ */
+function warnOthers(failed: Channel, problem: string) {
+  const health = channelHealth();
+  const others = getSettings().notifications.channels.filter((c) => c.id !== failed.id && c.enabled && !isFailing(health[c.id]));
+  for (const ch of others) {
+    void deliver(ch, {
+      event: 'notify.failing',
+      level: 'error',
+      title: `Notification channel ${failed.name} is failing`,
+      message: `Servify couldn't deliver to ${failed.name} (${failed.type}) several times in a row: ${problem} Open Settings → Notifications to fix it.`,
+      links: [{ label: 'Notification settings', url: `${dashboardBase()}/settings/notifications` }],
+    });
+  }
 }
 
 /** Send a notice to every enabled channel subscribed to its event. Never throws. */

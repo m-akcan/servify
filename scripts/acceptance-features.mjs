@@ -1617,11 +1617,148 @@ async function cliParityChecks(P) {
   await api('DELETE', `/services/${app.id}?deleteVolumes=1&skipSafetyBackup=1`).catch(() => {});
 }
 
+/**
+ * Notification errors (ONLY=notify): fake Discord / Slack / ntfy / webhook endpoints and SMTP servers on 127.0.0.1
+ * answer with known failures; each must come back as a plain-language problem with a fix, never quoting the channel's
+ * credential. Three failures in a row mark a channel failing and the other channels hear about it. Telegram's host is
+ * fixed, so only the local "chat ID is the bot itself" refusal on save is checked here.
+ */
+async function notifyChecks() {
+  console.log('\n▸ notification errors');
+  let answer = { status: 200, body: 'ok' };
+  const got = [];
+  const fake = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      if (req.url.startsWith('/good')) {
+        got.push(b);
+        return res.end('ok');
+      }
+      res.writeHead(answer.status, { 'content-type': answer.body.startsWith('{') ? 'application/json' : 'text/plain' });
+      res.end(answer.body);
+    });
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  cleanups.push(async () => fake.close());
+  const port = fake.address().port;
+  const TOKEN = 'zQ9xV3kLmN8pR2sT5uW7yB1cD4fG6hJ0';
+  const made = [];
+  const add = async (body) => {
+    const ch = await api('POST', '/settings/notifications/channels', { events: ['deploy.failed'], ...body });
+    made.push(ch.id);
+    cleanups.push(() => api('DELETE', `/settings/notifications/channels/${ch.id}`).catch(() => {}));
+    return ch;
+  };
+  const test = (ch) => api('POST', `/settings/notifications/channels/${ch.id}/test`);
+  const health = () => api('GET', '/settings/notifications/health');
+
+  const good = await add({ name: 'acc-good', type: 'webhook', url: `http://127.0.0.1:${port}/good` });
+  check('a working channel tests fine', (await test(good)).ok === true);
+  check('and its health says delivered', (await health())[good.id]?.ok === true);
+
+  const discord = await add({ name: 'acc-discord', type: 'discord', url: `http://127.0.0.1:${port}/api/webhooks/1234567890/${TOKEN}` });
+  answer = { status: 404, body: '{"message": "Unknown Webhook", "code": 10015}' };
+  const d1 = await test(discord);
+  check('Discord 404: the webhook was deleted, with how to make a new one', d1.ok === false && /webhook doesn’t exist/.test(d1.problem) && /Integrations → Webhooks/.test(d1.fix ?? ''), JSON.stringify(d1));
+  const h1 = (await health())[discord.id];
+  check('the channel shows the problem, not yet failing', h1?.ok === false && h1.failures === 1 && h1.failing === false && /deleted/.test(h1.problem));
+  check('no credential in the problem, fix or detail', !JSON.stringify([d1, h1]).includes(TOKEN), JSON.stringify(h1));
+  got.length = 0;
+  await test(discord);
+  await test(discord);
+  const h3 = (await health())[discord.id];
+  check('three failures in a row: failing', h3?.failing === true && h3.failures === 3, JSON.stringify(h3));
+  const warned = await waitFor(async () => got.find((b) => b.includes('acc-discord') && b.includes('notify.failing')), 10_000, 'failing notice');
+  check('the other channel was told', !!warned && !warned.includes(TOKEN), warned ?? '');
+  got.length = 0;
+  await test(discord);
+  await sleep(500);
+  check('…once per streak', !got.some((b) => b.includes('notify.failing')));
+  const dels = await api('GET', '/settings/notifications/deliveries');
+  check('recent deliveries carry the problem', dels.some((d) => d.channelId === discord.id && /webhook doesn’t exist/.test(d.problem ?? '')));
+  // Switching it off and on keeps the health (same URL); a new URL clears it.
+  await api('POST', '/settings/notifications/channels', { ...discord, enabled: false });
+  check('a disabled channel is not counted as failing', (await health())[discord.id]?.failing === false);
+  await api('POST', '/settings/notifications/channels', { ...discord, enabled: true });
+  check('re-enabled: failing again (nothing changed)', (await health())[discord.id]?.failing === true);
+  await api('POST', '/settings/notifications/channels', { ...discord, url: `http://127.0.0.1:${port}/good` });
+  check('saving a new URL clears the old results', !(await health())[discord.id]);
+
+  const slack = await add({ name: 'acc-slack', type: 'slack', url: `http://127.0.0.1:${port}/services/T000/B000/${TOKEN}` });
+  answer = { status: 404, body: 'no_service' };
+  const s1 = await test(slack);
+  check('Slack 404 no_service: the webhook no longer exists', /no longer exists/.test(s1.problem ?? '') && /Incoming Webhook/.test(s1.fix ?? ''), JSON.stringify(s1));
+  answer = { status: 410, body: 'channel_is_archived' };
+  check('Slack 410: the channel was archived', /archived/.test((await test(slack)).problem ?? ''));
+
+  const ntfy = await add({ name: 'acc-ntfy', type: 'ntfy', url: `http://127.0.0.1:${port}`, topic: 'acc-topic' });
+  answer = { status: 403, body: '{"code":40301,"http":403,"error":"forbidden"}' };
+  const n1 = await test(ntfy);
+  check('ntfy 403: protected topic, add an access token', /protected/.test(n1.problem ?? '') && /access token/.test(n1.fix ?? ''), JSON.stringify(n1));
+  answer = { status: 429, body: '{"code":42901,"http":429,"error":"limit reached: too many requests"}' };
+  check('ntfy 429: rate limited, with what to do', /rate limiting/.test((await test(ntfy)).problem ?? ''));
+
+  const hook = await add({ name: 'acc-hook', type: 'webhook', url: `http://127.0.0.1:${port}/x`, secret: TOKEN });
+  answer = { status: 500, body: `{"error":"database down","echo":"${TOKEN}"}` };
+  const w1 = await test(hook);
+  check('generic fallback: the status and a short excerpt', /HTTP 500/.test(w1.problem ?? '') && /database down/.test(w1.fix ?? ''), JSON.stringify(w1));
+  check('the excerpt never repeats a secret', !JSON.stringify(w1).includes(TOKEN) && !JSON.stringify((await health())[hook.id]).includes(TOKEN));
+
+  // SMTP: a closed port, and a server that refuses the login.
+  const closed = await new Promise((r) => {
+    const t = net.createServer().listen(0, '127.0.0.1', () => {
+      const p = t.address().port;
+      t.close(() => r(p));
+    });
+  });
+  const mail = await add({ name: 'acc-mail', type: 'email', smtp: { host: '127.0.0.1', port: closed, secure: false, from: 'a@example.com', to: 'b@example.com' } });
+  const m1 = await test(mail);
+  check('SMTP connection refused: check host and port', /connection refused/.test(m1.problem ?? '') && /587/.test(m1.fix ?? ''), JSON.stringify(m1));
+  const smtp = net.createServer((sock) => {
+    sock.write('220 acc ESMTP\r\n');
+    let buf = '';
+    sock.on('data', (c) => {
+      buf += c;
+      let i;
+      while ((i = buf.indexOf('\r\n')) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        if (/^EHLO/i.test(line)) sock.write('250-acc\r\n250 AUTH PLAIN LOGIN\r\n');
+        else if (/^AUTH/i.test(line)) sock.write('535 5.7.8 Authentication credentials invalid\r\n');
+        else if (/^QUIT/i.test(line)) sock.end('221 bye\r\n');
+        else sock.write('250 ok\r\n');
+      }
+    });
+    sock.on('error', () => {});
+  });
+  await new Promise((r) => smtp.listen(0, '127.0.0.1', r));
+  cleanups.push(async () => smtp.close());
+  await api('POST', '/settings/notifications/channels', { ...mail, smtp: { host: '127.0.0.1', port: smtp.address().port, secure: false, user: 'acc', pass: TOKEN, from: 'a@example.com', to: 'b@example.com' } });
+  const m2 = await test(mail);
+  check('SMTP 535: username or password refused, app passwords', /username or password/.test(m2.problem ?? '') && /app password/.test(m2.fix ?? ''), JSON.stringify(m2));
+  check('the SMTP password is not repeated', !JSON.stringify(m2).includes(TOKEN));
+
+  // Telegram: the chat ID of the bot itself is refused on save (bot tokens start with the bot's id).
+  let refused = '';
+  try {
+    await add({ name: 'acc-tg', type: 'telegram', botToken: `7012345678:${TOKEN}AAAA`, chatId: '7012345678' });
+  } catch (e) {
+    refused = e.message;
+  }
+  check('Telegram: a chat ID that is the bot itself is refused on save', /→ 400/.test(refused) && /bot itself/.test(refused) && /getUpdates/.test(refused) && !refused.includes(TOKEN), refused);
+
+  // Removing a channel removes its health.
+  await api('DELETE', `/settings/notifications/channels/${ntfy.id}`);
+  check('a removed channel has no health entry', !(await health())[ntfy.id]);
+}
+
 async function main() {
   const settings = await api('GET', '/settings');
   const secret = settings.webhooks.secret;
   if (!secret || secret.includes('•')) throw new Error('needs owner access: set SERVIFY_COOKIE or run Servify with SERVIFY_AUTH=none');
   if (process.env.ONLY === 'auth') return authChecks();
+  if (process.env.ONLY === 'notify') return notifyChecks();
   const P = await api('POST', '/projects', { name: `features-${Date.now().toString(36)}` });
   projectsToDelete.push(P.id);
   if (process.env.ONLY === 'restarts') return hungReplicaChecks(P);

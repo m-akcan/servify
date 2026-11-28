@@ -54,6 +54,7 @@ import { replicasOf } from './engine.ts';
 import * as settings from './settings.ts';
 import * as updater from './updater.ts';
 import { testChannel, recentDeliveries } from './notify.ts';
+import { channelHealth, isFailing as isChannelFailing } from './notifyhealth.ts';
 import { recentHookDeliveries, deployHookToken } from './hooks.ts';
 import { listCertificates, retryCertificate, localCaPem } from './certs.ts';
 import { restoreBackup, deleteBackup, openBackupStream, testRestore, publicBackup } from './backups.ts';
@@ -1027,7 +1028,21 @@ api.patch('/settings/https', async (c) => {
 });
 api.post('/settings/notifications/channels', async (c) => {
   ownerOnly(c);
-  return c.json(settings.upsertChannel(actor(c), await jsonBody(c)), 201);
+  return c.json(await settings.upsertChannel(actor(c), await jsonBody(c)), 201);
+});
+api.get('/settings/notifications/health', (c) => {
+  // Per channel: the last result and failures in a row. The plain-language problem only for the owner.
+  // `failing`: enabled and failed several times in a row (a switched-off channel isn't expected to deliver).
+  const all = channelHealth();
+  const owner = isOwner(c);
+  const out: Record<string, unknown> = {};
+  for (const ch of settings.getSettings().notifications.channels) {
+    const h = all[ch.id];
+    if (!h) continue;
+    const failing = ch.enabled && isChannelFailing(h);
+    out[ch.id] = owner ? { ...h, failing } : { ts: h.ts, ok: h.ok, failures: h.failures, failing };
+  }
+  return c.json(out);
 });
 api.delete('/settings/notifications/channels/:id', (c) => {
   ownerOnly(c);

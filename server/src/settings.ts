@@ -10,6 +10,7 @@ import { sealJson, openJson, isSealed } from './crypto.ts';
 import { secret, HttpError, id } from './util.ts';
 import { config } from './config.ts';
 import { bus, recordActivity, type Actor } from './events.ts';
+import { clearHealth, telegramProblem } from './notifyhealth.ts';
 
 export const MASK = '••••••••';
 
@@ -314,14 +315,24 @@ export function updateHttps(actor: Actor, patch: Partial<z.infer<typeof httpsSch
   return s.https;
 }
 
-export function upsertChannel(actor: Actor, raw: unknown): Channel {
+export async function upsertChannel(actor: Actor, raw: unknown): Promise<Channel> {
   const input = channelSchema.parse(raw);
-  const s = structuredClone(getSettings());
-  const prev = input.id ? s.notifications.channels.find((c) => c.id === input.id) : undefined;
-  if (input.id && !prev) throw new HttpError(404, 'channel not found');
-  let ch = unmask({ ...input, id: prev?.id ?? id('ch') } as Channel, prev, ['url', 'secret', 'botToken']);
-  if (ch.smtp) ch.smtp = unmask(ch.smtp, prev?.smtp, ['pass']);
+  const before = getSettings().notifications.channels.find((c) => c.id === input.id);
+  if (input.id && !before) throw new HttpError(404, 'channel not found');
+  let ch = unmask({ ...input, id: before?.id ?? id('ch') } as Channel, before, ['url', 'secret', 'botToken']);
+  if (ch.smtp) ch.smtp = unmask(ch.smtp, before?.smtp, ['pass']);
   validateChannel(ch);
+  // Telegram: catch a chat ID that is the bot itself, or a rejected token, before it fails quietly. Only when the token
+  // or chat changed, so a broken channel can still be switched off.
+  if (ch.type === 'telegram' && (!before || before.type !== 'telegram' || before.botToken !== ch.botToken || before.chatId !== ch.chatId)) {
+    const problem = await telegramProblem(ch.botToken!, ch.chatId!);
+    if (problem) throw new HttpError(400, problem);
+  }
+  // New delivery settings: the old results no longer say anything about the channel.
+  const where = (c?: Channel) => JSON.stringify([c?.type, c?.url, c?.secret, c?.botToken, c?.chatId, c?.topic, c?.smtp]);
+  if (before && where(before) !== where(ch)) clearHealth(ch.id);
+  const s = structuredClone(getSettings());
+  const prev = s.notifications.channels.find((c) => c.id === ch.id);
   s.notifications.channels = prev ? s.notifications.channels.map((c) => (c.id === ch.id ? ch : c)) : [...s.notifications.channels, ch];
   save(s);
   recordActivity(actor, 'settings.notifications', `${prev ? 'Updated' : 'Added'} notification channel ${ch.name}`);
@@ -342,6 +353,7 @@ export function deleteChannel(actor: Actor, channelId: string) {
   if (!ch) throw new HttpError(404, 'channel not found');
   s.notifications.channels = s.notifications.channels.filter((c) => c.id !== channelId);
   save(s);
+  clearHealth(channelId);
   recordActivity(actor, 'settings.notifications', `Removed notification channel ${ch.name}`);
 }
 
