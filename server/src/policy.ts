@@ -112,6 +112,9 @@ export const ROUTE_POLICIES: Record<string, Policy> = {
   'DELETE /volumes/:id': { level: 'write', params: V },
   'POST /volumes/:id/share': { level: 'write', params: V, body: { serviceId: 'service' } },
   'GET /servers/:id/docker-volumes': { level: 'owner', ownerMessage: 'Listing other Docker volumes can only be set by the owner in the dashboard, not with an agent token' },
+  // Reclaim space: Servify's leftovers on every server (owner only: deletes data).
+  'GET /reclaim': { level: 'owner', ownerMessage: 'Reclaiming space can only be done by the owner in the dashboard, not with an agent token' },
+  'POST /reclaim/delete': { level: 'owner', ownerMessage: 'Reclaiming space can only be done by the owner in the dashboard, not with an agent token' },
 
   // Services: reading.
   'GET /services/:id': { level: 'read', params: S },
